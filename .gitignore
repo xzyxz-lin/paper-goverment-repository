@@ -1,0 +1,18 @@
+# Python
+.venv/
+__pycache__/
+*.pyc
+
+# 数据与资产（本地私有，不入库）
+data/library.db
+data/library.db-*
+data/*.cfg
+data/deleted.json
+data/.translation_cache.json
+picture asset/
+
+# Workbuddy 本地运行状态
+.workbuddy/
+
+# 测试临时文件
+test_sample.pdf
