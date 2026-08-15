@@ -120,13 +120,18 @@ const state = {
   currentFolderId: null,
   currentFolderPath: [],   // [{id, name}] 从根到当前
   papers: [],
+  recycleItems: [],
+  recycleSummary: { total: 0, project: 0, folder: 0, paper: 0 },
+  recycleRetentionDays: 7,
   searchTerm: "",
   folderOpen: {},          // folderId -> bool 展开状态
   // 多选删除（仿照论文观察台）
   selPapers: new Set(),    // 当前项目里的论文 id
   selProjects: new Set(),  // 项目卡片 id
   selFolders: new Set(),   // 文件夹 id
-  selectionAnchor: { paper: null, project: null, folder: null }, // Shift 范围选择的起点
+  selRecycle: new Set(),   // 回收记录 id
+  selectionAnchor: { paper: null, project: null, folder: null, recycle: null }, // Shift 范围选择的起点
+  currentView: "projects",
   deletedCount: { projects: 0, folders: 0, papers: 0 },
 };
 
@@ -141,6 +146,7 @@ async function enterApp() {
     $("#service-state").textContent = "已连接";
     $("#service-addr").textContent = location.host;
     await loadProjects();
+    await loadRecycle(false);
     renderNav();
     showView("projects");
   } catch (e) {
@@ -157,8 +163,11 @@ async function loadProjects() {
 function renderNav() {
   const nav = $("#nav-stack");
   let html = `
-    <button class="nav-item is-active" data-view="projects" type="button">
+    <button class="nav-item ${state.currentView === "projects" ? "is-active" : ""}" data-view="projects" type="button">
       <svg><use href="#i-grid"/></svg><span>项目总览</span>
+    </button>
+    <button class="nav-item ${state.currentView === "recycle" ? "is-active" : ""}" data-view="recycle" type="button">
+      <svg><use href="#i-archive"/></svg><span>回收站</span>${state.recycleSummary.total ? `<b>${state.recycleSummary.total}</b>` : ""}
     </button>`;
   const projects = state.projects;
   if (projects.length) {
@@ -176,6 +185,7 @@ function renderNav() {
     const view = btn.dataset.view;
     const pid = btn.dataset.project;
     if (view === "projects") { showView("projects"); setActiveNav(btn); }
+    else if (view === "recycle") { openRecycle(); }
     else if (pid) { openProject(parseInt(pid)); }
   }));
 }
@@ -187,6 +197,7 @@ function setActiveNav(btn) {
 
 /* ============ 视图切换 ============ */
 function showView(view) {
+  state.currentView = view;
   $$(".page").forEach(p => p.classList.remove("is-visible"));
   const page = $(`.page[data-view="${view}"]`);
   if (page) page.classList.add("is-visible");
@@ -198,6 +209,9 @@ function showView(view) {
   } else if (view === "project") {
     $("#page-title").textContent = state.currentProjectName;
     $("#page-eyebrow").textContent = "LIBRARY / PROJECT";
+  } else if (view === "recycle") {
+    $("#page-title").textContent = "回收站";
+    $("#page-eyebrow").textContent = "LIBRARY / RECYCLE BIN";
   }
 }
 
@@ -290,8 +304,10 @@ function clearSelection() {
   state.selPapers.clear();
   state.selProjects.clear();
   state.selFolders.clear();
-  state.selectionAnchor = { paper: null, project: null, folder: null };
+  state.selRecycle.clear();
+  state.selectionAnchor = { paper: null, project: null, folder: null, recycle: null };
   updateSelectionUI();
+  updateRecycleSelectionUI();
 }
 
 // 在某容器内做 Shift 范围选择
@@ -369,10 +385,19 @@ async function doBulkDelete() {
     toast(`已删除 ${okCount} 项`);
     // 刷新视图
     await loadProjects();
+    await loadRecycle(false);
     renderNav();
     if (state.currentProjectId) {
-      await loadTree();
-      await loadPapers();
+      if (!state.projects.find(p => p.id === state.currentProjectId)) {
+        state.currentProjectId = null;
+        state.currentFolderId = null;
+        state.currentFolderPath = [];
+        showView("projects");
+        renderProjects();
+      } else {
+        await loadTree();
+        await loadPapers();
+      }
     } else {
       renderProjects();
     }
@@ -383,26 +408,186 @@ async function doBulkDelete() {
 }
 
 async function restoreAllDeleted() {
-  if (!confirm("恢复全部已删除的项目/文件夹/论文？")) return;
+  await openRecycle();
+}
+
+/* ============ 回收站 ============ */
+async function loadRecycle(render = true) {
+  const data = await req("GET", "/api/recycle");
+  state.recycleItems = data.items || [];
+  state.recycleSummary = data.summary || { total: 0, project: 0, folder: 0, paper: 0 };
+  state.recycleRetentionDays = data.retention_days || 7;
+  updateRecycleBadges();
+  if (render) renderRecycle();
+}
+
+function updateRecycleBadges() {
+  const count = state.recycleSummary.total || 0;
+  const side = $("#recycle-side-count");
+  const top = $("#recycle-top-count");
+  if (side) { side.hidden = !count; side.textContent = count; }
+  if (top) { top.hidden = !count; top.textContent = count; }
+}
+
+async function openRecycle() {
+  clearSelection();
   try {
-    const r = await req("POST", "/api/deleted/clear", {});
-    toast(r.message || "已恢复全部删除项");
-    await loadProjects();
+    await loadRecycle(false);
+    showView("recycle");
     renderNav();
-    if (state.currentProjectId) {
-      // 恢复后当前项目可能不再存在，校验
-      if (!state.projects.find(p => p.id === state.currentProjectId)) {
-        state.currentProjectId = null;
-        showView("projects");
-      } else {
-        await loadTree();
-        await loadPapers();
-      }
+    renderRecycle();
+  } catch (e) {
+    toast("回收站加载失败：" + e.message, true);
+  }
+}
+
+function recycleKindLabel(kind) {
+  return { project: "项目", folder: "文件夹", paper: "论文" }[kind] || "记录";
+}
+
+function formatRecycleTime(iso) {
+  const date = new Date(iso);
+  if (Number.isNaN(date.getTime())) return "时间未知";
+  return date.toLocaleString("zh-CN", { month: "2-digit", day: "2-digit", hour: "2-digit", minute: "2-digit", hour12: false });
+}
+
+function renderRecycle() {
+  const stats = $("#recycle-stats");
+  const list = $("#recycle-list");
+  if (!stats || !list) return;
+  $("#recycle-retention-days").textContent = `${state.recycleRetentionDays} 天`;
+  const summary = state.recycleSummary;
+  stats.innerHTML = `
+    <div><span>待恢复</span><strong>${summary.total || 0}</strong></div>
+    <div><span>项目</span><strong>${summary.project || 0}</strong></div>
+    <div><span>文件夹</span><strong>${summary.folder || 0}</strong></div>
+    <div><span>论文</span><strong>${summary.paper || 0}</strong></div>`;
+
+  if (!state.recycleItems.length) {
+    list.innerHTML = `<div class="recycle-empty"><svg><use href="#i-archive"/></svg><h4>回收站是空的</h4><p>删除的项目、文件夹和论文会在这里保留 ${state.recycleRetentionDays} 天。</p></div>`;
+    updateRecycleSelectionUI();
+    return;
+  }
+
+  const groups = new Map();
+  state.recycleItems.forEach(item => {
+    const key = String(item.project_id || item.id);
+    if (!groups.has(key)) groups.set(key, { name: item.project_name || "未知项目", items: [] });
+    groups.get(key).items.push(item);
+  });
+  list.innerHTML = [...groups.values()].map(group => `
+    <section class="recycle-group">
+      <header><span>PROJECT</span><h4>${esc(group.name)}</h4><b>${group.items.length} 项</b></header>
+      <div class="recycle-group__items">
+        ${group.items.map(item => `
+          <article class="recycle-row" data-rid="${item.id}" tabindex="0" role="checkbox" aria-checked="false">
+            <label class="lib-sel recycle-row__check" aria-label="选择${esc(item.title)}"><input type="checkbox" class="recycle-chk" data-rid="${item.id}"></label>
+            <div class="recycle-row__kind recycle-row__kind--${item.kind}">${recycleKindLabel(item.kind)}</div>
+            <div class="recycle-row__main">
+              <h5>${esc(item.title)}</h5>
+              <p>${item.folder_path ? `${esc(item.folder_path)} · ` : ""}${esc(item.context)}</p>
+            </div>
+            <div class="recycle-row__time"><span>删除于 ${formatRecycleTime(item.deleted_at)}</span><b class="${item.remaining_days <= 1 ? "is-urgent" : ""}">${item.remaining_days ? `剩余 ${item.remaining_days} 天` : "已到期"}</b></div>
+          </article>`).join("")}
+      </div>
+    </section>`).join("");
+
+  $$(".recycle-row", list).forEach(row => {
+    row.addEventListener("click", (e) => handleRecycleClick(row, e));
+    row.addEventListener("keydown", (e) => {
+      if (e.key === "Enter" || e.key === " ") { e.preventDefault(); handleRecycleClick(row, e); }
+    });
+  });
+  updateRecycleSelectionUI();
+}
+
+function rangeSelectRecycle(target) {
+  const rows = $$(".recycle-row", $("#recycle-list"));
+  const end = rows.indexOf(target);
+  const start = rows.findIndex(row => parseInt(row.dataset.rid) === state.selectionAnchor.recycle);
+  const targetId = parseInt(target.dataset.rid);
+  if (start < 0 || end < 0) {
+    state.selRecycle.add(targetId);
+    state.selectionAnchor.recycle = targetId;
+    return;
+  }
+  const [lo, hi] = start < end ? [start, end] : [end, start];
+  for (let i = lo; i <= hi; i++) state.selRecycle.add(parseInt(rows[i].dataset.rid));
+}
+
+function handleRecycleClick(row, e) {
+  const id = parseInt(row.dataset.rid);
+  if (!id) return;
+  if (e.shiftKey) {
+    rangeSelectRecycle(row);
+  } else {
+    if (state.selRecycle.has(id)) state.selRecycle.delete(id);
+    else state.selRecycle.add(id);
+    state.selectionAnchor.recycle = id;
+  }
+  updateRecycleSelectionUI();
+}
+
+function updateRecycleSelectionUI() {
+  const total = state.selRecycle.size;
+  $$(".recycle-row").forEach(row => {
+    const checked = state.selRecycle.has(parseInt(row.dataset.rid));
+    row.classList.toggle("is-selected", checked);
+    row.setAttribute("aria-checked", String(checked));
+  });
+  $$(".recycle-chk").forEach(box => { box.checked = state.selRecycle.has(parseInt(box.dataset.rid)); });
+  const toolbar = $("#recycle-toolbar");
+  const count = $("#recycle-selection-count");
+  const restore = $("#recycle-restore-btn");
+  const purge = $("#recycle-purge-btn");
+  if (toolbar) toolbar.hidden = total === 0;
+  if (count) count.textContent = `已选中 ${total} 项`;
+  if (restore) restore.disabled = total === 0;
+  if (purge) purge.disabled = total === 0;
+}
+
+async function refreshAfterRecycleChange() {
+  await loadProjects();
+  await loadRecycle(false);
+  renderNav();
+  if (state.currentProjectId) {
+    if (!state.projects.find(p => p.id === state.currentProjectId)) {
+      state.currentProjectId = null;
+      state.currentFolderId = null;
+      showView("projects");
     } else {
-      renderProjects();
+      await loadTree();
+      await loadPapers();
     }
+  }
+}
+
+async function restoreSelectedRecycle() {
+  const ids = [...state.selRecycle];
+  if (!ids.length) return;
+  try {
+    const data = await req("POST", "/api/recycle/restore", { ids });
+    toast(data.message || "已恢复所选内容");
+    clearSelection();
+    await refreshAfterRecycleChange();
+    if (state.currentView === "recycle") renderRecycle();
   } catch (e) {
     toast("恢复失败：" + e.message, true);
+  }
+}
+
+async function purgeSelectedRecycle() {
+  const ids = [...state.selRecycle];
+  if (!ids.length) return;
+  if (!confirm(`确认永久删除选中的 ${ids.length} 项吗？\n此操作会清理对应的论文记录、笔记和截图，且无法恢复。`)) return;
+  try {
+    const data = await req("POST", "/api/recycle/purge", { ids });
+    toast(data.message || "已永久删除所选内容");
+    clearSelection();
+    await refreshAfterRecycleChange();
+    if (state.currentView === "recycle") renderRecycle();
+  } catch (e) {
+    toast("永久删除失败：" + e.message, true);
   }
 }
 function renderProjects() {
@@ -1013,7 +1198,7 @@ function openFolderModal(parentId) {
 async function deleteFolder(fid) {
   const node = findFolder(state.folderTree, fid);
   const extra = node && node.children && node.children.length ? "（含其所有子文件夹）" : "";
-  if (!confirm(`删除文件夹「${node?.name || ""}」${extra}？其中的论文也会一并删除。\n（可点侧边栏「回收站 / 恢复全部」撤销）`)) return;
+  if (!confirm(`删除文件夹「${node?.name || ""}」${extra}？其中的论文会一起进入回收站，可在 7 天内恢复。`)) return;
   const r = await req("DELETE", "/api/folders?id=" + fid);
   toast(r.message || "已删除");
   state.selFolders.delete(fid);
@@ -1021,6 +1206,8 @@ async function deleteFolder(fid) {
   await loadTree();
   await loadPapers();
   await loadProjects();
+  await loadRecycle(false);
+  renderNav();
   updateSelectionUI();
 }
 
@@ -1188,9 +1375,14 @@ function bindGlobal() {
   // 批量删除工具条
   $("#bulk-delete-btn").addEventListener("click", doBulkDelete);
   $("#bulk-clear-sel").addEventListener("click", clearSelection);
-  // 回收站：恢复全部
+  // 回收站
   const recycleBtn = $("#recycle-btn");
-  if (recycleBtn) recycleBtn.addEventListener("click", restoreAllDeleted);
+  if (recycleBtn) recycleBtn.addEventListener("click", openRecycle);
+  const recycleTopBtn = $("#recycle-open-btn");
+  if (recycleTopBtn) recycleTopBtn.addEventListener("click", openRecycle);
+  $("#recycle-restore-btn").addEventListener("click", restoreSelectedRecycle);
+  $("#recycle-purge-btn").addEventListener("click", purgeSelectedRecycle);
+  $("#recycle-clear-sel").addEventListener("click", clearSelection);
   // Esc 清空选择
   document.addEventListener("keydown", (e) => { if (e.key === "Escape") clearSelection(); });
 }

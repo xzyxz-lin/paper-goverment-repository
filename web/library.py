@@ -22,11 +22,12 @@ import json
 import os
 import re
 import secrets
+import shutil
 import sqlite3
 import subprocess
 import threading
 import uuid
-from datetime import datetime
+from datetime import datetime, timedelta
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from urllib.parse import urlparse, parse_qs, unquote
@@ -37,6 +38,7 @@ PROJECT_DIR = APP_DIR.parent
 DB_PATH = PROJECT_DIR / "data" / "library.db"
 ASSET_DIR = PROJECT_DIR / "picture asset"
 DELETED_PATH = PROJECT_DIR / "data" / "deleted.json"
+RECYCLE_RETENTION_DAYS = 7
 DB_PATH.parent.mkdir(parents=True, exist_ok=True)
 ASSET_DIR.mkdir(parents=True, exist_ok=True)
 
@@ -168,6 +170,403 @@ def _soft_delete_folders(fids: list[int]) -> int:
     save_deleted(d)
     return len(target_folders)
 
+
+# ===== 结构化回收站（默认保留 7 天） =====
+def _recycle_now() -> datetime:
+    return datetime.now().astimezone()
+
+
+def _recycle_related(record: sqlite3.Row | dict) -> dict[str, list[int]]:
+    """读取回收记录关联的删除索引；兼容缺失字段的旧记录。"""
+    raw = record["related_json"] if isinstance(record, sqlite3.Row) else record.get("related_json", "{}")
+    try:
+        data = json.loads(raw or "{}")
+    except (TypeError, json.JSONDecodeError):
+        data = {}
+    out = {"projects": [], "folders": [], "papers": []}
+    for key in out:
+        out[key] = [int(x) for x in data.get(key, []) if str(x).isdigit()]
+    if not any(out.values()):
+        kind = record["kind"] if isinstance(record, sqlite3.Row) else record.get("kind")
+        entity_id = int(record["entity_id"] if isinstance(record, sqlite3.Row) else record.get("entity_id", 0))
+        key = {"project": "projects", "folder": "folders", "paper": "papers"}.get(kind)
+        if key and entity_id:
+            out[key] = [entity_id]
+    return out
+
+
+def _write_deleted_sets(data: dict, related: dict[str, list[int]], add: bool) -> None:
+    """把一条回收记录对应的可见性索引写入/移出旧删除索引。"""
+    for key in ("projects", "folders", "papers"):
+        current = set(data.get(key, []))
+        ids = set(related.get(key, []))
+        if add:
+            current.update(ids)
+        else:
+            current.difference_update(ids)
+        data[key] = sorted(current)
+
+
+def _folder_descendants(rows: list[dict], root_ids: list[int]) -> set[int]:
+    return _descendant_folder_ids(rows, root_ids)
+
+
+def _owned_folder_rows(conn: sqlite3.Connection, user_id: int) -> list[dict]:
+    rows = conn.execute(
+        """SELECT f.id, f.project_id, f.parent_id, f.name
+           FROM folder f JOIN project p ON p.id = f.project_id
+           WHERE p.user_id = ?""",
+        (user_id,),
+    ).fetchall()
+    return [dict(row) for row in rows]
+
+
+def _recycle_insert(
+    conn: sqlite3.Connection,
+    user_id: int,
+    kind: str,
+    entity_id: int,
+    project_id: int | None,
+    folder_id: int | None,
+    related: dict[str, list[int]],
+) -> bool:
+    now = _recycle_now()
+    cur = conn.execute(
+        """INSERT OR IGNORE INTO recycle_item
+           (user_id, kind, entity_id, project_id, folder_id, related_json, deleted_at, expires_at)
+           VALUES (?,?,?,?,?,?,?,?)""",
+        (
+            user_id,
+            kind,
+            entity_id,
+            project_id,
+            folder_id,
+            json.dumps(related, ensure_ascii=False),
+            now.isoformat(timespec="seconds"),
+            (now + timedelta(days=RECYCLE_RETENTION_DAYS)).isoformat(timespec="seconds"),
+        ),
+    )
+    return cur.rowcount > 0
+
+
+def move_to_recycle(user_id: int, kind: str, ids: list[int]) -> int:
+    """验证归属后把项目、文件夹或论文移入回收站，返回新增的根项目数。"""
+    ids = sorted({int(x) for x in ids if x})
+    if not ids:
+        return 0
+    purge_expired_recycle_items()
+    conn = get_db()
+    deleted = load_deleted()
+    added = 0
+
+    if kind == "project":
+        placeholders = ",".join("?" for _ in ids)
+        rows = conn.execute(
+            f"SELECT id FROM project WHERE user_id = ? AND id IN ({placeholders})",
+            [user_id, *ids],
+        ).fetchall()
+        for row in rows:
+            project_id = row["id"]
+            related = {"projects": [project_id], "folders": [], "papers": []}
+            if _recycle_insert(conn, user_id, "project", project_id, project_id, None, related):
+                _write_deleted_sets(deleted, related, True)
+                added += 1
+
+    elif kind == "folder":
+        folder_rows = _owned_folder_rows(conn, user_id)
+        by_id = {row["id"]: row for row in folder_rows}
+        selected = [by_id[x] for x in ids if x in by_id]
+        selected_ids = {row["id"] for row in selected}
+        # 多选了父子文件夹时，只记录最外层文件夹，恢复/清除时语义更清楚。
+        roots = []
+        for row in selected:
+            cur = row["parent_id"]
+            nested = False
+            while cur is not None:
+                if cur in selected_ids:
+                    nested = True
+                    break
+                cur = by_id.get(cur, {}).get("parent_id")
+            if not nested:
+                roots.append(row)
+        for row in roots:
+            folder_ids = sorted(_folder_descendants(folder_rows, [row["id"]]))
+            if folder_ids:
+                placeholders = ",".join("?" for _ in folder_ids)
+                paper_rows = conn.execute(
+                    f"SELECT id FROM paper WHERE folder_id IN ({placeholders})", folder_ids
+                ).fetchall()
+                paper_ids = [paper["id"] for paper in paper_rows]
+            else:
+                paper_ids = []
+            related = {"projects": [], "folders": folder_ids, "papers": paper_ids}
+            if _recycle_insert(conn, user_id, "folder", row["id"], row["project_id"], row["id"], related):
+                _write_deleted_sets(deleted, related, True)
+                added += 1
+
+    elif kind == "paper":
+        placeholders = ",".join("?" for _ in ids)
+        rows = conn.execute(
+            f"""SELECT pa.id, pa.folder_id, f.project_id
+                FROM paper pa
+                JOIN folder f ON f.id = pa.folder_id
+                JOIN project p ON p.id = f.project_id
+                WHERE p.user_id = ? AND pa.id IN ({placeholders})""",
+            [user_id, *ids],
+        ).fetchall()
+        for row in rows:
+            paper_id = row["id"]
+            related = {"projects": [], "folders": [], "papers": [paper_id]}
+            if _recycle_insert(conn, user_id, "paper", paper_id, row["project_id"], row["folder_id"], related):
+                _write_deleted_sets(deleted, related, True)
+                added += 1
+    else:
+        raise ValueError("不支持的回收类型")
+
+    conn.commit()
+    save_deleted(deleted)
+    return added
+
+
+def _folder_path(conn: sqlite3.Connection, folder_id: int | None) -> str:
+    if not folder_id:
+        return "根目录"
+    row = conn.execute("SELECT project_id FROM folder WHERE id = ?", (folder_id,)).fetchone()
+    if not row:
+        return "根目录"
+    rows = conn.execute("SELECT id, parent_id, name FROM folder WHERE project_id = ?", (row["project_id"],)).fetchall()
+    by_id = {item["id"]: item for item in rows}
+    names: list[str] = []
+    cur = by_id.get(folder_id)
+    while cur:
+        names.append(cur["name"])
+        cur = by_id.get(cur["parent_id"])
+    return " / ".join(reversed(names)) or "根目录"
+
+
+def _recycle_item_view(conn: sqlite3.Connection, record: sqlite3.Row) -> dict | None:
+    kind = record["kind"]
+    entity_id = record["entity_id"]
+    if kind == "project":
+        row = conn.execute("SELECT id, name FROM project WHERE id = ?", (entity_id,)).fetchone()
+        if not row:
+            return None
+        folder_count = conn.execute("SELECT COUNT(*) c FROM folder WHERE project_id = ?", (entity_id,)).fetchone()["c"]
+        paper_count = conn.execute(
+            "SELECT COUNT(*) c FROM paper WHERE folder_id IN (SELECT id FROM folder WHERE project_id = ?)", (entity_id,)
+        ).fetchone()["c"]
+        title = row["name"]
+        context = f"包含 {folder_count} 个文件夹、{paper_count} 篇论文"
+        folder_path = ""
+    elif kind == "folder":
+        row = conn.execute(
+            """SELECT f.id, f.name, f.project_id, p.name project_name
+               FROM folder f JOIN project p ON p.id = f.project_id WHERE f.id = ?""",
+            (entity_id,),
+        ).fetchone()
+        if not row:
+            return None
+        related = _recycle_related(record)
+        title = row["name"]
+        folder_path = _folder_path(conn, entity_id)
+        context = f"包含 {max(0, len(related['folders']) - 1)} 个子文件夹、{len(related['papers'])} 篇论文"
+    else:
+        row = conn.execute(
+            """SELECT pa.id, pa.title_en, pa.title_zh, pa.journal, f.id folder_id, f.project_id, p.name project_name
+               FROM paper pa
+               JOIN folder f ON f.id = pa.folder_id
+               JOIN project p ON p.id = f.project_id WHERE pa.id = ?""",
+            (entity_id,),
+        ).fetchone()
+        if not row:
+            return None
+        title = row["title_en"] or row["title_zh"] or "（未命名论文）"
+        folder_path = _folder_path(conn, row["folder_id"])
+        context = row["journal"] or "论文记录"
+
+    project_id = record["project_id"] or (row["project_id"] if "project_id" in row.keys() else row["id"])
+    project_name = row["project_name"] if "project_name" in row.keys() else row["name"]
+    expires_at = datetime.fromisoformat(record["expires_at"])
+    remain_seconds = max(0, int((expires_at - _recycle_now()).total_seconds()))
+    remaining_days = max(1, (remain_seconds + 86399) // 86400) if remain_seconds else 0
+    return {
+        "id": record["id"],
+        "kind": kind,
+        "entity_id": entity_id,
+        "project_id": project_id,
+        "project_name": project_name,
+        "folder_path": folder_path,
+        "title": title,
+        "context": context,
+        "deleted_at": record["deleted_at"],
+        "expires_at": record["expires_at"],
+        "remaining_days": remaining_days,
+    }
+
+
+def list_recycle_items(user_id: int) -> tuple[list[dict], dict]:
+    purge_expired_recycle_items()
+    conn = get_db()
+    records = conn.execute(
+        "SELECT * FROM recycle_item WHERE user_id = ? ORDER BY expires_at, id DESC", (user_id,)
+    ).fetchall()
+    items = [item for record in records if (item := _recycle_item_view(conn, record))]
+    summary = {"total": len(items), "project": 0, "folder": 0, "paper": 0}
+    for item in items:
+        summary[item["kind"]] += 1
+    return items, summary
+
+
+def _image_paths_for_related(conn: sqlite3.Connection, related: dict[str, list[int]]) -> list[str]:
+    paper_ids = related.get("papers", [])
+    project_ids = related.get("projects", [])
+    folder_ids = related.get("folders", [])
+    if project_ids:
+        placeholders = ",".join("?" for _ in project_ids)
+        paper_rows = conn.execute(
+            f"SELECT id FROM paper WHERE folder_id IN (SELECT id FROM folder WHERE project_id IN ({placeholders}))", project_ids
+        ).fetchall()
+        paper_ids = list({*paper_ids, *(row["id"] for row in paper_rows)})
+    if folder_ids:
+        placeholders = ",".join("?" for _ in folder_ids)
+        paper_rows = conn.execute(f"SELECT id FROM paper WHERE folder_id IN ({placeholders})", folder_ids).fetchall()
+        paper_ids = list({*paper_ids, *(row["id"] for row in paper_rows)})
+    if not paper_ids:
+        return []
+    placeholders = ",".join("?" for _ in paper_ids)
+    rows = conn.execute(
+        f"SELECT i.file_path FROM image i JOIN note n ON n.id = i.note_id WHERE n.paper_id IN ({placeholders})", paper_ids
+    ).fetchall()
+    return [row["file_path"] for row in rows]
+
+
+def _remove_asset_files(paths: list[str]) -> None:
+    root = ASSET_DIR.resolve()
+    for raw_path in paths:
+        try:
+            target = Path(raw_path).resolve()
+            target.relative_to(root)
+            target.unlink(missing_ok=True)
+            parent = target.parent
+            while parent != root:
+                try:
+                    parent.rmdir()
+                except OSError:
+                    break
+                parent = parent.parent
+        except (OSError, ValueError):
+            continue
+
+
+def _delete_recycle_records(records: list[sqlite3.Row]) -> int:
+    """永久删除回收记录对应的数据和截图，仅由手动永久删除或 7 天到期调用。"""
+    if not records:
+        return 0
+    conn = get_db()
+    deleted_index = load_deleted()
+    removed = 0
+    for record in records:
+        related = _recycle_related(record)
+        asset_paths = _image_paths_for_related(conn, related)
+        kind = record["kind"]
+        entity_id = record["entity_id"]
+        if kind == "project":
+            cur = conn.execute("DELETE FROM project WHERE id = ? AND user_id = ?", (entity_id, record["user_id"]))
+        elif kind == "folder":
+            cur = conn.execute(
+                """DELETE FROM folder WHERE id = ? AND project_id IN
+                   (SELECT id FROM project WHERE user_id = ?)""",
+                (entity_id, record["user_id"]),
+            )
+        else:
+            cur = conn.execute(
+                """DELETE FROM paper WHERE id = ? AND folder_id IN
+                   (SELECT f.id FROM folder f JOIN project p ON p.id = f.project_id WHERE p.user_id = ?)""",
+                (entity_id, record["user_id"]),
+            )
+        _write_deleted_sets(deleted_index, related, False)
+        conn.execute("DELETE FROM recycle_item WHERE id = ?", (record["id"],))
+        if cur.rowcount:
+            _remove_asset_files(asset_paths)
+            removed += 1
+    conn.commit()
+    save_deleted(deleted_index)
+    return removed
+
+
+def purge_expired_recycle_items() -> int:
+    conn = get_db()
+    now = _recycle_now().isoformat(timespec="seconds")
+    records = conn.execute("SELECT * FROM recycle_item WHERE expires_at <= ?", (now,)).fetchall()
+    return _delete_recycle_records(records)
+
+
+def restore_recycle_items(user_id: int, recycle_ids: list[int] | None = None) -> int:
+    conn = get_db()
+    purge_expired_recycle_items()
+    params: list = [user_id]
+    sql = "SELECT * FROM recycle_item WHERE user_id = ?"
+    if recycle_ids is not None:
+        ids = sorted({int(x) for x in recycle_ids if x})
+        if not ids:
+            return 0
+        placeholders = ",".join("?" for _ in ids)
+        sql += f" AND id IN ({placeholders})"
+        params += ids
+    records = conn.execute(sql, params).fetchall()
+    if not records:
+        return 0
+    deleted_index = load_deleted()
+    for record in records:
+        _write_deleted_sets(deleted_index, _recycle_related(record), False)
+    ids = [record["id"] for record in records]
+    placeholders = ",".join("?" for _ in ids)
+    conn.execute(f"DELETE FROM recycle_item WHERE id IN ({placeholders})", ids)
+    conn.commit()
+    save_deleted(deleted_index)
+    return len(records)
+
+
+def purge_recycle_items(user_id: int, recycle_ids: list[int]) -> int:
+    purge_expired_recycle_items()
+    ids = sorted({int(x) for x in recycle_ids if x})
+    if not ids:
+        return 0
+    placeholders = ",".join("?" for _ in ids)
+    records = get_db().execute(
+        f"SELECT * FROM recycle_item WHERE user_id = ? AND id IN ({placeholders})", [user_id, *ids]
+    ).fetchall()
+    return _delete_recycle_records(records)
+
+
+def migrate_legacy_deleted_index() -> None:
+    """把旧 deleted.json 中的已有删除项登记为新的 7 天回收记录，保留原索引作可见性控制。"""
+    deleted = load_deleted()
+    if deleted.get("_recycle_v2_migrated"):
+        return
+    conn = get_db()
+    for kind, table, id_col, join_sql in (
+        ("project", "project", "id", "SELECT id, user_id FROM project WHERE id IN ({})"),
+        ("folder", "folder", "id", """SELECT f.id, p.user_id FROM folder f
+            JOIN project p ON p.id = f.project_id WHERE f.id IN ({})"""),
+        ("paper", "paper", "id", """SELECT pa.id, p.user_id FROM paper pa
+            JOIN folder f ON f.id = pa.folder_id JOIN project p ON p.id = f.project_id WHERE pa.id IN ({})"""),
+    ):
+        key = kind + "s" if kind != "paper" else "papers"
+        ids = [int(x) for x in deleted.get(key, []) if x]
+        if not ids:
+            continue
+        placeholders = ",".join("?" for _ in ids)
+        rows = conn.execute(join_sql.format(placeholders), ids).fetchall()
+        by_user: dict[int, list[int]] = {}
+        for row in rows:
+            by_user.setdefault(row["user_id"], []).append(row["id"])
+        for user_id, owned_ids in by_user.items():
+            move_to_recycle(user_id, kind, owned_ids)
+    deleted = load_deleted()
+    deleted["_recycle_v2_migrated"] = _recycle_now().isoformat(timespec="seconds")
+    save_deleted(deleted)
+
 # ===== 数据库连接（每线程独立） =====
 _local = threading.local()
 
@@ -234,6 +633,20 @@ def init_db() -> None:
             rel_path TEXT NOT NULL,
             created_at TEXT NOT NULL
         );
+        CREATE TABLE IF NOT EXISTS recycle_item (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            user_id INTEGER NOT NULL REFERENCES user(id) ON DELETE CASCADE,
+            kind TEXT NOT NULL CHECK(kind IN ('project', 'folder', 'paper')),
+            entity_id INTEGER NOT NULL,
+            project_id INTEGER,
+            folder_id INTEGER,
+            related_json TEXT NOT NULL DEFAULT '{}',
+            deleted_at TEXT NOT NULL,
+            expires_at TEXT NOT NULL,
+            UNIQUE(kind, entity_id)
+        );
+        CREATE INDEX IF NOT EXISTS idx_recycle_item_user_expiry
+            ON recycle_item(user_id, expires_at);
         """
     )
     conn.commit()
@@ -743,6 +1156,7 @@ class Handler(BaseHTTPRequestHandler):
             elif path.startswith("/assets/"):
                 asset_response(self, path[len("/assets/"):])
             elif path == "/api/health":
+                purge_expired_recycle_items()
                 json_response(self, {"ok": True, "db": str(DB_PATH)})
             elif path == "/api/me":
                 uid = require_user(self)
@@ -757,7 +1171,10 @@ class Handler(BaseHTTPRequestHandler):
                     self._error(401, "未登录")
                     return
                 conn = get_db()
-                deleted_proj_ids = load_deleted().get("projects", [])
+                deleted = load_deleted()
+                deleted_proj_ids = deleted.get("projects", [])
+                deleted_folder_ids = deleted.get("folders", [])
+                deleted_paper_ids = deleted.get("papers", [])
                 if deleted_proj_ids:
                     placeholders = ",".join("?" for _ in deleted_proj_ids)
                     rows = conn.execute(
@@ -771,13 +1188,22 @@ class Handler(BaseHTTPRequestHandler):
                 projects = []
                 for r in rows:
                     d = dict(r)
-                    d["folder_count"] = conn.execute(
-                        "SELECT COUNT(*) c FROM folder WHERE project_id = ?", (r["id"],)
-                    ).fetchone()["c"]
-                    d["paper_count"] = conn.execute(
-                        "SELECT COUNT(*) c FROM paper WHERE folder_id IN "
-                        "(SELECT id FROM folder WHERE project_id = ?)", (r["id"],)
-                    ).fetchone()["c"]
+                    folder_sql = "SELECT COUNT(*) c FROM folder WHERE project_id = ?"
+                    folder_params: list = [r["id"]]
+                    if deleted_folder_ids:
+                        folder_sql += " AND id NOT IN ({})".format(",".join("?" for _ in deleted_folder_ids))
+                        folder_params += deleted_folder_ids
+                    d["folder_count"] = conn.execute(folder_sql, folder_params).fetchone()["c"]
+                    paper_sql = """SELECT COUNT(*) c FROM paper pa
+                        JOIN folder f ON f.id = pa.folder_id WHERE f.project_id = ?"""
+                    paper_params: list = [r["id"]]
+                    if deleted_folder_ids:
+                        paper_sql += " AND f.id NOT IN ({})".format(",".join("?" for _ in deleted_folder_ids))
+                        paper_params += deleted_folder_ids
+                    if deleted_paper_ids:
+                        paper_sql += " AND pa.id NOT IN ({})".format(",".join("?" for _ in deleted_paper_ids))
+                        paper_params += deleted_paper_ids
+                    d["paper_count"] = conn.execute(paper_sql, paper_params).fetchone()["c"]
                     projects.append(d)
                 json_response(self, {"projects": projects})
             elif path == "/api/projects/tree":
@@ -786,6 +1212,13 @@ class Handler(BaseHTTPRequestHandler):
                     self._error(401, "未登录")
                     return
                 pid = int((qs.get("id") or [None])[0])
+                own = get_db().execute("SELECT id FROM project WHERE id = ? AND user_id = ?", (pid, uid)).fetchone()
+                if not own:
+                    self._error(404, "项目不存在")
+                    return
+                if pid in load_deleted().get("projects", []):
+                    self._error(404, "项目已移入回收站")
+                    return
                 json_response(self, {"folders": build_folder_tree(pid)})
             elif path == "/api/papers":
                 uid = require_user(self)
@@ -800,26 +1233,30 @@ class Handler(BaseHTTPRequestHandler):
                 # 计算当前用户可见的所有「未软删的文件夹」id（用于过滤在已删除文件夹里的论文）
                 # 注意：这里不区分项目，因 papers 接口本身受 folder_id / 搜索参数约束
                 deleted_folder_ids = list(deleted.get("folders", []))
+                deleted_project_ids = list(deleted.get("projects", []))
                 # 拼装 WHERE
-                conds = []
-                params: list = []
+                conds = ["pr.user_id = ?"]
+                params: list = [uid]
                 if fid:
-                    conds.append("folder_id = ?")
+                    conds.append("pa.folder_id = ?")
                     params.append(int(fid))
                 if q:
-                    conds.append("(title_en LIKE ? OR title_zh LIKE ? OR authors LIKE ? OR journal LIKE ?)")
+                    conds.append("(pa.title_en LIKE ? OR pa.title_zh LIKE ? OR pa.authors LIKE ? OR pa.journal LIKE ?)")
                     like = f"%{q}%"
                     params += [like, like, like, like]
                 if deleted_paper_ids:
-                    conds.append("id NOT IN ({})".format(",".join("?" for _ in deleted_paper_ids)))
+                    conds.append("pa.id NOT IN ({})".format(",".join("?" for _ in deleted_paper_ids)))
                     params += deleted_paper_ids
                 if deleted_folder_ids:
-                    conds.append("folder_id NOT IN ({})".format(",".join("?" for _ in deleted_folder_ids)))
+                    conds.append("f.id NOT IN ({})".format(",".join("?" for _ in deleted_folder_ids)))
                     params += deleted_folder_ids
-                sql = "SELECT * FROM paper"
-                if conds:
-                    sql += " WHERE " + " AND ".join(conds)
-                sql += " ORDER BY id DESC"
+                if deleted_project_ids:
+                    conds.append("pr.id NOT IN ({})".format(",".join("?" for _ in deleted_project_ids)))
+                    params += deleted_project_ids
+                sql = """SELECT pa.* FROM paper pa
+                    JOIN folder f ON f.id = pa.folder_id
+                    JOIN project pr ON pr.id = f.project_id
+                    WHERE """ + " AND ".join(conds) + " ORDER BY pa.id DESC"
                 rows = conn.execute(sql, params).fetchall()
                 papers = []
                 for r in rows:
@@ -843,7 +1280,13 @@ class Handler(BaseHTTPRequestHandler):
                     return
                 pid = int((qs.get("id") or [None])[0])
                 conn = get_db()
-                r = conn.execute("SELECT * FROM paper WHERE id = ?", (pid,)).fetchone()
+                r = conn.execute(
+                    """SELECT pa.*, f.project_id AS _project_id FROM paper pa
+                       JOIN folder f ON f.id = pa.folder_id
+                       JOIN project pr ON pr.id = f.project_id
+                       WHERE pa.id = ? AND pr.user_id = ?""",
+                    (pid, uid),
+                ).fetchone()
                 if not r:
                     self._error(404, "论文不存在")
                     return
@@ -855,6 +1298,9 @@ class Handler(BaseHTTPRequestHandler):
                 if r["folder_id"] in deleted.get("folders", []):
                     self._error(404, "论文所在文件夹已被删除")
                     return
+                if r["_project_id"] in deleted.get("projects", []):
+                    self._error(404, "论文所在项目已被删除")
+                    return
                 d = dict(r)
                 d["notes"] = []
                 for n in conn.execute("SELECT * FROM note WHERE paper_id = ? ORDER BY id", (pid,)).fetchall():
@@ -864,6 +1310,13 @@ class Handler(BaseHTTPRequestHandler):
                     ).fetchall()]
                     d["notes"].append(nd)
                 json_response(self, {"paper": d})
+            elif path == "/api/recycle":
+                uid = require_user(self)
+                if not uid:
+                    self._error(401, "未登录")
+                    return
+                items, summary = list_recycle_items(uid)
+                json_response(self, {"items": items, "summary": summary, "retention_days": RECYCLE_RETENTION_DAYS})
             else:
                 self._error(404, "Not Found")
         except Exception as e:
@@ -924,7 +1377,7 @@ class Handler(BaseHTTPRequestHandler):
                     self._error(401, "未登录")
                     return
                 ids = [int(x) for x in (_read_json_body(self).get("ids") or []) if x]
-                added = _soft_delete_one_batch("projects", ids)
+                added = move_to_recycle(uid, "project", ids)
                 json_response(self, {"ok": True, "deleted": added, "message": f"已删除 {added} 个项目"})
             elif path == "/api/folders/delete":
                 uid = require_user(self)
@@ -932,7 +1385,7 @@ class Handler(BaseHTTPRequestHandler):
                     self._error(401, "未登录")
                     return
                 ids = [int(x) for x in (_read_json_body(self).get("ids") or []) if x]
-                added = _soft_delete_folders(ids)
+                added = move_to_recycle(uid, "folder", ids)
                 json_response(self, {"ok": True, "deleted": added, "message": f"已删除 {added} 个文件夹"})
             elif path == "/api/papers/delete":
                 uid = require_user(self)
@@ -940,16 +1393,31 @@ class Handler(BaseHTTPRequestHandler):
                     self._error(401, "未登录")
                     return
                 ids = [int(x) for x in (_read_json_body(self).get("ids") or []) if x]
-                added = _soft_delete_one_batch("papers", ids)
+                added = move_to_recycle(uid, "paper", ids)
                 json_response(self, {"ok": True, "deleted": added, "message": f"已删除 {added} 篇论文"})
             elif path == "/api/deleted/clear":
                 uid = require_user(self)
                 if not uid:
                     self._error(401, "未登录")
                     return
-                # 清空所有删除索引 = 全部恢复
-                save_deleted(_deleted_empty())
-                json_response(self, {"ok": True, "message": "已恢复全部删除项"})
+                restored = restore_recycle_items(uid)
+                json_response(self, {"ok": True, "restored": restored, "message": f"已恢复 {restored} 项"})
+            elif path == "/api/recycle/restore":
+                uid = require_user(self)
+                if not uid:
+                    self._error(401, "未登录")
+                    return
+                ids = [int(x) for x in (_read_json_body(self).get("ids") or []) if x]
+                restored = restore_recycle_items(uid, ids)
+                json_response(self, {"ok": True, "restored": restored, "message": f"已恢复 {restored} 项"})
+            elif path == "/api/recycle/purge":
+                uid = require_user(self)
+                if not uid:
+                    self._error(401, "未登录")
+                    return
+                ids = [int(x) for x in (_read_json_body(self).get("ids") or []) if x]
+                purged = purge_recycle_items(uid, ids)
+                json_response(self, {"ok": True, "purged": purged, "message": f"已永久删除 {purged} 项"})
             elif path == "/api/projects":
                 uid = require_user(self)
                 if not uid:
@@ -981,6 +1449,15 @@ class Handler(BaseHTTPRequestHandler):
                     self._error(400, "文件夹名不能为空")
                     return
                 conn = get_db()
+                project = conn.execute("SELECT id FROM project WHERE id = ? AND user_id = ?", (project_id, uid)).fetchone()
+                if not project:
+                    self._error(404, "项目不存在")
+                    return
+                if parent_id:
+                    parent = conn.execute("SELECT id FROM folder WHERE id = ? AND project_id = ?", (parent_id, project_id)).fetchone()
+                    if not parent:
+                        self._error(400, "父文件夹不存在")
+                        return
                 cur = conn.execute(
                     "INSERT INTO folder (project_id, parent_id, name, sort_order, created_at) VALUES (?,?,?,0,?)",
                     (project_id, parent_id, name, now_iso()),
@@ -995,6 +1472,14 @@ class Handler(BaseHTTPRequestHandler):
                 body = _read_json_body(self)
                 folder_id = int(body.get("folder_id"))
                 conn = get_db()
+                folder = conn.execute(
+                    """SELECT f.id FROM folder f JOIN project p ON p.id = f.project_id
+                       WHERE f.id = ? AND p.user_id = ?""",
+                    (folder_id, uid),
+                ).fetchone()
+                if not folder:
+                    self._error(404, "文件夹不存在")
+                    return
                 cur = conn.execute(
                     """INSERT INTO paper
                        (folder_id, title_en, title_zh, journal, authors, publish_date, doi, url, local_path, created_at)
@@ -1101,7 +1586,8 @@ class Handler(BaseHTTPRequestHandler):
                 conn = get_db()
                 cur = conn.execute(
                     """UPDATE paper SET title_en=?, title_zh=?, journal=?, authors=?,
-                       publish_date=?, doi=?, url=?, local_path=? WHERE id=?""",
+                       publish_date=?, doi=?, url=?, local_path=? WHERE id=? AND folder_id IN
+                       (SELECT f.id FROM folder f JOIN project p ON p.id = f.project_id WHERE p.user_id = ?)""",
                     (
                         body.get("title_en", "").strip(),
                         body.get("title_zh", "").strip(),
@@ -1112,6 +1598,7 @@ class Handler(BaseHTTPRequestHandler):
                         body.get("url", "").strip(),
                         body.get("local_path", "").strip(),
                         pid,
+                        uid,
                     ),
                 )
                 conn.commit()
@@ -1125,7 +1612,10 @@ class Handler(BaseHTTPRequestHandler):
                 nid = int(body.get("id"))
                 conn = get_db()
                 cur = conn.execute(
-                    "UPDATE note SET content=? WHERE id=?", (body.get("content", ""), nid)
+                    """UPDATE note SET content=? WHERE id=? AND paper_id IN
+                       (SELECT pa.id FROM paper pa JOIN folder f ON f.id = pa.folder_id
+                        JOIN project p ON p.id = f.project_id WHERE p.user_id = ?)""",
+                    (body.get("content", ""), nid, uid),
                 )
                 conn.commit()
                 json_response(self, {"ok": True, "updated": cur.rowcount})
@@ -1146,30 +1636,40 @@ class Handler(BaseHTTPRequestHandler):
             # 兼容旧 API：单条软删
             if path == "/api/projects":
                 pid = int((qs.get("id") or [None])[0])
-                _soft_delete_one("projects", pid)
-                json_response(self, {"ok": True, "deleted": 1, "message": "已删除项目（可恢复）"})
+                added = move_to_recycle(uid, "project", [pid])
+                json_response(self, {"ok": True, "deleted": added, "message": "已删除项目（可在回收站恢复）"})
                 return
             if path == "/api/folders":
                 fid = int((qs.get("id") or [None])[0])
-                added = _soft_delete_folders([fid])
-                json_response(self, {"ok": True, "deleted": added, "message": f"已删除 {added} 项（可恢复）"})
+                added = move_to_recycle(uid, "folder", [fid])
+                json_response(self, {"ok": True, "deleted": added, "message": f"已删除 {added} 个文件夹（可在回收站恢复）"})
                 return
             if path == "/api/papers":
                 pid = int((qs.get("id") or [None])[0])
-                _soft_delete_one("papers", pid)
-                json_response(self, {"ok": True, "deleted": 1, "message": "已删除论文（可恢复）"})
+                added = move_to_recycle(uid, "paper", [pid])
+                json_response(self, {"ok": True, "deleted": added, "message": "已删除论文（可在回收站恢复）"})
                 return
             if path == "/api/notes":
                 nid = int((qs.get("id") or [None])[0])
                 conn = get_db()
-                conn.execute("DELETE FROM note WHERE id = ?", (nid,))
+                conn.execute(
+                    """DELETE FROM note WHERE id = ? AND paper_id IN
+                       (SELECT pa.id FROM paper pa JOIN folder f ON f.id = pa.folder_id
+                        JOIN project p ON p.id = f.project_id WHERE p.user_id = ?)""",
+                    (nid, uid),
+                )
                 conn.commit()
                 json_response(self, {"ok": True})
                 return
             if path == "/api/notes/images":
                 iid = int((qs.get("id") or [None])[0])
                 conn = get_db()
-                img = conn.execute("SELECT * FROM image WHERE id = ?", (iid,)).fetchone()
+                img = conn.execute(
+                    """SELECT i.* FROM image i JOIN note n ON n.id = i.note_id
+                       JOIN paper pa ON pa.id = n.paper_id JOIN folder f ON f.id = pa.folder_id
+                       JOIN project p ON p.id = f.project_id WHERE i.id = ? AND p.user_id = ?""",
+                    (iid, uid),
+                ).fetchone()
                 if img:
                     try:
                         Path(img["file_path"]).unlink(missing_ok=True)
@@ -1191,6 +1691,8 @@ def main():
     args = parser.parse_args()
 
     init_db()
+    migrate_legacy_deleted_index()
+    purge_expired_recycle_items()
     server = ThreadingHTTPServer((args.host, args.port), Handler)
     print(f"Private Library running at http://127.0.0.1:{args.port} (host={args.host})")
     print(f"DB: {DB_PATH}")
