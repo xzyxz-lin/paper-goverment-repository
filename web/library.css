@@ -108,6 +108,10 @@ body.view-paper-view header.topbar > .topbar-actions { display: none !important;
 .scan-button { display: inline-flex; align-items: center; gap: 9px; min-height: 44px; padding: 0 17px; color: white; background: var(--oxide-700); border: 1px solid var(--oxide-700); border-radius: 3px; font-weight: 650; box-shadow: 0 8px 24px rgba(31,91,87,.18); transition: transform .18s ease, background .18s ease; cursor: pointer; }
 .scan-button:hover { background: var(--oxide-600); transform: translateY(-1px); }
 .scan-button--ghost { color: var(--oxide-700); background: transparent; box-shadow: none; border-color: var(--paper-400); }
+.note-flag-btn { display: inline-flex; align-items: center; gap: 6px; color: var(--danger-600); border-color: rgba(166,58,53,.4); }
+.note-flag-btn svg { width: 13px; height: 13px; }
+.note-flag-btn.is-active { color: #fff; background: var(--danger-600); border-color: var(--danger-600); }
+.note-flag-btn.is-active:hover { background: #8f302b; }
 .scan-button--ghost:hover { background: var(--paper-100); border-color: var(--oxide-600); }
 .scan-button.is-running svg { animation: spin 1s linear infinite; }
 .scan-button:disabled { cursor: wait; opacity: .7; transform: none; }
@@ -631,7 +635,8 @@ body.view-paper-view header.topbar > .topbar-actions { display: none !important;
 .open-actions .article-open--ghost:hover { background: var(--paper-100); }
 
 /* 思考标注 */
-.note-card { margin-bottom: 14px; padding: 16px 18px; background: var(--white); border: 1px solid var(--paper-200); border-left: 3px solid var(--copper-500); border-radius: 3px; }
+.note-card { position: relative; margin-bottom: 14px; padding: 16px 18px; background: var(--white); border: 1px solid var(--paper-200); border-left: 3px solid var(--copper-500); border-radius: 3px; }
+.note-card.is-flagged { border-left-color: var(--danger-600); }
 .note-card__head { display: flex; align-items: center; justify-content: space-between; margin-bottom: 10px; }
 .note-card__time { color: var(--ink-700); font: 500 .68rem var(--font-data); }
 .note-card__actions { display: inline-flex; align-items: center; gap: 4px; }
@@ -643,6 +648,24 @@ body.view-paper-view header.topbar > .topbar-actions { display: none !important;
 .note-card__check input { width: 16px; height: 16px; accent-color: var(--oxide-700); cursor: pointer; }
 .note-card.is-selected { background: rgba(31,91,87,.06); border-color: rgba(31,91,87,.35); box-shadow: inset 3px 0 0 var(--oxide-700); }
 .note-card__text { margin: 0; color: var(--ink-900); font-size: .88rem; line-height: 1.7; white-space: pre-wrap; word-break: break-word; }
+
+/* 思考标记：未想透待复查的大叹号 */
+.note-flag {
+  position: absolute; top: -10px; left: -10px; z-index: 2;
+  display: inline-flex; align-items: center; justify-content: center;
+  width: 26px; height: 26px;
+  font: 800 1rem/1 var(--font-display); color: #fff;
+  background: var(--danger-600);
+  border: 2px solid var(--paper-50);
+  border-radius: 50%;
+  box-shadow: 0 3px 10px rgba(166,58,53,.35);
+}
+.pv-card .note-flag { top: -12px; left: -12px; }
+.note-fullscreen__body .note-flag,
+.note-fullscreen__content .note-flag {
+  top: -14px; left: -14px; width: 30px; height: 30px;
+  box-shadow: 0 3px 12px rgba(0,0,0,.45);
+}
 
 /* 思考批量删除工具条 */
 .note-bulk-bar {
@@ -1250,8 +1273,8 @@ body.view-paper-view header.topbar > .topbar-actions { display: none !important;
 .paper-view-page { padding: 28px clamp(28px, 4vw, 64px) 64px; }
 .pv-hero {
   position: sticky;
-  top: 0;
-  z-index: 10;
+  top: var(--topbar);
+  z-index: 11;
   display: flex;
   align-items: flex-start;
   justify-content: space-between;
@@ -1260,6 +1283,7 @@ body.view-paper-view header.topbar > .topbar-actions { display: none !important;
   padding: 28px clamp(28px, 4vw, 64px) 18px;
   background: var(--paper-50);
   border-bottom: 1px solid var(--paper-200);
+  box-shadow: 0 6px 18px rgba(20,28,29,.06);
 }
 .pv-hero h3 { margin: 6px 0 4px; font: 520 clamp(1.55rem, 2.4vw, 2.2rem)/1.15 var(--font-display); }
 .pv-hero p { margin: 0; color: var(--ink-700); font-size: .84rem; line-height: 1.6; max-width: 560px; }

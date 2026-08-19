@@ -1277,10 +1277,15 @@ function renderPaperDrawer(p) {
   };
 }
 
+function flagBadge(n) {
+  return n.flagged ? `<div class="note-flag" title="已标记：这条思考可能还没想透，待复查">!</div>` : "";
+}
+
 function renderNoteCard(n) {
   const checked = state.selNotes.has(n.id) ? "checked" : "";
   return `
-    <div class="note-card ${checked ? "is-selected" : ""}" data-note="${n.id}">
+    <div class="note-card ${checked ? "is-selected" : ""} ${n.flagged ? "is-flagged" : ""}" data-note="${n.id}">
+      ${flagBadge(n)}
       <div class="note-card__head">
         <label class="note-card__check">
           <input type="checkbox" data-note="${n.id}" ${checked}>
@@ -1743,6 +1748,7 @@ function openNoteFullscreen(n) {
   const content = $("#note-fullscreen-content");
   fullscreenScaleIndex = 1; // 默认标准大小
   content.innerHTML = `
+    ${flagBadge(n)}
     <div class="pv-card__head" style="border-color:rgba(255,255,255,.12);">
       <span class="pv-card__time" style="color:rgba(255,255,255,.7);">${esc((n.created_at || "").replace("T", " ").slice(0, 16))}</span>
       <span class="pv-card__index" style="color:rgba(255,255,255,.55);">#${esc(String(state._viewPaper?.notes?.indexOf(n) + 1 || ""))}</span>
@@ -1770,7 +1776,8 @@ function renderViewNoteCard(n, idx) {
   const time = esc((n.created_at || "").replace("T", " ").slice(0, 16));
   const checked = state.selViewNotes.has(n.id) ? "checked" : "";
   return `
-    <article class="pv-card ${checked ? "is-selected" : ""}" data-note-id="${n.id}">
+    <article class="pv-card ${checked ? "is-selected" : ""} ${n.flagged ? "is-flagged" : ""}" data-note-id="${n.id}">
+      ${flagBadge(n)}
       <div class="pv-card__head">
         <label class="pv-card__check">
           <input type="checkbox" data-note="${n.id}" ${checked}>
@@ -1910,19 +1917,31 @@ function insertEditImage(blob, editor) {
 
 function openNoteEditor(note) {
   state.editImages = [];
+  let flagged = !!note.flagged;
   openModal(`
     <button class="icon-button" id="m-close" type="button" aria-label="关闭"><svg><use href="#i-close"/></svg></button>
     <p class="eyebrow">EDIT NOTE</p>
     <h3>编辑思考</h3>
     <div class="note-editor" id="m-note-editor" contenteditable="true" data-placeholder="修改文字、删除截图、Ctrl+V 贴新图…">${renderNoteEditorContent(note)}</div>
     <p class="field-help">支持修改文字、删除截图、粘贴新截图。</p>
-    <div style="display:flex; gap:10px; justify-content:flex-end; margin-top:16px;">
+    <div style="display:flex; gap:10px; align-items:center; margin-top:16px;">
+      <button class="scan-button scan-button--ghost note-flag-btn ${flagged ? "is-active" : ""}" id="m-note-flag" type="button" title="标记：这条思考可能还没想透，待复查">
+        <svg style="width:13px;height:13px;"><use href="#i-flag"/></svg><span>${flagged ? "已标记" : "标记"}</span>
+      </button>
+      <div style="flex:1;"></div>
       <button class="scan-button scan-button--ghost" id="m-note-cancel" type="button">取消</button>
       <button class="scan-button" id="m-note-save" type="button">保存修改</button>
     </div>`);
 
   const editor = $("#m-note-editor");
   editor.focus();
+
+  const flagBtn = $("#m-note-flag");
+  flagBtn.onclick = () => {
+    flagged = !flagged;
+    flagBtn.classList.toggle("is-active", flagged);
+    flagBtn.querySelector("span").textContent = flagged ? "已标记" : "标记";
+  };
 
   editor.addEventListener("paste", (e) => {
     const items = e.clipboardData && e.clipboardData.items;
@@ -1948,7 +1967,7 @@ function openNoteEditor(note) {
       return;
     }
     try {
-      await req("PUT", "/api/notes", { id: note.id, content, images });
+      await req("PUT", "/api/notes", { id: note.id, content, images, flagged });
       toast("已保存修改");
       closeModal();
       if (state._viewPaper) await openPaperView(state._viewPaper.id);

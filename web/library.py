@@ -869,6 +869,17 @@ def init_db() -> None:
     conn.commit()
     _migrate_recycle_item_kind(conn)
     _migrate_note_version_image_ids(conn)
+    _migrate_note_flagged(conn)
+
+
+def _migrate_note_flagged(conn: sqlite3.Connection) -> None:
+    """为已存在的老数据库 note 表补 flagged 标记列。"""
+    cur = conn.execute("SELECT name FROM sqlite_master WHERE type='table' AND name='note'")
+    if not cur.fetchone():
+        return
+    cols = {r[1] for r in conn.execute("PRAGMA table_info(note)")}
+    if "flagged" not in cols:
+        conn.execute("ALTER TABLE note ADD COLUMN flagged INTEGER NOT NULL DEFAULT 0")
 
 
 def _migrate_note_version_image_ids(conn: sqlite3.Connection) -> None:
@@ -2109,6 +2120,7 @@ class Handler(BaseHTTPRequestHandler):
                 nid = int(body.get("id"))
                 content = body.get("content", "")
                 new_images = body.get("images", [])
+                flagged = 1 if body.get("flagged") else 0
                 conn = get_db()
                 note = conn.execute(
                     """SELECT n.id, n.content, n.paper_id, f.project_id
@@ -2195,7 +2207,7 @@ class Handler(BaseHTTPRequestHandler):
                 output.append(content[last:])
                 final_content = "".join(output)
 
-                conn.execute("UPDATE note SET content = ? WHERE id = ?", (final_content, nid))
+                conn.execute("UPDATE note SET content = ?, flagged = ? WHERE id = ?", (final_content, flagged, nid))
                 conn.commit()
                 json_response(self, {"ok": True})
             else:
