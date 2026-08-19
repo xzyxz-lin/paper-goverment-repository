@@ -48,7 +48,7 @@ _DELETED_LOCK = threading.Lock()
 
 
 def _deleted_empty() -> dict:
-    return {"projects": [], "folders": [], "papers": []}
+    return {"projects": [], "folders": [], "papers": [], "notes": []}
 
 
 def load_deleted() -> dict:
@@ -78,7 +78,7 @@ def save_deleted(d: dict) -> None:
 
 def _deleted_filter_clause(kind: str, alias: str = "t") -> tuple[str, list]:
     """生成 SQL WHERE 子句片段 + 参数：过滤掉 id 在删除索引里的行。
-    kind: 'projects' | 'folders' | 'papers'
+    kind: 'projects' | 'folders' | 'papers' | 'notes'
     """
     d = load_deleted()
     ids = d.get(kind, [])
@@ -183,13 +183,13 @@ def _recycle_related(record: sqlite3.Row | dict) -> dict[str, list[int]]:
         data = json.loads(raw or "{}")
     except (TypeError, json.JSONDecodeError):
         data = {}
-    out = {"projects": [], "folders": [], "papers": []}
+    out = {"projects": [], "folders": [], "papers": [], "notes": []}
     for key in out:
         out[key] = [int(x) for x in data.get(key, []) if str(x).isdigit()]
     if not any(out.values()):
         kind = record["kind"] if isinstance(record, sqlite3.Row) else record.get("kind")
         entity_id = int(record["entity_id"] if isinstance(record, sqlite3.Row) else record.get("entity_id", 0))
-        key = {"project": "projects", "folder": "folders", "paper": "papers"}.get(kind)
+        key = {"project": "projects", "folder": "folders", "paper": "papers", "note": "notes"}.get(kind)
         if key and entity_id:
             out[key] = [entity_id]
     return out
@@ -197,7 +197,7 @@ def _recycle_related(record: sqlite3.Row | dict) -> dict[str, list[int]]:
 
 def _write_deleted_sets(data: dict, related: dict[str, list[int]], add: bool) -> None:
     """把一条回收记录对应的可见性索引写入/移出旧删除索引。"""
-    for key in ("projects", "folders", "papers"):
+    for key in ("projects", "folders", "papers", "notes"):
         current = set(data.get(key, []))
         ids = set(related.get(key, []))
         if add:
@@ -320,6 +320,25 @@ def move_to_recycle(user_id: int, kind: str, ids: list[int]) -> int:
             if _recycle_insert(conn, user_id, "paper", paper_id, row["project_id"], row["folder_id"], related):
                 _write_deleted_sets(deleted, related, True)
                 added += 1
+
+    elif kind == "note":
+        placeholders = ",".join("?" for _ in ids)
+        rows = conn.execute(
+            f"""SELECT n.id, n.paper_id, pa.folder_id, f.project_id
+                FROM note n
+                JOIN paper pa ON pa.id = n.paper_id
+                JOIN folder f ON f.id = pa.folder_id
+                JOIN project p ON p.id = f.project_id
+                WHERE p.user_id = ? AND n.id IN ({placeholders})""",
+            [user_id, *ids],
+        ).fetchall()
+        for row in rows:
+            note_id = row["id"]
+            related = {"projects": [], "folders": [], "papers": [], "notes": [note_id]}
+            if _recycle_insert(conn, user_id, "note", note_id, row["project_id"], row["folder_id"], related):
+                _write_deleted_sets(deleted, related, True)
+                added += 1
+
     else:
         raise ValueError("不支持的回收类型")
 
@@ -370,6 +389,22 @@ def _recycle_item_view(conn: sqlite3.Connection, record: sqlite3.Row) -> dict | 
         title = row["name"]
         folder_path = _folder_path(conn, entity_id)
         context = f"包含 {max(0, len(related['folders']) - 1)} 个子文件夹、{len(related['papers'])} 篇论文"
+    elif kind == "note":
+        row = conn.execute(
+            """SELECT n.id, n.content, n.created_at, pa.id paper_id, pa.title_en, pa.title_zh,
+                      f.id folder_id, f.project_id, p.name project_name
+               FROM note n
+               JOIN paper pa ON pa.id = n.paper_id
+               JOIN folder f ON f.id = pa.folder_id
+               JOIN project p ON p.id = f.project_id WHERE n.id = ?""",
+            (entity_id,),
+        ).fetchone()
+        if not row:
+            return None
+        title = "思考标注"
+        folder_path = _folder_path(conn, row["folder_id"])
+        context = row["title_en"] or row["title_zh"] or "（未命名论文）"
+
     else:
         row = conn.execute(
             """SELECT pa.id, pa.title_en, pa.title_zh, pa.journal, f.id folder_id, f.project_id, p.name project_name
@@ -389,7 +424,7 @@ def _recycle_item_view(conn: sqlite3.Connection, record: sqlite3.Row) -> dict | 
     expires_at = datetime.fromisoformat(record["expires_at"])
     remain_seconds = max(0, int((expires_at - _recycle_now()).total_seconds()))
     remaining_days = max(1, (remain_seconds + 86399) // 86400) if remain_seconds else 0
-    return {
+    item = {
         "id": record["id"],
         "kind": kind,
         "entity_id": entity_id,
@@ -402,6 +437,14 @@ def _recycle_item_view(conn: sqlite3.Connection, record: sqlite3.Row) -> dict | 
         "expires_at": record["expires_at"],
         "remaining_days": remaining_days,
     }
+    if kind == "note":
+        images = [dict(i) for i in conn.execute(
+            "SELECT * FROM image WHERE note_id = ? ORDER BY id", (entity_id,)
+        ).fetchall()]
+        item["note_content"] = row["content"] or ""
+        item["note_created_at"] = row["created_at"]
+        item["note_images"] = images
+    return item
 
 
 def list_recycle_items(user_id: int) -> tuple[list[dict], dict]:
@@ -411,7 +454,7 @@ def list_recycle_items(user_id: int) -> tuple[list[dict], dict]:
         "SELECT * FROM recycle_item WHERE user_id = ? ORDER BY expires_at, id DESC", (user_id,)
     ).fetchall()
     items = [item for record in records if (item := _recycle_item_view(conn, record))]
-    summary = {"total": len(items), "project": 0, "folder": 0, "paper": 0}
+    summary = {"total": len(items), "project": 0, "folder": 0, "paper": 0, "note": 0}
     for item in items:
         summary[item["kind"]] += 1
     return items, summary
@@ -476,6 +519,20 @@ def _delete_recycle_records(records: list[sqlite3.Row]) -> int:
             cur = conn.execute(
                 """DELETE FROM folder WHERE id = ? AND project_id IN
                    (SELECT id FROM project WHERE user_id = ?)""",
+                (entity_id, record["user_id"]),
+            )
+        elif kind == "note":
+            # note 的 image 随 ON DELETE CASCADE 一起清理；截图文件在 note 查询时收集
+            note_images = [dict(i) for i in conn.execute("SELECT * FROM image WHERE note_id = ?", (entity_id,)).fetchall()]
+            for img in note_images:
+                try:
+                    Path(img["file_path"]).unlink(missing_ok=True)
+                except Exception:
+                    pass
+            cur = conn.execute(
+                """DELETE FROM note WHERE id = ? AND paper_id IN
+                   (SELECT pa.id FROM paper pa JOIN folder f ON f.id = pa.folder_id
+                    JOIN project p ON p.id = f.project_id WHERE p.user_id = ?)""",
                 (entity_id, record["user_id"]),
             )
         else:
@@ -551,6 +608,8 @@ def migrate_legacy_deleted_index() -> None:
             JOIN project p ON p.id = f.project_id WHERE f.id IN ({})"""),
         ("paper", "paper", "id", """SELECT pa.id, p.user_id FROM paper pa
             JOIN folder f ON f.id = pa.folder_id JOIN project p ON p.id = f.project_id WHERE pa.id IN ({})"""),
+        ("note", "note", "id", """SELECT n.id, p.user_id FROM note n JOIN paper pa ON pa.id = n.paper_id
+            JOIN folder f ON f.id = pa.folder_id JOIN project p ON p.id = f.project_id WHERE n.id IN ({})"""),
     ):
         key = kind + "s" if kind != "paper" else "papers"
         ids = [int(x) for x in deleted.get(key, []) if x]
@@ -645,6 +704,37 @@ def init_db() -> None:
             expires_at TEXT NOT NULL,
             UNIQUE(kind, entity_id)
         );
+        CREATE INDEX IF NOT EXISTS idx_recycle_item_user_expiry
+            ON recycle_item(user_id, expires_at);
+        """
+    )
+    conn.commit()
+    _migrate_recycle_item_kind(conn)
+
+
+def _migrate_recycle_item_kind(conn: sqlite3.Connection) -> None:
+    """把 recycle_item.kind 的 CHECK 扩展为支持 'note'（SQLite 不能直接 ALTER CHECK）。"""
+    cur = conn.execute("SELECT sql FROM sqlite_master WHERE type='table' AND name='recycle_item'")
+    sql = cur.fetchone()
+    if not sql or "'note'" in (sql[0] or ""):
+        return
+    conn.executescript(
+        """
+        ALTER TABLE recycle_item RENAME TO recycle_item_old;
+        CREATE TABLE recycle_item (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            user_id INTEGER NOT NULL REFERENCES user(id) ON DELETE CASCADE,
+            kind TEXT NOT NULL CHECK(kind IN ('project', 'folder', 'paper', 'note')),
+            entity_id INTEGER NOT NULL,
+            project_id INTEGER,
+            folder_id INTEGER,
+            related_json TEXT NOT NULL DEFAULT '{}',
+            deleted_at TEXT NOT NULL,
+            expires_at TEXT NOT NULL,
+            UNIQUE(kind, entity_id)
+        );
+        INSERT INTO recycle_item SELECT * FROM recycle_item_old;
+        DROP TABLE recycle_item_old;
         CREATE INDEX IF NOT EXISTS idx_recycle_item_user_expiry
             ON recycle_item(user_id, expires_at);
         """
@@ -1266,8 +1356,10 @@ class Handler(BaseHTTPRequestHandler):
                 papers = []
                 for r in rows:
                     d = dict(r)
+                    note_filter, note_params = _deleted_filter_clause("notes", "n")
                     notes = conn.execute(
-                        "SELECT * FROM note WHERE paper_id = ? ORDER BY id", (r["id"],)
+                        f"SELECT n.* FROM note n WHERE n.paper_id = ?{note_filter} ORDER BY n.id",
+                        (r["id"], *note_params),
                     ).fetchall()
                     d["notes"] = []
                     for n in notes:
@@ -1308,7 +1400,10 @@ class Handler(BaseHTTPRequestHandler):
                     return
                 d = dict(r)
                 d["notes"] = []
-                for n in conn.execute("SELECT * FROM note WHERE paper_id = ? ORDER BY id", (pid,)).fetchall():
+                note_filter, note_params = _deleted_filter_clause("notes", "n")
+                for n in conn.execute(
+                    f"SELECT n.* FROM note n WHERE n.paper_id = ?{note_filter} ORDER BY n.id", (pid, *note_params)
+                ).fetchall():
                     nd = dict(n)
                     nd["images"] = [dict(i) for i in conn.execute(
                         "SELECT * FROM image WHERE note_id = ? ORDER BY id", (n["id"],)
@@ -1655,16 +1750,14 @@ class Handler(BaseHTTPRequestHandler):
                 json_response(self, {"ok": True, "deleted": added, "message": "已删除论文（可在回收站恢复）"})
                 return
             if path == "/api/notes":
-                nid = int((qs.get("id") or [None])[0])
-                conn = get_db()
-                conn.execute(
-                    """DELETE FROM note WHERE id = ? AND paper_id IN
-                       (SELECT pa.id FROM paper pa JOIN folder f ON f.id = pa.folder_id
-                        JOIN project p ON p.id = f.project_id WHERE p.user_id = ?)""",
-                    (nid, uid),
-                )
-                conn.commit()
-                json_response(self, {"ok": True})
+                # 支持单条 id 或批量 ids（逗号分隔）
+                raw_ids = qs.get("id") or qs.get("ids") or []
+                ids = sorted({int(x) for x in raw_ids if x})
+                if not ids:
+                    self._error(400, "缺少 id")
+                    return
+                added = move_to_recycle(uid, "note", ids)
+                json_response(self, {"ok": True, "deleted": added, "message": f"已删除 {added} 条思考（可在回收站恢复）"})
                 return
             if path == "/api/notes/images":
                 iid = int((qs.get("id") or [None])[0])

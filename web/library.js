@@ -121,7 +121,7 @@ const state = {
   currentFolderPath: [],   // [{id, name}] 从根到当前
   papers: [],
   recycleItems: [],
-  recycleSummary: { total: 0, project: 0, folder: 0, paper: 0 },
+  recycleSummary: { total: 0, project: 0, folder: 0, paper: 0, note: 0 },
   recycleRetentionDays: 7,
   searchTerm: "",
   folderOpen: {},          // folderId -> bool 展开状态
@@ -223,6 +223,7 @@ function showView(view) {
   const hideTopActions = view === "paper-view";
   $("#recycle-open-btn").hidden = hideTopActions;
   $("#new-project-btn").hidden = hideTopActions;
+  document.body.classList.toggle("view-paper-view", hideTopActions);
 }
 
 /* ============ 项目总览 ============ */
@@ -452,7 +453,24 @@ async function openRecycle() {
 }
 
 function recycleKindLabel(kind) {
-  return { project: "项目", folder: "文件夹", paper: "论文" }[kind] || "记录";
+  return { project: "项目", folder: "文件夹", paper: "论文", note: "思考" }[kind] || "记录";
+}
+
+function renderRecycleNote(item) {
+  const text = (item.note_content || "").replace(/\[\[img:\d+\]\]/g, " ").replace(/\s+/g, " ").trim();
+  const truncated = text.length > 160 ? text.slice(0, 160) + "…" : text;
+  const imgs = (item.note_images || []).slice(0, 4);
+  const imgHtml = imgs.length
+    ? `<div class="recycle-note__imgs">${imgs.map(img => `<img src="/assets/${encodeURI(img.rel_path)}" alt="截图">`).join("")}${item.note_images.length > 4 ? `<span class="recycle-note__more">+${item.note_images.length - 4}</span>` : ""}</div>`
+    : "";
+  const path = [esc(item.project_name || ""), item.folder_path ? esc(item.folder_path) : "", esc(item.context || "")].filter(Boolean).join(" / ");
+  return `
+    <div class="recycle-row__main recycle-row__main--note">
+      <h5>思考标注 · <span>${formatRecycleTime(item.note_created_at)}</span></h5>
+      <p class="recycle-note__path">${path}</p>
+      ${truncated ? `<p class="recycle-note__text">${esc(truncated)}</p>` : ""}
+      ${imgHtml}
+    </div>`;
 }
 
 function formatRecycleTime(iso) {
@@ -471,10 +489,11 @@ function renderRecycle() {
     <div><span>待恢复</span><strong>${summary.total || 0}</strong></div>
     <div><span>项目</span><strong>${summary.project || 0}</strong></div>
     <div><span>文件夹</span><strong>${summary.folder || 0}</strong></div>
-    <div><span>论文</span><strong>${summary.paper || 0}</strong></div>`;
+    <div><span>论文</span><strong>${summary.paper || 0}</strong></div>
+    <div><span>思考</span><strong>${summary.note || 0}</strong></div>`;
 
   if (!state.recycleItems.length) {
-    list.innerHTML = `<div class="recycle-empty"><svg><use href="#i-archive"/></svg><h4>回收站是空的</h4><p>删除的项目、文件夹和论文会在这里保留 ${state.recycleRetentionDays} 天。</p></div>`;
+    list.innerHTML = `<div class="recycle-empty"><svg><use href="#i-archive"/></svg><h4>回收站是空的</h4><p>删除的项目、文件夹、论文和思考会在这里保留 ${state.recycleRetentionDays} 天。</p></div>`;
     updateRecycleSelectionUI();
     return;
   }
@@ -490,13 +509,14 @@ function renderRecycle() {
       <header><span>PROJECT</span><h4>${esc(group.name)}</h4><b>${group.items.length} 项</b></header>
       <div class="recycle-group__items">
         ${group.items.map(item => `
-          <article class="recycle-row" data-rid="${item.id}" tabindex="0" role="checkbox" aria-checked="false">
+          <article class="recycle-row${item.kind === "note" ? " recycle-row--note" : ""}" data-rid="${item.id}" tabindex="0" role="checkbox" aria-checked="false">
             <label class="lib-sel recycle-row__check" aria-label="选择${esc(item.title)}"><input type="checkbox" class="recycle-chk" data-rid="${item.id}"></label>
             <div class="recycle-row__kind recycle-row__kind--${item.kind}">${recycleKindLabel(item.kind)}</div>
+            ${item.kind === "note" ? renderRecycleNote(item) : `
             <div class="recycle-row__main">
               <h5>${esc(item.title)}</h5>
               <p>${item.folder_path ? `${esc(item.folder_path)} · ` : ""}${esc(item.context)}</p>
-            </div>
+            </div>`}
             <div class="recycle-row__time"><span>删除于 ${formatRecycleTime(item.deleted_at)}</span><b class="${item.remaining_days <= 1 ? "is-urgent" : ""}">${item.remaining_days ? `剩余 ${item.remaining_days} 天` : "已到期"}</b></div>
           </article>`).join("")}
       </div>
@@ -909,6 +929,7 @@ function renderPaperDrawer(p) {
     <div class="note-bulk-bar" id="note-bulk-bar" ${state.selNotes.size ? "" : "hidden"}>
       <span id="note-bulk-count">已选中 ${state.selNotes.size} 条思考</span>
       <div>
+        <button class="scan-button scan-button--ghost" id="note-bulk-sel-all" type="button"><svg><use href="#i-plus"/></svg><span>${notes.length && state.selNotes.size === notes.length ? "取消全选" : "全选"}</span></button>
         <button class="scan-button scan-button--ghost" id="note-bulk-del" type="button"><svg><use href="#i-trash"/></svg><span>删除选中</span></button>
         <button class="note-bulk-clear" id="note-bulk-clear" type="button">取消选择</button>
       </div>
@@ -920,7 +941,7 @@ function renderPaperDrawer(p) {
 
     <div class="drawer-section-title"><span>新增思考</span></div>
     <div class="note-compose">
-      <div class="note-editor" id="note-editor" contenteditable="true" data-placeholder="这篇文章带给我什么启发？可写文字、可 Ctrl+V 贴图（插在光标处）、图文穿插、换行缩进，写完点「保存思考」才算一条。"></div>
+      <div class="note-editor" id="note-editor" contenteditable="true" data-placeholder="写文字、Ctrl+V 贴图，点「保存思考」成一条。"></div>
       <div class="note-compose__bar">
         <span class="note-compose__hint">支持：文字 + 多张截图 + 图间插话 + 换行缩进</span>
         <button class="scan-button scan-button--ghost" id="compose-view-btn" type="button" style="min-height:38px;padding:0 12px;"><svg style="width:15px;height:15px;"><use href="#i-image"/></svg><span>View</span></button>
@@ -970,6 +991,12 @@ function renderPaperDrawer(p) {
   if (bulkDel) bulkDel.onclick = () => deleteSelectedNotes(p.id);
   const bulkClear = $("#note-bulk-clear");
   if (bulkClear) bulkClear.onclick = () => { state.selNotes.clear(); renderPaperDrawer(p); };
+  const bulkSelAll = $("#note-bulk-sel-all");
+  if (bulkSelAll) bulkSelAll.onclick = () => {
+    if (state.selNotes.size === notes.length) state.selNotes.clear();
+    else notes.forEach(n => state.selNotes.add(n.id));
+    renderPaperDrawer(p);
+  };
 }
 
 function renderNoteCard(n) {
@@ -1095,7 +1122,7 @@ async function refreshPaper(pid) {
 }
 
 async function deleteNote(nid, paperId) {
-  if (!confirm("删除这条思考？")) return;
+  if (!confirm("删除这条思考？删除后可在回收站保留 7 天。")) return;
   await req("DELETE", "/api/notes?id=" + nid);
   toast("已删除");
   await refreshPaper(paperId);
@@ -1104,10 +1131,8 @@ async function deleteNote(nid, paperId) {
 async function deleteSelectedNotes(paperId) {
   const ids = Array.from(state.selNotes);
   if (!ids.length) return;
-  if (!confirm(`确定删除选中的 ${ids.length} 条思考？`)) return;
-  for (const nid of ids) {
-    await req("DELETE", "/api/notes?id=" + nid);
-  }
+  if (!confirm(`确定删除选中的 ${ids.length} 条思考？删除后可在回收站保留 7 天。`)) return;
+  await req("DELETE", "/api/notes?ids=" + ids.join(","));
   state.selNotes.clear();
   toast(`已删除 ${ids.length} 条思考`);
   await refreshPaper(paperId);
@@ -1235,7 +1260,7 @@ function renderViewNoteBlocks(n) {
 
   const pushText = (txt) => {
     const t = txt.trim();
-    if (t) html += `<div class="pv-block pv-block--text">${esc(t)}</div>`;
+    if (t) html += `<div class="pv-block pv-block--text"><span class="pv-block__label">文字</span><div class="pv-block__content">${esc(t)}</div></div>`;
   };
 
   while ((m = re.exec(content)) !== null) {
@@ -1243,7 +1268,7 @@ function renderViewNoteBlocks(n) {
     const idx = parseInt(m[1]);
     const img = images[idx];
     if (img) {
-      html += `<div class="pv-block pv-block--media"><img src="/assets/${encodeURI(img.rel_path)}" alt="截图" loading="lazy"></div>`;
+      html += `<div class="pv-block pv-block--media"><span class="pv-block__label">截图</span><img src="/assets/${encodeURI(img.rel_path)}" alt="截图" loading="lazy"></div>`;
       used.add(idx);
     }
     last = m.index + m[0].length;
@@ -1253,7 +1278,7 @@ function renderViewNoteBlocks(n) {
   // 兼容旧数据：未被占位符引用的图片追加在最后
   images.forEach((img, idx) => {
     if (!used.has(idx)) {
-      html += `<div class="pv-block pv-block--media"><img src="/assets/${encodeURI(img.rel_path)}" alt="截图" loading="lazy"></div>`;
+      html += `<div class="pv-block pv-block--media"><span class="pv-block__label">截图</span><img src="/assets/${encodeURI(img.rel_path)}" alt="截图" loading="lazy"></div>`;
     }
   });
 
