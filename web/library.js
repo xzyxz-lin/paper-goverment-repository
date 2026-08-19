@@ -1204,11 +1204,9 @@ function closePaperView() {
 }
 
 function renderPaperView(p) {
-  const title = p.title_en || p.title_zh || "（未命名论文）";
   const notes = p.notes || [];
   const imgCount = notes.reduce((s, n) => s + (n.images ? n.images.length : 0), 0);
 
-  $("#paper-view-title").textContent = title;
   $("#paper-view-subtitle").textContent = notes.length
     ? `共 ${notes.length} 条思考，${imgCount} 张截图。滚动查看完整回顾。`
     : "这篇论文还没有思考记录。在抽屉里点击「新增思考」写下第一条。";
