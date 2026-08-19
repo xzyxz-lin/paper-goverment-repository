@@ -27,7 +27,7 @@ import sqlite3
 import subprocess
 import threading
 import uuid
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from urllib.parse import urlparse, parse_qs, unquote
@@ -174,6 +174,14 @@ def _soft_delete_folders(fids: list[int]) -> int:
 # ===== 结构化回收站（默认保留 7 天） =====
 def _recycle_now() -> datetime:
     return datetime.now().astimezone()
+
+
+def _parse_iso_dt(s: str) -> datetime:
+    """解析 ISO 格式时间字符串；若无时区则按 UTC 处理。"""
+    dt = datetime.fromisoformat(s)
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=timezone.utc)
+    return dt
 
 
 def _recycle_related(record: sqlite3.Row | dict) -> dict[str, list[int]]:
@@ -748,7 +756,7 @@ def _migrate_note_version_image_ids(conn: sqlite3.Connection) -> None:
     if "image_ids_json" not in cols:
         conn.execute("ALTER TABLE note_version ADD COLUMN image_ids_json TEXT NOT NULL DEFAULT '[]'")
     if "expires_at" not in cols:
-        default_expires = (datetime.utcnow() + timedelta(days=RECYCLE_RETENTION_DAYS)).isoformat()
+        default_expires = (_recycle_now() + timedelta(days=RECYCLE_RETENTION_DAYS)).isoformat(timespec="seconds")
         conn.execute(f"ALTER TABLE note_version ADD COLUMN expires_at TEXT NOT NULL DEFAULT '{default_expires}'")
     conn.commit()
 
@@ -1495,7 +1503,7 @@ class Handler(BaseHTTPRequestHandler):
                 ).fetchall()
                 versions = []
                 for r in rows:
-                    remain_seconds = max(0, int((datetime.fromisoformat(r["expires_at"]) - now).total_seconds()))
+                    remain_seconds = max(0, int((_parse_iso_dt(r["expires_at"]) - now).total_seconds()))
                     remaining_days = max(1, (remain_seconds + 86399) // 86400) if remain_seconds else 0
                     versions.append({
                         "id": r["id"],
@@ -1802,7 +1810,7 @@ class Handler(BaseHTTPRequestHandler):
                         if iid not in seen_img:
                             seen_img.add(iid)
                             current_image_ids.append(iid)
-                expires = (datetime.utcnow() + timedelta(days=RECYCLE_RETENTION_DAYS)).isoformat()
+                expires = (_recycle_now() + timedelta(days=RECYCLE_RETENTION_DAYS)).isoformat(timespec="seconds")
                 conn.execute(
                     "INSERT INTO note_version (note_id, content, image_ids_json, created_at, expires_at) VALUES (?,?,?,?,?)",
                     (note_id, note["content"], json.dumps(current_image_ids), now_iso(), expires),
@@ -1893,7 +1901,7 @@ class Handler(BaseHTTPRequestHandler):
                         if iid not in seen_img:
                             seen_img.add(iid)
                             current_image_ids.append(iid)
-                expires = (datetime.utcnow() + timedelta(days=RECYCLE_RETENTION_DAYS)).isoformat()
+                expires = (_recycle_now() + timedelta(days=RECYCLE_RETENTION_DAYS)).isoformat(timespec="seconds")
                 conn.execute(
                     "INSERT INTO note_version (note_id, content, image_ids_json, created_at, expires_at) VALUES (?,?,?,?,?)",
                     (nid, note["content"], json.dumps(current_image_ids), now_iso(), expires),
