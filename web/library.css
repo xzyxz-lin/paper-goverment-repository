@@ -1302,6 +1302,7 @@ body.view-paper-view header.topbar > .topbar-actions { display: none !important;
 .pv-stats strong { margin-left: 6px; color: var(--oxide-700); font-size: 1.05rem; }
 .pv-list { display: grid; gap: 32px; }
 .pv-card {
+  position: relative;
   padding: 28px;
   background: var(--white);
   border: 1px solid var(--paper-300);
@@ -1309,6 +1310,7 @@ body.view-paper-view header.topbar > .topbar-actions { display: none !important;
   border-radius: 4px;
   box-shadow: 0 4px 18px rgba(20,28,29,.05);
 }
+.pv-card.is-flagged { border-left-color: var(--danger-600); }
 .pv-card__head {
   display: flex;
   align-items: center;
