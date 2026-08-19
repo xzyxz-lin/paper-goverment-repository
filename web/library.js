@@ -1330,10 +1330,17 @@ async function openPaperView(pid) {
 }
 
 function closePaperView() {
+  const paper = state._viewPaper;
   const back = state._viewPaperReturnTo || "project";
   state._viewPaper = null;
   state._viewPaperReturnTo = null;
-  showView(back);
+  // 退出观察后回到该论文的抽屉状态，而不是退回到无选中的初始界面
+  if (paper && paper.id) {
+    showView(back);
+    openPaperDrawer(paper.id);
+  } else {
+    showView(back);
+  }
 }
 
 function renderPaperView(p) {
