@@ -1144,7 +1144,8 @@ function closeModal() {
   $("#modal-backdrop").hidden = true;
   $("#modal").innerHTML = "";
 }
-$("#modal-backdrop").addEventListener("click", (e) => { if (e.target === e.currentTarget) closeModal(); });
+// 注意：不再给遮罩绑定“点击空白处关闭”。数据录入弹框（导入/编辑论文、新建项目/文件夹）
+// 必须显式通过右上角叉叉或保存按钮关闭，避免误点空白处丢失已填内容。
 
 /* 新建项目 */
 function openProjectModal() {
