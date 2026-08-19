@@ -1305,7 +1305,7 @@ function renderNoteContent(n) {
   let m;
   const used = new Set();
   const flushText = (txt) => {
-    if (txt && txt.trim()) html += `<p class="note-text">${esc(txt)}</p>`;
+    if (txt && txt.trim()) html += `<p class="note-text">${esc(txt).replace(/\n/g, "<br>")}</p>`;
   };
   while ((m = re.exec(content)) !== null) {
     flushText(content.slice(last, m.index));
@@ -1786,7 +1786,7 @@ function renderViewNoteBlocks(n) {
 
   const pushText = (txt) => {
     const t = txt.trim();
-    if (t) html += `<div class="pv-block pv-block--text"><span class="pv-block__label">文字</span><div class="pv-block__content">${esc(t)}</div></div>`;
+    if (t) html += `<div class="pv-block pv-block--text"><span class="pv-block__label">文字</span><div class="pv-block__content">${esc(t).replace(/\n/g, "<br>")}</div></div>`;
   };
 
   while ((m = re.exec(content)) !== null) {
@@ -1829,6 +1829,7 @@ function renderNoteEditorContent(n) {
     last = m.index + m[0].length;
   }
   html += esc(content.slice(last));
+  html = html.replace(/\n/g, "<br>");
   return html || "<div><br></div>";
 }
 
