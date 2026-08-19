@@ -1750,9 +1750,9 @@ class Handler(BaseHTTPRequestHandler):
                 json_response(self, {"ok": True, "deleted": added, "message": "已删除论文（可在回收站恢复）"})
                 return
             if path == "/api/notes":
-                # 支持单条 id 或批量 ids（逗号分隔）
-                raw_ids = qs.get("id") or qs.get("ids") or []
-                ids = sorted({int(x) for x in raw_ids if x})
+                # 支持单条 id 或批量 ids（逗号分隔或重复参数）
+                raw_parts = qs.get("id") or qs.get("ids") or []
+                ids = sorted({int(x.strip()) for part in raw_parts for x in part.split(",") if x.strip()})
                 if not ids:
                     self._error(400, "缺少 id")
                     return
