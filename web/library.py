@@ -629,6 +629,10 @@ def migrate_legacy_deleted_index() -> None:
 # ===== 数据库连接（每线程独立） =====
 _local = threading.local()
 
+# 全局数据库写锁：ThreadingHTTPServer 多线程下，SQLite 写操作容易互相阻塞，
+# 用一个锁串行化所有写请求，彻底避免 database is locked。
+DB_LOCK = threading.Lock()
+
 
 def get_db() -> sqlite3.Connection:
     conn = getattr(_local, "conn", None)
@@ -1470,8 +1474,10 @@ class Handler(BaseHTTPRequestHandler):
                     return
                 conn = get_db()
                 now = _recycle_now()
-                # 清理过期历史版本
-                conn.execute("DELETE FROM note_version WHERE expires_at <= ?", (now.isoformat(timespec="seconds"),))
+                # 清理过期历史版本（串行化写操作，避免并发 database is locked）
+                with DB_LOCK:
+                    conn.execute("DELETE FROM note_version WHERE expires_at <= ?", (now.isoformat(timespec="seconds"),))
+                    conn.commit()
                 rows = conn.execute(
                     """SELECT nv.id, nv.note_id, nv.content, nv.image_ids_json, nv.created_at, nv.expires_at,
                               n.created_at note_created_at,
@@ -1515,6 +1521,10 @@ class Handler(BaseHTTPRequestHandler):
             self._error(500, str(e))
 
     def do_POST(self):
+        with DB_LOCK:
+            self._do_POST_locked()
+
+    def _do_POST_locked(self):
         parsed = urlparse(self.path)
         path = parsed.path
         try:
@@ -1814,6 +1824,10 @@ class Handler(BaseHTTPRequestHandler):
             self._error(500, str(e))
 
     def do_PUT(self):
+        with DB_LOCK:
+            self._do_PUT_locked()
+
+    def _do_PUT_locked(self):
         parsed = urlparse(self.path)
         path = parsed.path
         try:
@@ -1948,6 +1962,10 @@ class Handler(BaseHTTPRequestHandler):
             self._error(500, str(e))
 
     def do_DELETE(self):
+        with DB_LOCK:
+            self._do_DELETE_locked()
+
+    def _do_DELETE_locked(self):
         parsed = urlparse(self.path)
         path = parsed.path
         qs = parse_qs(parsed.query)
