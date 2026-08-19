@@ -718,6 +718,19 @@ def init_db() -> None:
     )
     conn.commit()
     _migrate_recycle_item_kind(conn)
+    _migrate_note_version_image_ids(conn)
+
+
+def _migrate_note_version_image_ids(conn: sqlite3.Connection) -> None:
+    """为已存在的老数据库 note_version 表补 image_ids_json 列。"""
+    cur = conn.execute("SELECT name FROM sqlite_master WHERE type='table' AND name='note_version'")
+    if not cur.fetchone():
+        return
+    cols = {r[1] for r in conn.execute("PRAGMA table_info(note_version)")}
+    if "image_ids_json" in cols:
+        return
+    conn.execute("ALTER TABLE note_version ADD COLUMN image_ids_json TEXT NOT NULL DEFAULT '[]'")
+    conn.commit()
 
 
 def _migrate_recycle_item_kind(conn: sqlite3.Connection) -> None:
