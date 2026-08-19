@@ -124,7 +124,7 @@ const state = {
   recycleSummary: { total: 0, project: 0, folder: 0, paper: 0 },
   recycleRetentionDays: 7,
   historyTree: [],
-  historySel: { projectId: null, folderId: null, paperId: null },
+  historySel: { projectId: null, folderId: null, paperId: null, eventType: null },
   historyRetentionDays: 7,
   searchTerm: "",
   folderOpen: {},          // folderId -> bool 展开状态
@@ -609,7 +609,7 @@ async function purgeSelectedRecycle() {
 async function openHistory() {
   try {
     await loadHistoryVersions();
-    state.historySel = { projectId: null, folderId: null, paperId: null };
+    state.historySel = { projectId: null, folderId: null, paperId: null, eventType: null };
     showView("history");
     renderNav();
     renderHistoryVersions();
@@ -644,7 +644,7 @@ function renderHistoryVersions() {
     return;
   }
 
-  const { projectId, folderId, paperId } = state.historySel;
+  const { projectId, folderId, paperId, eventType } = state.historySel;
   const tree = state.historyTree;
 
   // 面包屑
@@ -661,15 +661,19 @@ function renderHistoryVersions() {
     }
     if (folder && paperId != null) {
       paper = folder.papers.find(p => p.paper_id === paperId);
-      parts.push(`<span class="history-crumb is-current">${esc(paper ? paper.paper_title : "论文")}</span>`);
+      parts.push(`<button class="history-crumb" data-level="paper" type="button">${esc(paper ? paper.paper_title : "论文")}</button>`);
+    }
+    if (paper && eventType != null) {
+      parts.push(`<span class="history-crumb is-current">${esc(HISTORY_EVENT_LABEL[eventType] || "修改")}的思考</span>`);
     }
     crumbs.innerHTML = parts.join('<span class="history-crumb__sep">/</span>');
     $$(".history-crumb", crumbs).forEach(btn => {
       btn.onclick = () => {
         const lvl = btn.dataset.level;
-        if (lvl === "root") state.historySel = { projectId: null, folderId: null, paperId: null };
-        else if (lvl === "project") state.historySel = { projectId, folderId: null, paperId: null };
-        else if (lvl === "folder") state.historySel = { projectId, folderId, paperId: null };
+        if (lvl === "root") state.historySel = { projectId: null, folderId: null, paperId: null, eventType: null };
+        else if (lvl === "project") state.historySel = { projectId, folderId: null, paperId: null, eventType: null };
+        else if (lvl === "folder") state.historySel = { projectId, folderId, paperId: null, eventType: null };
+        else if (lvl === "paper") state.historySel = { projectId, folderId, paperId, eventType: null };
         renderHistoryVersions();
       };
     });
@@ -684,7 +688,7 @@ function renderHistoryVersions() {
         <span class="history-node__count">${p.folders.reduce((s, f) => s + f.papers.length, 0)} 条记录</span>
       </button>`).join("");
     $$(".history-node", level).forEach(btn => btn.onclick = () => {
-      state.historySel = { projectId: parseInt(btn.dataset.project), folderId: null, paperId: null };
+      state.historySel = { projectId: parseInt(btn.dataset.project), folderId: null, paperId: null, eventType: null };
       renderHistoryVersions();
     });
     return;
@@ -699,7 +703,7 @@ function renderHistoryVersions() {
         <span class="history-node__count">${f.papers.length} 篇论文记录</span>
       </button>`).join("");
     $$(".history-node", level).forEach(btn => btn.onclick = () => {
-      state.historySel = { projectId, folderId: parseInt(btn.dataset.folder), paperId: null };
+      state.historySel = { projectId, folderId: parseInt(btn.dataset.folder), paperId: null, eventType: null };
       renderHistoryVersions();
     });
     return;
@@ -714,53 +718,75 @@ function renderHistoryVersions() {
         <span class="history-node__count">${p.events.length} 条记录</span>
       </button>`).join("");
     $$(".history-node", level).forEach(btn => btn.onclick = () => {
-      state.historySel = { projectId, folderId, paperId: parseInt(btn.dataset.paper) };
+      state.historySel = { projectId, folderId, paperId: parseInt(btn.dataset.paper), eventType: null };
       renderHistoryVersions();
     });
     return;
   }
 
   const paper = folder.papers.find(p => p.paper_id === paperId);
-  const groups = [
-    { type: "create", label: "新增的思考", items: paper.events.filter(e => e.event_type === "create") },
-    { type: "edit", label: "修改的思考", items: paper.events.filter(e => e.event_type === "edit") },
-    { type: "delete", label: "删除的思考", items: paper.events.filter(e => e.event_type === "delete") },
-  ].filter(g => g.items.length);
 
-  if (!groups.length) {
-    level.innerHTML = `<div class="recycle-empty"><svg><use href="#i-clock"/></svg><h4>这篇论文还没有历史记录</h4></div>`;
+  // 论文内：先选事件类型（新增 / 修改 / 删除），再查看列表
+  if (eventType == null) {
+    const groups = [
+      { type: "create", label: "新增的思考", items: paper.events.filter(e => e.event_type === "create") },
+      { type: "edit", label: "修改的思考", items: paper.events.filter(e => e.event_type === "edit") },
+      { type: "delete", label: "删除的思考", items: paper.events.filter(e => e.event_type === "delete") },
+    ].filter(g => g.items.length);
+
+    if (!groups.length) {
+      level.innerHTML = `<div class="recycle-empty"><svg><use href="#i-clock"/></svg><h4>这篇论文还没有历史记录</h4></div>`;
+      return;
+    }
+
+    level.innerHTML = groups.map(group => `
+      <button class="history-node history-node--event" data-event-type="${group.type}" type="button">
+        <span class="history-node__type history-node__type--${group.type}">${esc(HISTORY_EVENT_LABEL[group.type])}</span>
+        <span class="history-node__name">${esc(group.label)}</span>
+        <span class="history-node__count">${group.items.length} 条</span>
+      </button>`).join("");
+    $$(".history-node", level).forEach(btn => btn.onclick = () => {
+      state.historySel = { projectId, folderId, paperId, eventType: btn.dataset.eventType };
+      renderHistoryVersions();
+    });
     return;
   }
 
-  level.innerHTML = groups.map(group => `
-    <section class="history-group">
-      <header><span class="history-group__tag history-group__tag--${group.type}">${group.label}</span><b>${group.items.length} 条</b></header>
-      <div class="history-group__items">
-        ${group.items.map(v => {
-          const text = (v.content || "").replace(/\[\[img:\d+\]\]/g, " [图片] ").replace(/\s+/g, " ").trim();
-          const preview = text.length > 160 ? text.slice(0, 160) + "…" : text;
-          const imgCount = (v.image_ids || []).length;
-          const actions = v.event_type === "delete"
-            ? `<button class="scan-button scan-button--ghost scan-button--sm" data-action="view" type="button">查看</button>
-               <button class="scan-button scan-button--sm" data-action="restore" type="button">恢复</button>
-               <button class="recycle-purge-btn scan-button scan-button--sm" data-action="purge" type="button">彻底删除</button>`
-            : `<button class="scan-button scan-button--ghost scan-button--sm" data-action="view" type="button">查看</button>
-               <button class="scan-button scan-button--sm" data-action="revert" type="button">回退</button>`;
-          return `
-          <article class="history-row history-row--${v.event_type}" data-vid="${v.id}" data-nid="${v.note_id}">
-            <div class="history-row__main">
-              <h5>思考标注 <span>· ${formatHistoryTime(v.created_at)}${imgCount ? ` · ${imgCount} 张图片` : ""}</span></h5>
-              ${preview ? `<p class="history-row__preview">${esc(preview)}</p>` : ""}
-            </div>
-            <div class="history-row__time">
-              <span>${HISTORY_EVENT_LABEL[v.event_type] || "修改"}于 ${formatHistoryTime(v.created_at)}</span>
-              <b class="${v.remaining_days <= 1 ? "is-urgent" : ""}">${v.remaining_days ? `剩余 ${v.remaining_days} 天` : "已到期"}</b>
-            </div>
-            <div class="history-row__actions">${actions}</div>
-          </article>`;
-        }).join("")}
-      </div>
-    </section>`).join("");
+  // 事件列表
+  const items = paper.events.filter(e => e.event_type === eventType);
+  if (!items.length) {
+    level.innerHTML = `<div class="recycle-empty"><svg><use href="#i-clock"/></svg><h4>该类型下没有历史记录</h4></div>`;
+    return;
+  }
+
+  const label = HISTORY_EVENT_LABEL[eventType] || "修改";
+  level.innerHTML = `
+    <p class="history-type-hint">${esc(paper.paper_title)} — ${esc(label)}的思考 · ${items.length} 条</p>
+    <div class="history-group__items">
+      ${items.map(v => {
+        const text = (v.content || "").replace(/\[\[img:\d+\]\]/g, " [图片] ").replace(/\s+/g, " ").trim();
+        const preview = text.length > 160 ? text.slice(0, 160) + "…" : text;
+        const imgCount = (v.image_ids || []).length;
+        const actions = v.event_type === "delete"
+          ? `<button class="scan-button scan-button--ghost scan-button--sm" data-action="view" type="button">查看</button>
+             <button class="scan-button scan-button--sm" data-action="restore" type="button">恢复</button>
+             <button class="recycle-purge-btn scan-button scan-button--sm" data-action="purge" type="button">彻底删除</button>`
+          : `<button class="scan-button scan-button--ghost scan-button--sm" data-action="view" type="button">查看</button>
+             <button class="scan-button scan-button--sm" data-action="revert" type="button">回退</button>`;
+        return `
+        <article class="history-row history-row--${v.event_type}" data-vid="${v.id}" data-nid="${v.note_id}">
+          <div class="history-row__main">
+            <h5>思考标注 <span>· ${formatHistoryTime(v.created_at)}${imgCount ? ` · ${imgCount} 张图片` : ""}</span></h5>
+            ${preview ? `<p class="history-row__preview">${esc(preview)}</p>` : ""}
+          </div>
+          <div class="history-row__time">
+            <span>${esc(HISTORY_EVENT_LABEL[v.event_type] || "修改")}于 ${formatHistoryTime(v.created_at)}</span>
+            <b class="${v.remaining_days <= 1 ? "is-urgent" : ""}">${v.remaining_days ? `剩余 ${v.remaining_days} 天` : "已到期"}</b>
+          </div>
+          <div class="history-row__actions">${actions}</div>
+        </article>`;
+      }).join("")}
+    </div>`;
 
   $$(".history-row", level).forEach(row => {
     const v = paper.events.find(x => x.id === parseInt(row.dataset.vid));

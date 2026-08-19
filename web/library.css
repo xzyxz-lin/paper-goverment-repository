@@ -1136,6 +1136,9 @@ body.view-paper-view header.topbar > .topbar-actions { display: none !important;
   border-radius: 999px;
   white-space: nowrap;
 }
+.history-node__type--create { color: var(--copper-700); background: rgba(168,124,96,.18); }
+.history-node__type--edit { color: var(--oxide-700); background: rgba(31,91,87,.14); }
+.history-node__type--delete { color: var(--danger-700); background: rgba(150,42,42,.12); }
 .history-node__name {
   font: 540 1.02rem var(--font-display);
   color: var(--ink-900);
@@ -1170,6 +1173,11 @@ body.view-paper-view header.topbar > .topbar-actions { display: none !important;
 .history-group__tag--edit { color: var(--oxide-700); background: rgba(31,91,87,.14); }
 .history-group__tag--delete { color: var(--danger-700); background: rgba(150,42,42,.12); }
 .history-group__items { display: grid; gap: 12px; }
+.history-type-hint {
+  margin: 0 0 8px;
+  color: var(--ink-800);
+  font: 500 .84rem var(--font-body);
+}
 
 .history-row {
   display: grid;
