@@ -1084,6 +1084,28 @@ body.view-paper-view header.topbar > .topbar-actions { display: none !important;
   .recycle-row__time { grid-column: 3; justify-items: start; text-align: left; }
 }
 
+/* ===== 历史版本 ===== */
+.history-list { display: grid; gap: 14px; }
+.history-row {
+  display: grid; grid-template-columns: minmax(0, 1fr) auto;
+  gap: 16px; align-items: center;
+  padding: 18px 20px; background: var(--white);
+  border: 1px solid var(--paper-300); border-radius: 4px;
+}
+.history-row:hover { background: rgba(31,91,87,.04); }
+.history-row__meta {
+  display: flex; flex-wrap: wrap; gap: 6px 12px;
+  margin-bottom: 6px; color: var(--ink-700); font: 500 .72rem var(--font-data);
+}
+.history-row__project { color: var(--copper-600); font-weight: 650; }
+.history-row__path { color: var(--oxide-700); }
+.history-row__paper { color: var(--ink-800); }
+.history-row__main h5 { margin: 0 0 4px; font: 520 1rem var(--font-display); color: var(--ink-900); }
+.history-row__main h5 span { color: var(--ink-700); font: 500 .72rem var(--font-data); }
+.history-row__version { margin: 0 0 6px; color: var(--oxide-700); font: 600 .74rem var(--font-data); }
+.history-row__preview { margin: 0; color: var(--ink-800); font-size: .84rem; line-height: 1.6; }
+.history-row__actions { display: flex; gap: 8px; }
+
 /* ===== 论文思考全屏浏览（VIEW） ===== */
 .paper-view-page { padding: 28px clamp(28px, 4vw, 64px) 64px; }
 .pv-hero {

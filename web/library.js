@@ -123,6 +123,7 @@ const state = {
   recycleItems: [],
   recycleSummary: { total: 0, project: 0, folder: 0, paper: 0, note: 0 },
   recycleRetentionDays: 7,
+  historyVersions: [],
   searchTerm: "",
   folderOpen: {},          // folderId -> bool 展开状态
   // 多选删除（仿照论文观察台）
@@ -214,6 +215,9 @@ function showView(view) {
   } else if (view === "recycle") {
     $("#page-title").textContent = "回收站";
     $("#page-eyebrow").textContent = "LIBRARY / RECYCLE BIN";
+  } else if (view === "history") {
+    $("#page-title").textContent = "历史版本";
+    $("#page-eyebrow").textContent = "LIBRARY / HISTORY";
   } else if (view === "paper-view") {
     const p = state._viewPaper;
     $("#page-title").textContent = p ? (p.title_en || p.title_zh || "论文思考") : "论文思考";
@@ -621,6 +625,108 @@ async function purgeSelectedRecycle() {
     toast("永久删除失败：" + e.message, true);
   }
 }
+
+/* ============ 历史版本 ============ */
+async function openHistory() {
+  try {
+    await loadHistoryVersions();
+    showView("history");
+    renderNav();
+    renderHistoryVersions();
+  } catch (e) {
+    toast("历史版本加载失败：" + e.message, true);
+  }
+}
+
+async function loadHistoryVersions() {
+  const data = await req("GET", "/api/note_versions");
+  state.historyVersions = data.versions || [];
+}
+
+function formatHistoryTime(iso) {
+  const date = new Date(iso);
+  if (Number.isNaN(date.getTime())) return "时间未知";
+  return date.toLocaleString("zh-CN", { year: "numeric", month: "2-digit", day: "2-digit", hour: "2-digit", minute: "2-digit", hour12: false });
+}
+
+function renderHistoryVersions() {
+  const list = $("#history-list");
+  if (!list) return;
+  if (!state.historyVersions.length) {
+    list.innerHTML = `<div class="recycle-empty"><svg><use href="#i-clock"/></svg><h4>还没有历史版本</h4><p>每次编辑思考前，旧内容会自动保存一条历史记录。</p></div>`;
+    return;
+  }
+
+  list.innerHTML = state.historyVersions.map(v => {
+    const text = (v.content || "").replace(/\[\[img:\d+\]\]/g, " [图片] ").replace(/\s+/g, " ").trim();
+    const preview = text.length > 220 ? text.slice(0, 220) + "…" : text;
+    return `
+      <article class="history-row" data-vid="${v.id}" data-nid="${v.note_id}">
+        <div class="history-row__meta">
+          <span class="history-row__project">${esc(v.project_name)}</span>
+          <span class="history-row__path">${esc(v.folder_path)}</span>
+          <span class="history-row__paper">${esc(v.paper_title)}</span>
+        </div>
+        <div class="history-row__main">
+          <h5>思考标注 · <span>${formatHistoryTime(v.note_created_at)}</span></h5>
+          <p class="history-row__version">版本保存于 ${formatHistoryTime(v.created_at)}</p>
+          ${preview ? `<p class="history-row__preview">${esc(preview)}</p>` : ""}
+        </div>
+        <div class="history-row__actions">
+          <button class="scan-button scan-button--ghost scan-button--sm" data-action="view" type="button">查看</button>
+          <button class="scan-button scan-button--sm" data-action="revert" type="button">回退</button>
+        </div>
+      </article>`;
+  }).join("");
+
+  $$(".history-row button[data-action='view']").forEach(btn => {
+    btn.onclick = () => {
+      const row = btn.closest(".history-row");
+      const v = state.historyVersions.find(x => x.id === parseInt(row.dataset.vid));
+      if (v) viewHistoryVersion(v);
+    };
+  });
+  $$(".history-row button[data-action='revert']").forEach(btn => {
+    btn.onclick = () => {
+      const row = btn.closest(".history-row");
+      const v = state.historyVersions.find(x => x.id === parseInt(row.dataset.vid));
+      if (v) revertHistoryVersion(v);
+    };
+  });
+}
+
+async function viewHistoryVersion(v) {
+  let imageHtml = "";
+  try {
+    const data = await req("GET", "/api/paper?id=" + v.paper_id);
+    const note = (data.paper.notes || []).find(n => n.id === v.note_id);
+    const images = (note ? note.images : []).filter(img => (v.image_ids || []).includes(img.id));
+    const pseudoNote = { content: v.content, images };
+    imageHtml = `<div class="pv-card__body" style="grid-template-columns:1fr; margin-top:14px;">${renderViewNoteBlocks(pseudoNote)}</div>`;
+  } catch (e) {
+    imageHtml = `<p style="color:var(--danger-600);font-size:.8rem;">加载图片失败：${esc(e.message)}</p><div class="pv-card__body" style="grid-template-columns:1fr; margin-top:14px;">${renderViewNoteBlocks({ content: v.content, images: [] })}</div>`;
+  }
+  openModal(`
+    <button class="icon-button" id="m-close" type="button" aria-label="关闭"><svg><use href="#i-close"/></svg></button>
+    <p class="eyebrow">HISTORY VERSION · ${esc((v.created_at || "").replace("T", " ").slice(0, 16))}</p>
+    <h3>历史版本</h3>
+    <p class="modal-hint">${esc(v.project_name)} / ${esc(v.folder_path)} / ${esc(v.paper_title)}</p>
+    ${imageHtml}`);
+  $("#m-close").onclick = closeModal;
+}
+
+async function revertHistoryVersion(v) {
+  if (!confirm("确定回退到这个版本？当前内容会被保存为一个新版本，方便再次回退。")) return;
+  try {
+    await req("POST", "/api/note_versions/revert", { note_id: v.note_id, version_id: v.id });
+    toast("已回退到选中版本");
+    await loadHistoryVersions();
+    renderHistoryVersions();
+  } catch (e) {
+    toast("回退失败：" + e.message, true);
+  }
+}
+
 function renderProjects() {
   const totalPapers = state.projects.reduce((s, p) => s + (p.paper_count || 0), 0);
   const totalFolders = state.projects.reduce((s, p) => s + (p.folder_count || 0), 0);
@@ -1725,6 +1831,8 @@ function bindGlobal() {
   if (recycleBtn) recycleBtn.addEventListener("click", openRecycle);
   const recycleTopBtn = $("#recycle-open-btn");
   if (recycleTopBtn) recycleTopBtn.addEventListener("click", openRecycle);
+  const historyBtn = $("#history-btn");
+  if (historyBtn) historyBtn.addEventListener("click", openHistory);
   $("#recycle-restore-btn").addEventListener("click", restoreSelectedRecycle);
   $("#recycle-purge-btn").addEventListener("click", purgeSelectedRecycle);
   $("#recycle-clear-sel").addEventListener("click", clearSelection);

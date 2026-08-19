@@ -696,6 +696,7 @@ def init_db() -> None:
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             note_id INTEGER NOT NULL REFERENCES note(id) ON DELETE CASCADE,
             content TEXT NOT NULL,
+            image_ids_json TEXT NOT NULL DEFAULT '[]',
             created_at TEXT NOT NULL
         );
         CREATE INDEX IF NOT EXISTS idx_note_version_note ON note_version(note_id, created_at);
@@ -1424,6 +1425,44 @@ class Handler(BaseHTTPRequestHandler):
                     return
                 items, summary = list_recycle_items(uid)
                 json_response(self, {"items": items, "summary": summary, "retention_days": RECYCLE_RETENTION_DAYS})
+            elif path == "/api/note_versions":
+                uid = require_user(self)
+                if not uid:
+                    self._error(401, "未登录")
+                    return
+                conn = get_db()
+                rows = conn.execute(
+                    """                       SELECT nv.id, nv.note_id, nv.content, nv.image_ids_json, nv.created_at,
+                              n.created_at note_created_at,
+                              pa.id paper_id, pa.title_en paper_title_en, pa.title_zh paper_title_zh,
+                              p.id project_id, p.name project_name,
+                              f.id folder_id
+                       FROM note_version nv
+                       JOIN note n ON n.id = nv.note_id
+                       JOIN paper pa ON pa.id = n.paper_id
+                       JOIN folder f ON f.id = pa.folder_id
+                       JOIN project p ON p.id = f.project_id
+                       WHERE p.user_id = ?
+                       ORDER BY nv.created_at DESC""",
+                    (uid,),
+                ).fetchall()
+                versions = []
+                for r in rows:
+                    versions.append({
+                        "id": r["id"],
+                        "note_id": r["note_id"],
+                        "content": r["content"],
+                        "image_ids": json.loads(r["image_ids_json"] or "[]"),
+                        "created_at": r["created_at"],
+                        "note_created_at": r["note_created_at"],
+                        "paper_id": r["paper_id"],
+                        "paper_title": r["paper_title_en"] or r["paper_title_zh"] or "（未命名论文）",
+                        "project_id": r["project_id"],
+                        "project_name": r["project_name"],
+                        "folder_id": r["folder_id"],
+                        "folder_path": _folder_path(conn, r["folder_id"]),
+                    })
+                json_response(self, {"versions": versions})
             else:
                 self._error(404, "Not Found")
         except Exception as e:
@@ -1666,6 +1705,52 @@ class Handler(BaseHTTPRequestHandler):
                 folder = conn.execute("SELECT project_id FROM folder WHERE id = ?", (pa["folder_id"],)).fetchone()
                 img = store_image(folder["project_id"], n["paper_id"], note_id, body.get("data") or "", body.get("ext") or "png")
                 json_response(self, {"ok": True, "image": img})
+            elif path == "/api/note_versions/revert":
+                uid = require_user(self)
+                if not uid:
+                    self._error(401, "未登录")
+                    return
+                body = _read_json_body(self)
+                note_id = int(body.get("note_id"))
+                version_id = int(body.get("version_id"))
+                conn = get_db()
+                note = conn.execute(
+                    """SELECT n.id, n.content FROM note n
+                       JOIN paper pa ON pa.id = n.paper_id
+                       JOIN folder f ON f.id = pa.folder_id
+                       JOIN project p ON p.id = f.project_id
+                       WHERE n.id = ? AND p.user_id = ?""",
+                    (note_id, uid),
+                ).fetchone()
+                if not note:
+                    self._error(404, "思考不存在")
+                    return
+                version = conn.execute(
+                    "SELECT content FROM note_version WHERE id = ? AND note_id = ?",
+                    (version_id, note_id),
+                ).fetchone()
+                if not version:
+                    self._error(404, "历史版本不存在")
+                    return
+                # 先把当前内容与图片快照存为新版本，再回退
+                current_images = [r["id"] for r in conn.execute("SELECT id FROM image WHERE note_id = ? ORDER BY id", (note_id,)).fetchall()]
+                current_img_re = re.compile(r"\[\[img:(\d+)\]\]")
+                seen_img = set()
+                current_image_ids = []
+                for m in current_img_re.finditer(note["content"]):
+                    idx = int(m.group(1))
+                    if 0 <= idx < len(current_images):
+                        iid = current_images[idx]
+                        if iid not in seen_img:
+                            seen_img.add(iid)
+                            current_image_ids.append(iid)
+                conn.execute(
+                    "INSERT INTO note_version (note_id, content, image_ids_json, created_at) VALUES (?,?,?,?)",
+                    (note_id, note["content"], json.dumps(current_image_ids), now_iso()),
+                )
+                conn.execute("UPDATE note SET content = ? WHERE id = ?", (version["content"], note_id))
+                conn.commit()
+                json_response(self, {"ok": True})
             elif path == "/api/open":
                 uid = require_user(self)
                 if not uid:
@@ -1733,10 +1818,21 @@ class Handler(BaseHTTPRequestHandler):
                     self._error(404, "思考不存在")
                     return
 
-                # 保存当前版本到历史
+                # 保存当前版本到历史（记录内容 + 当前内容引用的图片 ID 顺序）
+                current_images = [r["id"] for r in conn.execute("SELECT id FROM image WHERE note_id = ? ORDER BY id", (nid,)).fetchall()]
+                current_img_re = re.compile(r"\[\[img:(\d+)\]\]")
+                seen_img = set()
+                current_image_ids = []
+                for m in current_img_re.finditer(note["content"]):
+                    idx = int(m.group(1))
+                    if 0 <= idx < len(current_images):
+                        iid = current_images[idx]
+                        if iid not in seen_img:
+                            seen_img.add(iid)
+                            current_image_ids.append(iid)
                 conn.execute(
-                    "INSERT INTO note_version (note_id, content, created_at) VALUES (?,?,?)",
-                    (nid, note["content"], now_iso()),
+                    "INSERT INTO note_version (note_id, content, image_ids_json, created_at) VALUES (?,?,?,?)",
+                    (nid, note["content"], json.dumps(current_image_ids), now_iso()),
                 )
 
                 # 解析新内容中的图片占位符：保留的现有图 [[existing-img:ID]] 和新图 [[img:IDX]]
