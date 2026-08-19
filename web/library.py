@@ -752,7 +752,11 @@ def build_folder_tree(project_id: int) -> list[dict]:
 # ===== 安全文件名 =====
 def safe_name(name: str) -> str:
     name = re.sub(r'[\\/:*?"<>|\r\n\t]', "_", name).strip().strip(".")
-    return name[:120] or "untitled"
+    # Windows 会静默去掉目录名末尾的 '.' 和 ' '，切片之后必须再 strip 一次，
+    # 否则 store_image() 里用 `safe_name(...)[:80]` 在空格处切开会得到尾部带空格的名字，
+    # mkdir 成功但 write_bytes 找不到目录（FileNotFoundError）。
+    name = name[:120].rstrip(". ")
+    return name or "untitled"
 
 
 # ===== DOI 前缀 → 期刊名映射（比解析页眉可靠得多）=====
@@ -972,7 +976,8 @@ def store_image(project_id: int, paper_id: int, note_id: int, data_b64: str, ext
         "SELECT title_en FROM paper WHERE id = ?", (paper_id,)
     ).fetchone()
     project_name = safe_name(p["name"] if p else f"project{project_id}")
-    paper_name = safe_name((pa["title_en"] if pa else "paper") or f"paper{paper_id}")[:80]
+    # 先截 80 字符再过 safe_name，才能让 safe_name 里的 rstrip 兜底 Windows 静默去掉的尾部 '.' 和 ' '
+    paper_name = safe_name(((pa["title_en"] if pa else "paper") or f"paper{paper_id}")[:80])
     subdir = ASSET_DIR / project_name / paper_name
     subdir.mkdir(parents=True, exist_ok=True)
 
