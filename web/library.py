@@ -642,6 +642,8 @@ def get_db() -> sqlite3.Connection:
 
 def init_db() -> None:
     conn = get_db()
+    # 先给旧表补列，再执行 CREATE TABLE / CREATE INDEX，避免索引引用不存在的列
+    _migrate_note_version_image_ids(conn)
     conn.executescript(
         """
         CREATE TABLE IF NOT EXISTS user (
@@ -697,9 +699,11 @@ def init_db() -> None:
             note_id INTEGER NOT NULL REFERENCES note(id) ON DELETE CASCADE,
             content TEXT NOT NULL,
             image_ids_json TEXT NOT NULL DEFAULT '[]',
-            created_at TEXT NOT NULL
+            created_at TEXT NOT NULL,
+            expires_at TEXT NOT NULL
         );
         CREATE INDEX IF NOT EXISTS idx_note_version_note ON note_version(note_id, created_at);
+        CREATE INDEX IF NOT EXISTS idx_note_version_expiry ON note_version(expires_at);
         CREATE TABLE IF NOT EXISTS session (
             token TEXT PRIMARY KEY,
             user_id INTEGER NOT NULL REFERENCES user(id) ON DELETE CASCADE,
@@ -729,14 +733,16 @@ def init_db() -> None:
 
 
 def _migrate_note_version_image_ids(conn: sqlite3.Connection) -> None:
-    """为已存在的老数据库 note_version 表补 image_ids_json 列。"""
+    """为已存在的老数据库 note_version 表补 image_ids_json / expires_at 列。"""
     cur = conn.execute("SELECT name FROM sqlite_master WHERE type='table' AND name='note_version'")
     if not cur.fetchone():
         return
     cols = {r[1] for r in conn.execute("PRAGMA table_info(note_version)")}
-    if "image_ids_json" in cols:
-        return
-    conn.execute("ALTER TABLE note_version ADD COLUMN image_ids_json TEXT NOT NULL DEFAULT '[]'")
+    if "image_ids_json" not in cols:
+        conn.execute("ALTER TABLE note_version ADD COLUMN image_ids_json TEXT NOT NULL DEFAULT '[]'")
+    if "expires_at" not in cols:
+        default_expires = (datetime.utcnow() + timedelta(days=RECYCLE_RETENTION_DAYS)).isoformat()
+        conn.execute(f"ALTER TABLE note_version ADD COLUMN expires_at TEXT NOT NULL DEFAULT '{default_expires}'")
     conn.commit()
 
 
@@ -1460,8 +1466,11 @@ class Handler(BaseHTTPRequestHandler):
                     self._error(401, "未登录")
                     return
                 conn = get_db()
+                now = _recycle_now()
+                # 清理过期历史版本
+                conn.execute("DELETE FROM note_version WHERE expires_at <= ?", (now.isoformat(timespec="seconds"),))
                 rows = conn.execute(
-                    """                       SELECT nv.id, nv.note_id, nv.content, nv.image_ids_json, nv.created_at,
+                    """SELECT nv.id, nv.note_id, nv.content, nv.image_ids_json, nv.created_at, nv.expires_at,
                               n.created_at note_created_at,
                               pa.id paper_id, pa.title_en paper_title_en, pa.title_zh paper_title_zh,
                               p.id project_id, p.name project_name,
@@ -1471,18 +1480,22 @@ class Handler(BaseHTTPRequestHandler):
                        JOIN paper pa ON pa.id = n.paper_id
                        JOIN folder f ON f.id = pa.folder_id
                        JOIN project p ON p.id = f.project_id
-                       WHERE p.user_id = ?
+                       WHERE p.user_id = ? AND nv.expires_at > ?
                        ORDER BY nv.created_at DESC""",
-                    (uid,),
+                    (uid, now.isoformat(timespec="seconds")),
                 ).fetchall()
                 versions = []
                 for r in rows:
+                    remain_seconds = max(0, int((datetime.fromisoformat(r["expires_at"]) - now).total_seconds()))
+                    remaining_days = max(1, (remain_seconds + 86399) // 86400) if remain_seconds else 0
                     versions.append({
                         "id": r["id"],
                         "note_id": r["note_id"],
                         "content": r["content"],
                         "image_ids": json.loads(r["image_ids_json"] or "[]"),
                         "created_at": r["created_at"],
+                        "expires_at": r["expires_at"],
+                        "remaining_days": remaining_days,
                         "note_created_at": r["note_created_at"],
                         "paper_id": r["paper_id"],
                         "paper_title": r["paper_title_en"] or r["paper_title_zh"] or "（未命名论文）",
@@ -1491,7 +1504,8 @@ class Handler(BaseHTTPRequestHandler):
                         "folder_id": r["folder_id"],
                         "folder_path": _folder_path(conn, r["folder_id"]),
                     })
-                json_response(self, {"versions": versions})
+                conn.commit()
+                json_response(self, {"versions": versions, "retention_days": RECYCLE_RETENTION_DAYS})
             else:
                 self._error(404, "Not Found")
         except Exception as e:
@@ -1775,9 +1789,10 @@ class Handler(BaseHTTPRequestHandler):
                         if iid not in seen_img:
                             seen_img.add(iid)
                             current_image_ids.append(iid)
+                expires = (datetime.utcnow() + timedelta(days=RECYCLE_RETENTION_DAYS)).isoformat()
                 conn.execute(
-                    "INSERT INTO note_version (note_id, content, image_ids_json, created_at) VALUES (?,?,?,?)",
-                    (note_id, note["content"], json.dumps(current_image_ids), now_iso()),
+                    "INSERT INTO note_version (note_id, content, image_ids_json, created_at, expires_at) VALUES (?,?,?,?,?)",
+                    (note_id, note["content"], json.dumps(current_image_ids), now_iso(), expires),
                 )
                 conn.execute("UPDATE note SET content = ? WHERE id = ?", (version["content"], note_id))
                 conn.commit()
@@ -1861,9 +1876,10 @@ class Handler(BaseHTTPRequestHandler):
                         if iid not in seen_img:
                             seen_img.add(iid)
                             current_image_ids.append(iid)
+                expires = (datetime.utcnow() + timedelta(days=RECYCLE_RETENTION_DAYS)).isoformat()
                 conn.execute(
-                    "INSERT INTO note_version (note_id, content, image_ids_json, created_at) VALUES (?,?,?,?)",
-                    (nid, note["content"], json.dumps(current_image_ids), now_iso()),
+                    "INSERT INTO note_version (note_id, content, image_ids_json, created_at, expires_at) VALUES (?,?,?,?,?)",
+                    (nid, note["content"], json.dumps(current_image_ids), now_iso(), expires),
                 )
 
                 # 解析新内容中的图片占位符：保留的现有图 [[existing-img:ID]] 和新图 [[img:IDX]]

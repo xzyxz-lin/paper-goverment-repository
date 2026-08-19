@@ -124,6 +124,7 @@ const state = {
   recycleSummary: { total: 0, project: 0, folder: 0, paper: 0, note: 0 },
   recycleRetentionDays: 7,
   historyVersions: [],
+  historyRetentionDays: 7,
   searchTerm: "",
   folderOpen: {},          // folderId -> bool 展开状态
   // 多选删除（仿照论文观察台）
@@ -168,9 +169,6 @@ function renderNav() {
   let html = `
     <button class="nav-item ${state.currentView === "projects" ? "is-active" : ""}" data-view="projects" type="button">
       <svg><use href="#i-grid"/></svg><span>项目总览</span>
-    </button>
-    <button class="nav-item ${state.currentView === "recycle" ? "is-active" : ""}" data-view="recycle" type="button">
-      <svg><use href="#i-archive"/></svg><span>回收站</span>${state.recycleSummary.total ? `<b>${state.recycleSummary.total}</b>` : ""}
     </button>`;
   const projects = state.projects;
   if (projects.length) {
@@ -188,7 +186,6 @@ function renderNav() {
     const view = btn.dataset.view;
     const pid = btn.dataset.project;
     if (view === "projects") { showView("projects"); setActiveNav(btn); }
-    else if (view === "recycle") { openRecycle(); }
     else if (pid) { openProject(parseInt(pid)); }
   }));
 }
@@ -641,6 +638,7 @@ async function openHistory() {
 async function loadHistoryVersions() {
   const data = await req("GET", "/api/note_versions");
   state.historyVersions = data.versions || [];
+  state.historyRetentionDays = data.retention_days || 7;
 }
 
 function formatHistoryTime(iso) {
@@ -651,6 +649,8 @@ function formatHistoryTime(iso) {
 
 function renderHistoryVersions() {
   const list = $("#history-list");
+  const retentionDaysEl = $("#history-retention-days");
+  if (retentionDaysEl) retentionDaysEl.textContent = (state.historyRetentionDays || 7) + " 天";
   if (!list) return;
   if (!state.historyVersions.length) {
     list.innerHTML = `<div class="recycle-empty"><svg><use href="#i-clock"/></svg><h4>还没有历史版本</h4><p>每次编辑思考前，旧内容会自动保存一条历史记录。</p></div>`;
@@ -659,18 +659,18 @@ function renderHistoryVersions() {
 
   list.innerHTML = state.historyVersions.map(v => {
     const text = (v.content || "").replace(/\[\[img:\d+\]\]/g, " [图片] ").replace(/\s+/g, " ").trim();
-    const preview = text.length > 220 ? text.slice(0, 220) + "…" : text;
+    const preview = text.length > 200 ? text.slice(0, 200) + "…" : text;
+    const imgCount = (v.image_ids || []).length;
     return `
       <article class="history-row" data-vid="${v.id}" data-nid="${v.note_id}">
-        <div class="history-row__meta">
-          <span class="history-row__project">${esc(v.project_name)}</span>
-          <span class="history-row__path">${esc(v.folder_path)}</span>
-          <span class="history-row__paper">${esc(v.paper_title)}</span>
-        </div>
         <div class="history-row__main">
-          <h5>思考标注 · <span>${formatHistoryTime(v.note_created_at)}</span></h5>
-          <p class="history-row__version">版本保存于 ${formatHistoryTime(v.created_at)}</p>
+          <p class="history-row__path">${esc(v.project_name)} / ${esc(v.folder_path || "")} / ${esc(v.paper_title)}</p>
+          <h5>思考标注 <span>· ${formatHistoryTime(v.created_at)}${imgCount ? ` · ${imgCount} 张图片` : ""}</span></h5>
           ${preview ? `<p class="history-row__preview">${esc(preview)}</p>` : ""}
+        </div>
+        <div class="history-row__time">
+          <span>修改于 ${formatHistoryTime(v.created_at)}</span>
+          <b class="${v.remaining_days <= 1 ? "is-urgent" : ""}">${v.remaining_days ? `剩余 ${v.remaining_days} 天` : "已到期"}</b>
         </div>
         <div class="history-row__actions">
           <button class="scan-button scan-button--ghost scan-button--sm" data-action="view" type="button">查看</button>
