@@ -185,6 +185,24 @@
         <p class="recycle-shortcut">提示：点击条目选择；按住 Ctrl 可增减选择，按住 Shift 可选择一整段。</p>
         <div class="recycle-list" id="recycle-list"></div>
       </section>
+
+      <!-- 论文思考全屏浏览（VIEW） -->
+      <section class="page paper-view-page" data-view="paper-view" aria-labelledby="paper-view-title">
+        <div class="pv-hero">
+          <div>
+            <p class="hero-index">PAPER / VIEW</p>
+            <h3 id="paper-view-title">论文思考</h3>
+            <p id="paper-view-subtitle">在历史思考中回顾读论文时的截图与想法。</p>
+          </div>
+          <div class="pv-hero__actions">
+            <button class="scan-button scan-button--ghost" id="pv-back-btn" type="button">
+              <svg><use href="#i-close"/></svg><span>关闭观察</span>
+            </button>
+          </div>
+        </div>
+        <div class="pv-stats" id="pv-stats"></div>
+        <div class="pv-list" id="pv-list"></div>
+      </section>
     </main>
   </div>
 

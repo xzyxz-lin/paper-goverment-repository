@@ -212,6 +212,10 @@ function showView(view) {
   } else if (view === "recycle") {
     $("#page-title").textContent = "回收站";
     $("#page-eyebrow").textContent = "LIBRARY / RECYCLE BIN";
+  } else if (view === "paper-view") {
+    const p = state._viewPaper;
+    $("#page-title").textContent = p ? (p.title_en || p.title_zh || "论文思考") : "论文思考";
+    $("#page-eyebrow").textContent = "PAPER / VIEW";
   }
 }
 
@@ -904,7 +908,7 @@ function renderPaperDrawer(p) {
       <div class="note-editor" id="note-editor" contenteditable="true" data-placeholder="这篇文章带给我什么启发？可写文字、可 Ctrl+V 贴图（插在光标处）、图文穿插、换行缩进，写完点「保存思考」才算一条。"></div>
       <div class="note-compose__bar">
         <span class="note-compose__hint">支持：文字 + 多张截图 + 图间插话 + 换行缩进</span>
-        <button class="scan-button scan-button--ghost" id="compose-add-img" type="button" style="min-height:38px;padding:0 12px;"><svg style="width:15px;height:15px;"><use href="#i-image"/></svg><span>插图</span></button>
+        <button class="scan-button scan-button--ghost" id="compose-view-btn" type="button" style="min-height:38px;padding:0 12px;"><svg style="width:15px;height:15px;"><use href="#i-image"/></svg><span>VIEW</span></button>
         <button class="scan-button" id="add-note-btn" type="button"><svg><use href="#i-plus"/></svg><span>保存思考</span></button>
       </div>
     </div>`;
@@ -932,7 +936,7 @@ function renderPaperDrawer(p) {
       }
     }
   });
-  $("#compose-add-img").onclick = () => pickComposeImage(editor);
+  $("#compose-view-btn").onclick = () => { closeDrawer(); openPaperView(p.id); };
   $("#add-note-btn").onclick = () => addNote(p.id, editor);
 
   // 已有笔记的删除
@@ -1031,29 +1035,6 @@ function insertComposeImage(blob, editor) {
   });
 }
 
-// 点「插图」按钮选择图片加入编辑区
-function pickComposeImage(editor) {
-  const input = document.createElement("input");
-  input.type = "file";
-  input.accept = "image/*";
-  input.onchange = () => {
-    const f = input.files[0];
-    if (!f) return;
-    fileToBase64(f).then(b64 => {
-      const ext = (f.name.split(".").pop() || "png").toLowerCase();
-      const idx = state.composeImages.length;
-      state.composeImages.push({ data: b64, ext });
-      const img = document.createElement("img");
-      img.src = "data:image/" + ext + ";base64," + b64;
-      img.dataset.idx = idx;
-      img.className = "compose-img";
-      editor.appendChild(img);
-      editor.focus();
-    });
-  };
-  input.click();
-}
-
 async function addNote(paperId, editor) {
   const { content, images } = serializeCompose(editor);
   const textOnly = content.replace(/\[\[img:\d+\]\]/g, "").trim();
@@ -1134,6 +1115,72 @@ function closeDrawer() {
   setTimeout(() => { $("#drawer-backdrop").hidden = true; }, 320);
 }
 $("#drawer-backdrop").addEventListener("click", closeDrawer);
+
+/* ============ 论文思考全屏浏览（VIEW） ============ */
+async function openPaperView(pid) {
+  const data = await req("GET", "/api/paper?id=" + pid);
+  const paper = data.paper;
+  state._viewPaper = paper;
+  state._viewPaperReturnTo = state.currentView || "project";
+  renderPaperView(paper);
+  showView("paper-view");
+}
+
+function closePaperView() {
+  const back = state._viewPaperReturnTo || "project";
+  state._viewPaper = null;
+  state._viewPaperReturnTo = null;
+  showView(back);
+}
+
+function renderPaperView(p) {
+  const title = p.title_en || p.title_zh || "（未命名论文）";
+  const notes = p.notes || [];
+  const imgCount = notes.reduce((s, n) => s + (n.images ? n.images.length : 0), 0);
+
+  $("#paper-view-title").textContent = title;
+  $("#paper-view-subtitle").textContent = notes.length
+    ? `共 ${notes.length} 条思考，${imgCount} 张截图。滚动查看完整回顾。`
+    : "这篇论文还没有思考记录。在抽屉里点击「新增思考」写下第一条。";
+
+  $("#pv-stats").innerHTML = `
+    <div><span>思考标注</span><strong>${notes.length}</strong></div>
+    <div><span>截图</span><strong>${imgCount}</strong></div>
+    <div><span>发表日期</span><strong>${esc(p.publish_date || "—")}</strong></div>`;
+
+  const list = $("#pv-list");
+  if (!notes.length) {
+    list.innerHTML = `
+      <div class="pv-empty">
+        <svg><use href="#i-image"/></svg>
+        <h4>还没有思考</h4>
+        <p>回到论文抽屉，在「新增思考」里写文字、贴截图，保存后就会出现在这里。</p>
+      </div>`;
+  } else {
+    list.innerHTML = notes.map((n, idx) => renderViewNoteCard(n, idx + 1)).join("");
+  }
+
+  $("#pv-back-btn").onclick = closePaperView;
+}
+
+function renderViewNoteCard(n, idx) {
+  const images = n.images || [];
+  const text = (n.content || "").replace(/\[\[img:\d+\]\]/g, "").trim();
+  const time = esc((n.created_at || "").replace("T", " ").slice(0, 16));
+  return `
+    <article class="pv-card">
+      <div class="pv-card__head">
+        <span class="pv-card__time">${time}</span>
+        <span class="pv-card__index">#${idx}</span>
+      </div>
+      <div class="pv-card__media">
+        ${images.length
+          ? images.map(img => `<img src="/assets/${encodeURI(img.rel_path)}" alt="截图" loading="lazy">`).join("")
+          : `<div class="pv-empty" style="min-height:160px;padding:28px 20px;"><p style="margin:0;color:var(--ink-500);font-size:.8rem;">（这条思考没有截图）</p></div>`}
+      </div>
+      <div class="pv-card__body">${text ? esc(text) : ""}</div>
+    </article>`;
+}
 
 /* ============ 弹窗 ============ */
 function openModal(html) {
