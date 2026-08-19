@@ -121,9 +121,10 @@ const state = {
   currentFolderPath: [],   // [{id, name}] 从根到当前
   papers: [],
   recycleItems: [],
-  recycleSummary: { total: 0, project: 0, folder: 0, paper: 0, note: 0 },
+  recycleSummary: { total: 0, project: 0, folder: 0, paper: 0 },
   recycleRetentionDays: 7,
-  historyVersions: [],
+  historyTree: [],
+  historySel: { projectId: null, folderId: null, paperId: null },
   historyRetentionDays: 7,
   searchTerm: "",
   folderOpen: {},          // folderId -> bool 展开状态
@@ -455,24 +456,7 @@ async function openRecycle() {
 }
 
 function recycleKindLabel(kind) {
-  return { project: "项目", folder: "文件夹", paper: "论文", note: "思考" }[kind] || "记录";
-}
-
-function renderRecycleNote(item) {
-  const text = (item.note_content || "").replace(/\[\[img:\d+\]\]/g, " ").replace(/\s+/g, " ").trim();
-  const truncated = text.length > 160 ? text.slice(0, 160) + "…" : text;
-  const imgs = (item.note_images || []).slice(0, 4);
-  const imgHtml = imgs.length
-    ? `<div class="recycle-note__imgs">${imgs.map(img => `<img src="/assets/${encodeURI(img.rel_path)}" alt="截图">`).join("")}${item.note_images.length > 4 ? `<span class="recycle-note__more">+${item.note_images.length - 4}</span>` : ""}</div>`
-    : "";
-  const path = [esc(item.project_name || ""), item.folder_path ? esc(item.folder_path) : "", esc(item.context || "")].filter(Boolean).join(" / ");
-  return `
-    <div class="recycle-row__main recycle-row__main--note">
-      <h5>思考标注 · <span>${formatRecycleTime(item.note_created_at)}</span></h5>
-      <p class="recycle-note__path">${path}</p>
-      ${truncated ? `<p class="recycle-note__text">${esc(truncated)}</p>` : ""}
-      ${imgHtml}
-    </div>`;
+  return { project: "项目", folder: "文件夹", paper: "论文" }[kind] || "记录";
 }
 
 function formatRecycleTime(iso) {
@@ -491,11 +475,10 @@ function renderRecycle() {
     <div><span>待恢复</span><strong>${summary.total || 0}</strong></div>
     <div><span>项目</span><strong>${summary.project || 0}</strong></div>
     <div><span>文件夹</span><strong>${summary.folder || 0}</strong></div>
-    <div><span>论文</span><strong>${summary.paper || 0}</strong></div>
-    <div><span>思考</span><strong>${summary.note || 0}</strong></div>`;
+    <div><span>论文</span><strong>${summary.paper || 0}</strong></div>`;
 
   if (!state.recycleItems.length) {
-    list.innerHTML = `<div class="recycle-empty"><svg><use href="#i-archive"/></svg><h4>回收站是空的</h4><p>删除的项目、文件夹、论文和思考会在这里保留 ${state.recycleRetentionDays} 天。</p></div>`;
+    list.innerHTML = `<div class="recycle-empty"><svg><use href="#i-archive"/></svg><h4>回收站是空的</h4><p>删除的项目、文件夹、论文会在这里保留 ${state.recycleRetentionDays} 天。已删除的思考归到「历史版本」中。</p></div>`;
     updateRecycleSelectionUI();
     return;
   }
@@ -511,14 +494,13 @@ function renderRecycle() {
       <header><span>PROJECT</span><h4>${esc(group.name)}</h4><b>${group.items.length} 项</b></header>
       <div class="recycle-group__items">
         ${group.items.map(item => `
-          <article class="recycle-row${item.kind === "note" ? " recycle-row--note" : ""}" data-rid="${item.id}" tabindex="0" role="checkbox" aria-checked="false">
+          <article class="recycle-row" data-rid="${item.id}" tabindex="0" role="checkbox" aria-checked="false">
             <label class="lib-sel recycle-row__check" aria-label="选择${esc(item.title)}"><input type="checkbox" class="recycle-chk" data-rid="${item.id}"></label>
             <div class="recycle-row__kind recycle-row__kind--${item.kind}">${recycleKindLabel(item.kind)}</div>
-            ${item.kind === "note" ? renderRecycleNote(item) : `
             <div class="recycle-row__main">
               <h5>${esc(item.title)}</h5>
               <p>${item.folder_path ? `${esc(item.folder_path)} · ` : ""}${esc(item.context)}</p>
-            </div>`}
+            </div>
             <div class="recycle-row__time"><span>删除于 ${formatRecycleTime(item.deleted_at)}</span><b class="${item.remaining_days <= 1 ? "is-urgent" : ""}">${item.remaining_days ? `剩余 ${item.remaining_days} 天` : "已到期"}</b></div>
           </article>`).join("")}
       </div>
@@ -611,7 +593,7 @@ async function restoreSelectedRecycle() {
 async function purgeSelectedRecycle() {
   const ids = [...state.selRecycle];
   if (!ids.length) return;
-  if (!confirm(`确认永久删除选中的 ${ids.length} 项吗？\n此操作会清理对应的论文记录、笔记和截图，且无法恢复。`)) return;
+  if (!confirm(`确认永久删除选中的 ${ids.length} 项吗？\n此操作会清理对应的项目、文件夹或论文记录及其截图，且无法恢复。`)) return;
   try {
     const data = await req("POST", "/api/recycle/purge", { ids });
     toast(data.message || "已永久删除所选内容");
@@ -627,6 +609,7 @@ async function purgeSelectedRecycle() {
 async function openHistory() {
   try {
     await loadHistoryVersions();
+    state.historySel = { projectId: null, folderId: null, paperId: null };
     showView("history");
     renderNav();
     renderHistoryVersions();
@@ -637,7 +620,7 @@ async function openHistory() {
 
 async function loadHistoryVersions() {
   const data = await req("GET", "/api/note_versions");
-  state.historyVersions = data.versions || [];
+  state.historyTree = data.tree || [];
   state.historyRetentionDays = data.retention_days || 7;
 }
 
@@ -647,71 +630,199 @@ function formatHistoryTime(iso) {
   return date.toLocaleString("zh-CN", { year: "numeric", month: "2-digit", day: "2-digit", hour: "2-digit", minute: "2-digit", hour12: false });
 }
 
+const HISTORY_EVENT_LABEL = { create: "新增", edit: "修改", delete: "删除" };
+
 function renderHistoryVersions() {
-  const list = $("#history-list");
-  const retentionDaysEl = $("#history-retention-days");
-  if (retentionDaysEl) retentionDaysEl.textContent = (state.historyRetentionDays || 7) + " 天";
-  if (!list) return;
-  if (!state.historyVersions.length) {
-    list.innerHTML = `<div class="recycle-empty"><svg><use href="#i-clock"/></svg><h4>还没有历史版本</h4><p>每次编辑思考前，旧内容会自动保存一条历史记录。</p></div>`;
+  const crumbs = $("#history-crumbs");
+  const level = $("#history-level");
+  const retentionEl = $("#history-retention-days");
+  if (retentionEl) retentionEl.textContent = (state.historyRetentionDays || 7) + " 天";
+  if (!level) return;
+  if (!state.historyTree.length) {
+    level.innerHTML = `<div class="recycle-empty"><svg><use href="#i-clock"/></svg><h4>还没有历史版本</h4><p>新增、修改或删除思考时，会自动按归属保留一条记录（7 天）。</p></div>`;
+    if (crumbs) crumbs.innerHTML = "";
     return;
   }
 
-  list.innerHTML = state.historyVersions.map(v => {
-    const text = (v.content || "").replace(/\[\[img:\d+\]\]/g, " [图片] ").replace(/\s+/g, " ").trim();
-    const preview = text.length > 200 ? text.slice(0, 200) + "…" : text;
-    const imgCount = (v.image_ids || []).length;
-    return `
-      <article class="history-row" data-vid="${v.id}" data-nid="${v.note_id}">
-        <div class="history-row__main">
-          <p class="history-row__path">${esc(v.project_name)} / ${esc(v.folder_path || "")} / ${esc(v.paper_title)}</p>
-          <h5>思考标注 <span>· ${formatHistoryTime(v.created_at)}${imgCount ? ` · ${imgCount} 张图片` : ""}</span></h5>
-          ${preview ? `<p class="history-row__preview">${esc(preview)}</p>` : ""}
-        </div>
-        <div class="history-row__time">
-          <span>修改于 ${formatHistoryTime(v.created_at)}</span>
-          <b class="${v.remaining_days <= 1 ? "is-urgent" : ""}">${v.remaining_days ? `剩余 ${v.remaining_days} 天` : "已到期"}</b>
-        </div>
-        <div class="history-row__actions">
-          <button class="scan-button scan-button--ghost scan-button--sm" data-action="view" type="button">查看</button>
-          <button class="scan-button scan-button--sm" data-action="revert" type="button">回退</button>
-        </div>
-      </article>`;
-  }).join("");
+  const { projectId, folderId, paperId } = state.historySel;
+  const tree = state.historyTree;
 
-  $$(".history-row button[data-action='view']").forEach(btn => {
-    btn.onclick = () => {
-      const row = btn.closest(".history-row");
-      const v = state.historyVersions.find(x => x.id === parseInt(row.dataset.vid));
-      if (v) viewHistoryVersion(v);
-    };
-  });
-  $$(".history-row button[data-action='revert']").forEach(btn => {
-    btn.onclick = () => {
-      const row = btn.closest(".history-row");
-      const v = state.historyVersions.find(x => x.id === parseInt(row.dataset.vid));
-      if (v) revertHistoryVersion(v);
-    };
+  // 面包屑
+  if (crumbs) {
+    const parts = [`<button class="history-crumb" data-level="root" type="button">历史版本</button>`];
+    let proj = null, folder = null, paper = null;
+    if (projectId != null) {
+      proj = tree.find(p => p.project_id === projectId);
+      parts.push(`<button class="history-crumb" data-level="project" type="button">${esc(proj ? proj.project_name : "项目")}</button>`);
+    }
+    if (proj && folderId != null) {
+      folder = proj.folders.find(f => f.folder_id === folderId);
+      parts.push(`<button class="history-crumb" data-level="folder" type="button">${esc(folder ? folder.folder_path : "文件夹")}</button>`);
+    }
+    if (folder && paperId != null) {
+      paper = folder.papers.find(p => p.paper_id === paperId);
+      parts.push(`<span class="history-crumb is-current">${esc(paper ? paper.paper_title : "论文")}</span>`);
+    }
+    crumbs.innerHTML = parts.join('<span class="history-crumb__sep">/</span>');
+    $$(".history-crumb", crumbs).forEach(btn => {
+      btn.onclick = () => {
+        const lvl = btn.dataset.level;
+        if (lvl === "root") state.historySel = { projectId: null, folderId: null, paperId: null };
+        else if (lvl === "project") state.historySel = { projectId, folderId: null, paperId: null };
+        else if (lvl === "folder") state.historySel = { projectId, folderId, paperId: null };
+        renderHistoryVersions();
+      };
+    });
+  }
+
+  // 各级列表
+  if (projectId == null) {
+    level.innerHTML = tree.map(p => `
+      <button class="history-node" data-project="${p.project_id}" type="button">
+        <span class="history-node__type">项目</span>
+        <span class="history-node__name">${esc(p.project_name)}</span>
+        <span class="history-node__count">${p.folders.reduce((s, f) => s + f.papers.length, 0)} 条记录</span>
+      </button>`).join("");
+    $$(".history-node", level).forEach(btn => btn.onclick = () => {
+      state.historySel = { projectId: parseInt(btn.dataset.project), folderId: null, paperId: null };
+      renderHistoryVersions();
+    });
+    return;
+  }
+
+  const proj = tree.find(p => p.project_id === projectId);
+  if (folderId == null) {
+    level.innerHTML = proj.folders.map(f => `
+      <button class="history-node" data-folder="${f.folder_id}" type="button">
+        <span class="history-node__type">文件夹</span>
+        <span class="history-node__name">${esc(f.folder_path)}</span>
+        <span class="history-node__count">${f.papers.length} 篇论文记录</span>
+      </button>`).join("");
+    $$(".history-node", level).forEach(btn => btn.onclick = () => {
+      state.historySel = { projectId, folderId: parseInt(btn.dataset.folder), paperId: null };
+      renderHistoryVersions();
+    });
+    return;
+  }
+
+  const folder = proj.folders.find(f => f.folder_id === folderId);
+  if (paperId == null) {
+    level.innerHTML = folder.papers.map(p => `
+      <button class="history-node" data-paper="${p.paper_id}" type="button">
+        <span class="history-node__type">论文</span>
+        <span class="history-node__name">${esc(p.paper_title)}</span>
+        <span class="history-node__count">${p.events.length} 条记录</span>
+      </button>`).join("");
+    $$(".history-node", level).forEach(btn => btn.onclick = () => {
+      state.historySel = { projectId, folderId, paperId: parseInt(btn.dataset.paper) };
+      renderHistoryVersions();
+    });
+    return;
+  }
+
+  const paper = folder.papers.find(p => p.paper_id === paperId);
+  const groups = [
+    { type: "create", label: "新增的思考", items: paper.events.filter(e => e.event_type === "create") },
+    { type: "edit", label: "修改的思考", items: paper.events.filter(e => e.event_type === "edit") },
+    { type: "delete", label: "删除的思考", items: paper.events.filter(e => e.event_type === "delete") },
+  ].filter(g => g.items.length);
+
+  if (!groups.length) {
+    level.innerHTML = `<div class="recycle-empty"><svg><use href="#i-clock"/></svg><h4>这篇论文还没有历史记录</h4></div>`;
+    return;
+  }
+
+  level.innerHTML = groups.map(group => `
+    <section class="history-group">
+      <header><span class="history-group__tag history-group__tag--${group.type}">${group.label}</span><b>${group.items.length} 条</b></header>
+      <div class="history-group__items">
+        ${group.items.map(v => {
+          const text = (v.content || "").replace(/\[\[img:\d+\]\]/g, " [图片] ").replace(/\s+/g, " ").trim();
+          const preview = text.length > 160 ? text.slice(0, 160) + "…" : text;
+          const imgCount = (v.image_ids || []).length;
+          const actions = v.event_type === "delete"
+            ? `<button class="scan-button scan-button--ghost scan-button--sm" data-action="view" type="button">查看</button>
+               <button class="scan-button scan-button--sm" data-action="restore" type="button">恢复</button>
+               <button class="recycle-purge-btn scan-button scan-button--sm" data-action="purge" type="button">彻底删除</button>`
+            : `<button class="scan-button scan-button--ghost scan-button--sm" data-action="view" type="button">查看</button>
+               <button class="scan-button scan-button--sm" data-action="revert" type="button">回退</button>`;
+          return `
+          <article class="history-row history-row--${v.event_type}" data-vid="${v.id}" data-nid="${v.note_id}">
+            <div class="history-row__main">
+              <h5>思考标注 <span>· ${formatHistoryTime(v.created_at)}${imgCount ? ` · ${imgCount} 张图片` : ""}</span></h5>
+              ${preview ? `<p class="history-row__preview">${esc(preview)}</p>` : ""}
+            </div>
+            <div class="history-row__time">
+              <span>${HISTORY_EVENT_LABEL[v.event_type] || "修改"}于 ${formatHistoryTime(v.created_at)}</span>
+              <b class="${v.remaining_days <= 1 ? "is-urgent" : ""}">${v.remaining_days ? `剩余 ${v.remaining_days} 天` : "已到期"}</b>
+            </div>
+            <div class="history-row__actions">${actions}</div>
+          </article>`;
+        }).join("")}
+      </div>
+    </section>`).join("");
+
+  $$(".history-row", level).forEach(row => {
+    const v = paper.events.find(x => x.id === parseInt(row.dataset.vid));
+    row.querySelectorAll("button[data-action]").forEach(btn => {
+      btn.onclick = () => {
+        const action = btn.dataset.action;
+        if (action === "view") viewHistoryVersion(v);
+        else if (action === "revert") revertHistoryVersion(v);
+        else if (action === "restore") restoreHistoryNote(v);
+        else if (action === "purge") purgeHistoryVersion(v);
+      };
+    });
   });
 }
 
-async function viewHistoryVersion(v) {
-  let imageHtml = "";
+async function restoreHistoryNote(v) {
+  if (!confirm("确定恢复这条已删除的思考？它会重新出现在论文抽屉里。")) return;
   try {
-    const data = await req("GET", "/api/paper?id=" + v.paper_id);
-    const note = (data.paper.notes || []).find(n => n.id === v.note_id);
-    const images = (note ? note.images : []).filter(img => (v.image_ids || []).includes(img.id));
-    const pseudoNote = { content: v.content, images };
-    imageHtml = `<div class="pv-card__body" style="grid-template-columns:1fr; margin-top:14px;">${renderViewNoteBlocks(pseudoNote)}</div>`;
+    await req("POST", "/api/note_versions/restore", { note_id: v.note_id });
+    toast("已恢复该思考");
+    await loadHistoryVersions();
+    renderHistoryVersions();
   } catch (e) {
-    imageHtml = `<p style="color:var(--danger-600);font-size:.8rem;">加载图片失败：${esc(e.message)}</p><div class="pv-card__body" style="grid-template-columns:1fr; margin-top:14px;">${renderViewNoteBlocks({ content: v.content, images: [] })}</div>`;
+    toast("恢复失败：" + e.message, true);
+  }
+}
+
+async function purgeHistoryVersion(v) {
+  if (!confirm("确定彻底删除这条历史记录？若为删除类记录，对应思考也会被永久删除，不可恢复。")) return;
+  try {
+    await req("POST", "/api/note_versions/purge", { ids: [v.id] });
+    toast("已彻底删除该历史记录");
+    await loadHistoryVersions();
+    renderHistoryVersions();
+  } catch (e) {
+    toast("删除失败：" + e.message, true);
+  }
+}
+
+async function viewHistoryVersion(v) {
+  let bodyHtml = "";
+  try {
+    const imgIds = (v.image_ids || []);
+    let relMap = {};
+    if (imgIds.length) {
+      const data = await req("GET", "/api/images?ids=" + imgIds.join(","));
+      (data.images || []).forEach(im => { relMap[im.id] = im.rel_path; });
+    }
+    const pseudoNote = {
+      content: v.content,
+      images: imgIds.map(id => ({ id, rel_path: relMap[id] || "" })).filter(x => x.rel_path),
+    };
+    bodyHtml = `<div class="pv-card__body" style="grid-template-columns:1fr; margin-top:14px;">${renderViewNoteBlocks(pseudoNote)}</div>`;
+  } catch (e) {
+    bodyHtml = `<p style="color:var(--danger-600);font-size:.8rem;">加载图片失败：${esc(e.message)}</p>`;
   }
   openModal(`
     <button class="icon-button" id="m-close" type="button" aria-label="关闭"><svg><use href="#i-close"/></svg></button>
-    <p class="eyebrow">HISTORY VERSION · ${esc((v.created_at || "").replace("T", " ").slice(0, 16))}</p>
+    <p class="eyebrow">历史版本 · ${HISTORY_EVENT_LABEL[v.event_type] || "修改"} · ${esc((v.created_at || "").replace("T", " ").slice(0, 16))}</p>
     <h3>历史版本</h3>
-    <p class="modal-hint">${esc(v.project_name)} / ${esc(v.folder_path)} / ${esc(v.paper_title)}</p>
-    ${imageHtml}`);
+    <p class="modal-hint">${esc(v.project_name || "")} / ${esc(v.folder_path || "")} / ${esc(v.paper_title || "")}</p>
+    ${bodyHtml}`);
   $("#m-close").onclick = closeModal;
 }
 

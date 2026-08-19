@@ -330,10 +330,11 @@ def move_to_recycle(user_id: int, kind: str, ids: list[int]) -> int:
                 added += 1
 
     elif kind == "note":
+        # 思考已不再进入回收站，改由历史版本（note_version 的 delete 事件）承载。
+        # 这里仅把思考记入删除索引，使其从抽屉/VIEW 中隐藏；真正的删除事件在删除接口写入。
         placeholders = ",".join("?" for _ in ids)
         rows = conn.execute(
-            f"""SELECT n.id, n.paper_id, pa.folder_id, f.project_id
-                FROM note n
+            f"""SELECT n.id FROM note n
                 JOIN paper pa ON pa.id = n.paper_id
                 JOIN folder f ON f.id = pa.folder_id
                 JOIN project p ON p.id = f.project_id
@@ -341,11 +342,7 @@ def move_to_recycle(user_id: int, kind: str, ids: list[int]) -> int:
             [user_id, *ids],
         ).fetchall()
         for row in rows:
-            note_id = row["id"]
-            related = {"projects": [], "folders": [], "papers": [], "notes": [note_id]}
-            if _recycle_insert(conn, user_id, "note", note_id, row["project_id"], row["folder_id"], related):
-                _write_deleted_sets(deleted, related, True)
-                added += 1
+            _soft_delete_one_batch("notes", [row["id"]])
 
     else:
         raise ValueError("不支持的回收类型")
@@ -353,6 +350,40 @@ def move_to_recycle(user_id: int, kind: str, ids: list[int]) -> int:
     conn.commit()
     save_deleted(deleted)
     return added
+
+
+def delete_notes_to_history(user_id: int, ids: list[int]) -> int:
+    """删除思考：记入历史版本（note_version 的 delete 事件），并从抽屉/VIEW 隐藏。
+    不进入回收站。返回实际处理的思考数。"""
+    ids = sorted({int(x) for x in ids if x})
+    if not ids:
+        return 0
+    conn = get_db()
+    placeholders = ",".join("?" for _ in ids)
+    rows = conn.execute(
+        f"""SELECT n.id, n.content, pa.id paper_id, pa.folder_id, f.project_id
+            FROM note n
+            JOIN paper pa ON pa.id = n.paper_id
+            JOIN folder f ON f.id = pa.folder_id
+            JOIN project p ON p.id = f.project_id
+            WHERE p.user_id = ? AND n.id IN ({placeholders})""",
+        [user_id, *ids],
+    ).fetchall()
+    handled = 0
+    for row in rows:
+        note_id = row["id"]
+        image_ids = _note_image_ids_from_content(conn, note_id, row["content"])
+        expires = (_recycle_now() + timedelta(days=RECYCLE_RETENTION_DAYS)).isoformat(timespec="seconds")
+        conn.execute(
+            """INSERT INTO note_version (note_id, event_type, content, image_ids_json, created_at, expires_at)
+               VALUES (?, 'delete', ?, ?, ?, ?)""",
+            (note_id, row["content"], json.dumps(image_ids), now_iso(), expires),
+        )
+        # _soft_delete_one_batch 内部已写入 deleted.json（含 notes 键），不要再覆盖
+        _soft_delete_one_batch("notes", [note_id])
+        handled += 1
+    conn.commit()
+    return handled
 
 
 def _folder_path(conn: sqlite3.Connection, folder_id: int | None) -> str:
@@ -398,20 +429,8 @@ def _recycle_item_view(conn: sqlite3.Connection, record: sqlite3.Row) -> dict | 
         folder_path = _folder_path(conn, entity_id)
         context = f"包含 {max(0, len(related['folders']) - 1)} 个子文件夹、{len(related['papers'])} 篇论文"
     elif kind == "note":
-        row = conn.execute(
-            """SELECT n.id, n.content, n.created_at, pa.id paper_id, pa.title_en, pa.title_zh,
-                      f.id folder_id, f.project_id, p.name project_name
-               FROM note n
-               JOIN paper pa ON pa.id = n.paper_id
-               JOIN folder f ON f.id = pa.folder_id
-               JOIN project p ON p.id = f.project_id WHERE n.id = ?""",
-            (entity_id,),
-        ).fetchone()
-        if not row:
-            return None
-        title = "思考标注"
-        folder_path = _folder_path(conn, row["folder_id"])
-        context = row["title_en"] or row["title_zh"] or "（未命名论文）"
+        # 思考已移出回收站，不再在此展示
+        return None
 
     else:
         row = conn.execute(
@@ -462,7 +481,7 @@ def list_recycle_items(user_id: int) -> tuple[list[dict], dict]:
         "SELECT * FROM recycle_item WHERE user_id = ? ORDER BY expires_at, id DESC", (user_id,)
     ).fetchall()
     items = [item for record in records if (item := _recycle_item_view(conn, record))]
-    summary = {"total": len(items), "project": 0, "folder": 0, "paper": 0, "note": 0}
+    summary = {"total": len(items), "project": 0, "folder": 0, "paper": 0}
     for item in items:
         summary[item["kind"]] += 1
     return items, summary
@@ -566,6 +585,111 @@ def purge_expired_recycle_items() -> int:
     return _delete_recycle_records(records)
 
 
+def purge_expired_note_versions() -> int:
+    """清理过期历史版本：
+    - delete 事件过期：物理删除对应思考及其截图（cascade 清掉该思考所有版本），并从删除索引移除
+    - create/edit 事件过期：仅删除版本行，思考本身保留
+    返回清理的版本条数。"""
+    conn = get_db()
+    now = _recycle_now().isoformat(timespec="seconds")
+    rows = conn.execute(
+        "SELECT id, note_id, event_type FROM note_version WHERE expires_at <= ?", (now,)
+    ).fetchall()
+    if not rows:
+        return 0
+    deleted_index = load_deleted()
+    note_ids_physically_deleted: set[int] = set()
+    version_ids_to_delete: list[int] = []
+    for r in rows:
+        if r["event_type"] == "delete":
+            note_id = r["note_id"]
+            # 删除截图文件
+            for img in conn.execute("SELECT file_path FROM image WHERE note_id = ?", (note_id,)).fetchall():
+                try:
+                    Path(img["file_path"]).unlink(missing_ok=True)
+                except Exception:
+                    pass
+            conn.execute("DELETE FROM note WHERE id = ?", (note_id,))  # cascade 清掉版本 + 图片记录
+            note_ids_physically_deleted.add(note_id)
+        else:
+            version_ids_to_delete.append(r["id"])
+    if version_ids_to_delete:
+        ph = ",".join("?" for _ in version_ids_to_delete)
+        conn.execute(f"DELETE FROM note_version WHERE id IN ({ph})", version_ids_to_delete)
+    if note_ids_physically_deleted:
+        notes_set = set(deleted_index.get("notes", []))
+        changed = notes_set.difference_update(note_ids_physically_deleted)
+        deleted_index["notes"] = sorted(notes_set)
+    conn.commit()
+    if note_ids_physically_deleted:
+        save_deleted(deleted_index)
+    return len(rows)
+
+
+def restore_note_from_history(note_id: int, user_id: int) -> bool:
+    """从历史版本的删除事件中恢复一条思考：把它从删除索引移除，使其重新可见。"""
+    conn = get_db()
+    note = conn.execute(
+        """SELECT n.id FROM note n
+           JOIN paper pa ON pa.id = n.paper_id JOIN folder f ON f.id = pa.folder_id
+           JOIN project p ON p.id = f.project_id WHERE n.id = ? AND p.user_id = ?""",
+        (note_id, user_id),
+    ).fetchone()
+    if not note:
+        return False
+    deleted = load_deleted()
+    notes_set = set(deleted.get("notes", []))
+    if note_id in notes_set:
+        notes_set.discard(note_id)
+        deleted["notes"] = sorted(notes_set)
+        save_deleted(deleted)
+    return True
+
+
+def purge_note_versions(user_id: int, version_ids: list[int]) -> int:
+    """永久删除指定的历史版本记录；若为 delete 类型则一并物理删除对应思考。"""
+    version_ids = sorted({int(x) for x in version_ids if x})
+    if not version_ids:
+        return 0
+    conn = get_db()
+    ph = ",".join("?" for _ in version_ids)
+    rows = conn.execute(
+        f"""SELECT nv.id, nv.note_id, nv.event_type
+            FROM note_version nv
+            JOIN note n ON n.id = nv.note_id
+            JOIN paper pa ON pa.id = n.paper_id JOIN folder f ON f.id = pa.folder_id
+            JOIN project p ON p.id = f.project_id
+            WHERE p.user_id = ? AND nv.id IN ({ph})""",
+        (user_id, *version_ids),
+    ).fetchall()
+    deleted_index = load_deleted()
+    physically: set[int] = set()
+    keep: list[int] = []
+    for r in rows:
+        if r["event_type"] == "delete":
+            physically.add(r["note_id"])
+        else:
+            keep.append(r["id"])
+    if physically:
+        for note_id in physically:
+            for img in conn.execute("SELECT file_path FROM image WHERE note_id = ?", (note_id,)).fetchall():
+                try:
+                    Path(img["file_path"]).unlink(missing_ok=True)
+                except Exception:
+                    pass
+            conn.execute("DELETE FROM note WHERE id = ?", (note_id,))
+        notes_set = set(deleted_index.get("notes", []))
+        notes_set.difference_update(physically)
+        deleted_index["notes"] = sorted(notes_set)
+    if keep:
+        kph = ",".join("?" for _ in keep)
+        conn.execute(f"DELETE FROM note_version WHERE id IN ({kph})", keep)
+    conn.commit()
+    save_deleted(deleted_index)
+    return len(rows)
+
+
+
 def restore_recycle_items(user_id: int, recycle_ids: list[int] | None = None) -> int:
     conn = get_db()
     purge_expired_recycle_items()
@@ -616,8 +740,7 @@ def migrate_legacy_deleted_index() -> None:
             JOIN project p ON p.id = f.project_id WHERE f.id IN ({})"""),
         ("paper", "paper", "id", """SELECT pa.id, p.user_id FROM paper pa
             JOIN folder f ON f.id = pa.folder_id JOIN project p ON p.id = f.project_id WHERE pa.id IN ({})"""),
-        ("note", "note", "id", """SELECT n.id, p.user_id FROM note n JOIN paper pa ON pa.id = n.paper_id
-            JOIN folder f ON f.id = pa.folder_id JOIN project p ON p.id = f.project_id WHERE n.id IN ({})"""),
+        # 思考已移出回收站，旧的已删除思考只保留在 deleted.json 中隐藏，不再登记回收
     ):
         key = kind + "s" if kind != "paper" else "papers"
         ids = [int(x) for x in deleted.get(key, []) if x]
@@ -712,6 +835,7 @@ def init_db() -> None:
         CREATE TABLE IF NOT EXISTS note_version (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             note_id INTEGER NOT NULL REFERENCES note(id) ON DELETE CASCADE,
+            event_type TEXT NOT NULL DEFAULT 'edit',
             content TEXT NOT NULL,
             image_ids_json TEXT NOT NULL DEFAULT '[]',
             created_at TEXT NOT NULL,
@@ -748,7 +872,7 @@ def init_db() -> None:
 
 
 def _migrate_note_version_image_ids(conn: sqlite3.Connection) -> None:
-    """为已存在的老数据库 note_version 表补 image_ids_json / expires_at 列。"""
+    """为已存在的老数据库 note_version 表补 image_ids_json / expires_at / event_type 列。"""
     cur = conn.execute("SELECT name FROM sqlite_master WHERE type='table' AND name='note_version'")
     if not cur.fetchone():
         return
@@ -758,22 +882,61 @@ def _migrate_note_version_image_ids(conn: sqlite3.Connection) -> None:
     if "expires_at" not in cols:
         default_expires = (_recycle_now() + timedelta(days=RECYCLE_RETENTION_DAYS)).isoformat(timespec="seconds")
         conn.execute(f"ALTER TABLE note_version ADD COLUMN expires_at TEXT NOT NULL DEFAULT '{default_expires}'")
+    if "event_type" not in cols:
+        conn.execute("ALTER TABLE note_version ADD COLUMN event_type TEXT NOT NULL DEFAULT 'edit'")
     conn.commit()
 
 
+def _note_image_ids_from_content(conn: sqlite3.Connection, note_id: int, content: str) -> list[int]:
+    """从笔记内容里的 [[img:N]] 占位符解析出真实图片 id 列表（按出现顺序、去重）。"""
+    all_image_ids = [r["id"] for r in conn.execute("SELECT id FROM image WHERE note_id = ? ORDER BY id", (note_id,)).fetchall()]
+    current_img_re = re.compile(r"\[\[img:(\d+)\]\]")
+    seen_img: set[int] = set()
+    out: list[int] = []
+    for m in current_img_re.finditer(content or ""):
+        idx = int(m.group(1))
+        if 0 <= idx < len(all_image_ids):
+            iid = all_image_ids[idx]
+            if iid not in seen_img:
+                seen_img.add(iid)
+                out.append(iid)
+    return out
+
+
 def _migrate_recycle_item_kind(conn: sqlite3.Connection) -> None:
-    """把 recycle_item.kind 的 CHECK 扩展为支持 'note'（SQLite 不能直接 ALTER CHECK）。"""
+    """旧库的 recycle_item 含 'note' 种类——现已把思考移出回收站、归入历史版本。
+    迁移时：把 'note' 记录转成 note_version 的 delete 事件，再重建不含 note 的表。"""
     cur = conn.execute("SELECT sql FROM sqlite_master WHERE type='table' AND name='recycle_item'")
     sql = cur.fetchone()
-    if not sql or "'note'" in (sql[0] or ""):
+    # 新库（check 已无 'note'）无需处理
+    if not sql or "'note'" not in (sql[0] or ""):
         return
+
+    # 先把 note 回收记录转成历史版本 delete 事件
+    note_rows = conn.execute(
+        """SELECT r.entity_id, r.deleted_at, r.expires_at FROM recycle_item r WHERE r.kind = 'note'"""
+    ).fetchall()
+    for row in note_rows:
+        note_id = row["entity_id"]
+        note = conn.execute(
+            "SELECT n.id, n.content FROM note n WHERE n.id = ?", (note_id,)
+        ).fetchone()
+        if not note:
+            continue
+        image_ids = _note_image_ids_from_content(conn, note_id, note["content"])
+        conn.execute(
+            """INSERT INTO note_version (note_id, event_type, content, image_ids_json, created_at, expires_at)
+               VALUES (?, 'delete', ?, ?, ?, ?)""",
+            (note_id, note["content"], json.dumps(image_ids), row["deleted_at"], row["expires_at"]),
+        )
+
     conn.executescript(
         """
         ALTER TABLE recycle_item RENAME TO recycle_item_old;
         CREATE TABLE recycle_item (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             user_id INTEGER NOT NULL REFERENCES user(id) ON DELETE CASCADE,
-            kind TEXT NOT NULL CHECK(kind IN ('project', 'folder', 'paper', 'note')),
+            kind TEXT NOT NULL CHECK(kind IN ('project', 'folder', 'paper')),
             entity_id INTEGER NOT NULL,
             project_id INTEGER,
             folder_id INTEGER,
@@ -782,7 +945,9 @@ def _migrate_recycle_item_kind(conn: sqlite3.Connection) -> None:
             expires_at TEXT NOT NULL,
             UNIQUE(kind, entity_id)
         );
-        INSERT INTO recycle_item SELECT * FROM recycle_item_old;
+        INSERT INTO recycle_item (id, user_id, kind, entity_id, project_id, folder_id, related_json, deleted_at, expires_at)
+            SELECT id, user_id, kind, entity_id, project_id, folder_id, related_json, deleted_at, expires_at
+            FROM recycle_item_old WHERE kind != 'note';
         DROP TABLE recycle_item_old;
         CREATE INDEX IF NOT EXISTS idx_recycle_item_user_expiry
             ON recycle_item(user_id, expires_at);
@@ -1468,6 +1633,28 @@ class Handler(BaseHTTPRequestHandler):
                     ).fetchall()]
                     d["notes"].append(nd)
                 json_response(self, {"paper": d})
+
+            elif path == "/api/images":
+                uid = require_user(self)
+                if not uid:
+                    self._error(401, "未登录")
+                    return
+                raw = qs.get("ids") or []
+                ids = sorted({int(x.strip()) for part in raw for x in part.split(",") if x.strip()})
+                if not ids:
+                    json_response(self, {"images": []})
+                    return
+                conn = get_db()
+                ph = ",".join("?" for _ in ids)
+                rows = conn.execute(
+                    f"""SELECT i.id, i.rel_path FROM image i
+                        JOIN note n ON n.id = i.note_id
+                        JOIN paper pa ON pa.id = n.paper_id JOIN folder f ON f.id = pa.folder_id
+                        JOIN project p ON p.id = f.project_id
+                        WHERE p.user_id = ? AND i.id IN ({ph})""",
+                    (uid, *ids),
+                ).fetchall()
+                json_response(self, {"images": [dict(r) for r in rows]})
             elif path == "/api/recycle":
                 uid = require_user(self)
                 if not uid:
@@ -1482,12 +1669,12 @@ class Handler(BaseHTTPRequestHandler):
                     return
                 conn = get_db()
                 now = _recycle_now()
-                # 清理过期历史版本（串行化写操作，避免并发 database is locked）
+                # 清理过期历史版本（删除事件过期则物理删对应思考）
                 with DB_LOCK:
-                    conn.execute("DELETE FROM note_version WHERE expires_at <= ?", (now.isoformat(timespec="seconds"),))
-                    conn.commit()
+                    purge_expired_note_versions()
                 rows = conn.execute(
-                    """SELECT nv.id, nv.note_id, nv.content, nv.image_ids_json, nv.created_at, nv.expires_at,
+                    """SELECT nv.id, nv.note_id, nv.event_type, nv.content, nv.image_ids_json,
+                              nv.created_at, nv.expires_at,
                               n.created_at note_created_at,
                               pa.id paper_id, pa.title_en paper_title_en, pa.title_zh paper_title_zh,
                               p.id project_id, p.name project_name,
@@ -1501,28 +1688,47 @@ class Handler(BaseHTTPRequestHandler):
                        ORDER BY nv.created_at DESC""",
                     (uid, now.isoformat(timespec="seconds")),
                 ).fetchall()
-                versions = []
+                # 组装成 项目 → 文件夹 → 论文 → 事件 的树
+                tree: dict[int, dict] = {}
                 for r in rows:
                     remain_seconds = max(0, int((_parse_iso_dt(r["expires_at"]) - now).total_seconds()))
                     remaining_days = max(1, (remain_seconds + 86399) // 86400) if remain_seconds else 0
-                    versions.append({
+                    event = {
                         "id": r["id"],
                         "note_id": r["note_id"],
+                        "event_type": r["event_type"] or "edit",
                         "content": r["content"],
                         "image_ids": json.loads(r["image_ids_json"] or "[]"),
                         "created_at": r["created_at"],
                         "expires_at": r["expires_at"],
                         "remaining_days": remaining_days,
                         "note_created_at": r["note_created_at"],
+                        "project_name": r["project_name"],
+                        "folder_path": _folder_path(conn, r["folder_id"]),
+                        "paper_title": r["paper_title_en"] or r["paper_title_zh"] or "（未命名论文）",
+                    }
+                    proj = tree.setdefault(r["project_id"], {"project_id": r["project_id"], "project_name": r["project_name"], "folders": {}})
+                    folder = proj["folders"].setdefault(r["folder_id"], {"folder_id": r["folder_id"], "folder_path": _folder_path(conn, r["folder_id"]), "papers": {}})
+                    paper = folder["papers"].setdefault(r["paper_id"], {
                         "paper_id": r["paper_id"],
                         "paper_title": r["paper_title_en"] or r["paper_title_zh"] or "（未命名论文）",
-                        "project_id": r["project_id"],
-                        "project_name": r["project_name"],
-                        "folder_id": r["folder_id"],
-                        "folder_path": _folder_path(conn, r["folder_id"]),
+                        "events": [],
                     })
+                    paper["events"].append(event)
+                # 转成有序列表
+                tree_list = []
+                for proj in tree.values():
+                    folder_list = []
+                    for folder in proj["folders"].values():
+                        paper_list = []
+                        for paper in folder["papers"].values():
+                            paper_list.append(paper)
+                        folder["papers"] = paper_list
+                        folder_list.append(folder)
+                    proj["folders"] = folder_list
+                    tree_list.append(proj)
                 conn.commit()
-                json_response(self, {"versions": versions, "retention_days": RECYCLE_RETENTION_DAYS})
+                json_response(self, {"tree": tree_list, "retention_days": RECYCLE_RETENTION_DAYS})
             else:
                 self._error(404, "Not Found")
         except Exception as e:
@@ -1753,8 +1959,15 @@ class Handler(BaseHTTPRequestHandler):
                     "INSERT INTO note (paper_id, content, created_at) VALUES (?,?,?)",
                     (paper_id, content, now_iso()),
                 )
+                new_note_id = cur.lastrowid
+                # 新增思考也记入历史版本（event_type=create）
+                expires = (_recycle_now() + timedelta(days=RECYCLE_RETENTION_DAYS)).isoformat(timespec="seconds")
+                conn.execute(
+                    "INSERT INTO note_version (note_id, event_type, content, image_ids_json, created_at, expires_at) VALUES (?, 'create', ?, '[]', ?, ?)",
+                    (new_note_id, content, now_iso(), expires),
+                )
                 conn.commit()
-                json_response(self, {"ok": True, "id": cur.lastrowid})
+                json_response(self, {"ok": True, "id": new_note_id})
             elif path == "/api/notes/images":
                 uid = require_user(self)
                 if not uid:
@@ -1812,12 +2025,33 @@ class Handler(BaseHTTPRequestHandler):
                             current_image_ids.append(iid)
                 expires = (_recycle_now() + timedelta(days=RECYCLE_RETENTION_DAYS)).isoformat(timespec="seconds")
                 conn.execute(
-                    "INSERT INTO note_version (note_id, content, image_ids_json, created_at, expires_at) VALUES (?,?,?,?,?)",
+                    "INSERT INTO note_version (note_id, event_type, content, image_ids_json, created_at, expires_at) VALUES (?, 'edit', ?, ?, ?, ?)",
                     (note_id, note["content"], json.dumps(current_image_ids), now_iso(), expires),
                 )
                 conn.execute("UPDATE note SET content = ? WHERE id = ?", (version["content"], note_id))
                 conn.commit()
                 json_response(self, {"ok": True})
+            elif path == "/api/note_versions/restore":
+                uid = require_user(self)
+                if not uid:
+                    self._error(401, "未登录")
+                    return
+                body = _read_json_body(self)
+                note_id = int(body.get("note_id"))
+                # 注意：do_POST 已经持有 DB_LOCK，这里不要再重复加锁（threading.Lock 不可重入）
+                ok = restore_note_from_history(note_id, uid)
+                json_response(self, {"ok": bool(ok)})
+                return
+            elif path == "/api/note_versions/purge":
+                uid = require_user(self)
+                if not uid:
+                    self._error(401, "未登录")
+                    return
+                body = _read_json_body(self)
+                ids = body.get("ids") or []
+                removed = purge_note_versions(uid, ids)
+                json_response(self, {"ok": True, "removed": removed})
+                return
             elif path == "/api/open":
                 uid = require_user(self)
                 if not uid:
@@ -1903,7 +2137,7 @@ class Handler(BaseHTTPRequestHandler):
                             current_image_ids.append(iid)
                 expires = (_recycle_now() + timedelta(days=RECYCLE_RETENTION_DAYS)).isoformat(timespec="seconds")
                 conn.execute(
-                    "INSERT INTO note_version (note_id, content, image_ids_json, created_at, expires_at) VALUES (?,?,?,?,?)",
+                    "INSERT INTO note_version (note_id, event_type, content, image_ids_json, created_at, expires_at) VALUES (?, 'edit', ?, ?, ?, ?)",
                     (nid, note["content"], json.dumps(current_image_ids), now_iso(), expires),
                 )
 
@@ -2005,8 +2239,8 @@ class Handler(BaseHTTPRequestHandler):
                 if not ids:
                     self._error(400, "缺少 id")
                     return
-                added = move_to_recycle(uid, "note", ids)
-                json_response(self, {"ok": True, "deleted": added, "message": f"已删除 {added} 条思考（可在回收站恢复）"})
+                deleted_count = delete_notes_to_history(uid, ids)
+                json_response(self, {"ok": True, "deleted": deleted_count, "message": f"已删除 {deleted_count} 条思考（可在历史版本中恢复）"})
                 return
             if path == "/api/notes/images":
                 iid = int((qs.get("id") or [None])[0])
@@ -2040,6 +2274,7 @@ def main():
     init_db()
     migrate_legacy_deleted_index()
     purge_expired_recycle_items()
+    purge_expired_note_versions()
     server = ThreadingHTTPServer((args.host, args.port), Handler)
     print(f"Private Library running at http://127.0.0.1:{args.port} (host={args.host})")
     print(f"DB: {DB_PATH}")
