@@ -134,6 +134,7 @@ const state = {
   selectionAnchor: { paper: null, project: null, folder: null, recycle: null }, // Shift 范围选择的起点
   currentView: "projects",
   deletedCount: { projects: 0, folders: 0, papers: 0 },
+  composeDrafts: new Map(), // paperId -> { html, images } 未保存的思考草稿
 };
 
 /* ============ 进入应用 ============ */
@@ -963,6 +964,13 @@ function renderPaperDrawer(p) {
   // 思考编辑区：图文混排（暂存图片，点保存才提交）
   state.composeImages = [];
   const editor = $("#note-editor");
+
+  // 恢复同一篇论文未保存的草稿
+  const draft = state.composeDrafts.get(p.id);
+  if (draft) {
+    editor.innerHTML = draft.html;
+    state.composeImages = draft.images.slice();
+  }
   editor.addEventListener("paste", (e) => {
     const items = e.clipboardData && e.clipboardData.items;
     if (!items) return;
@@ -1113,6 +1121,7 @@ async function addNote(paperId, editor) {
     }
     toast("已保存思考");
     state.composeImages = [];
+    state.composeDrafts.delete(paperId);
     await refreshPaper(paperId);
   } catch (e) { toast(e.message, true); }
 }
@@ -1182,6 +1191,21 @@ function openDrawer() {
   });
 }
 function closeDrawer() {
+  // 关闭前暂存未保存的思考草稿，避免误点外部导致内容丢失
+  const editor = $("#note-editor");
+  if (editor && state._currentPaper) {
+    const html = editor.innerHTML.trim();
+    const hasContent = html && html !== "<br>" && html !== "<div><br></div>";
+    if (hasContent || state.composeImages.length) {
+      state.composeDrafts.set(state._currentPaper.id, {
+        html: editor.innerHTML,
+        images: state.composeImages.slice(),
+      });
+    } else {
+      state.composeDrafts.delete(state._currentPaper.id);
+    }
+  }
+
   $("#drawer-backdrop").classList.remove("is-open");
   $("#detail-drawer").classList.remove("is-open");
   $("#detail-drawer").setAttribute("aria-hidden", "true");
