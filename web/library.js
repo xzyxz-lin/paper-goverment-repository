@@ -904,12 +904,18 @@ function renderPaperDrawer(p) {
     metaRows += `<tr><th>本地路径</th><td class="path-cell">${esc(p.local_path)}</td></tr>`;
   }
 
+  const editBtnHtml = `<button class="scan-button scan-button--sm" id="edit-paper-btn" type="button" style="min-height:30px;padding:0 12px;font-size:.74rem;"><svg style="width:13px;height:13px;"><use href="#i-edit"/></svg>编辑论文</button>`;
+
   const openBtns = p.local_path ? `
     <div class="open-actions">
       <a class="article-open" id="open-pdf-btn" href="#"><svg><use href="#i-doc"/></svg><span>打开 PDF</span></a>
       <a class="article-open article-open--ghost" id="reveal-file-btn" href="#"><svg><use href="#i-folder-open"/></svg><span>打开所在文件夹</span></a>
+      ${editBtnHtml}
     </div>` : `
-    <p style="color:var(--ink-700);font-size:.76rem;margin:6px 0 0;">未设置本地路径。可在「编辑」中填写本地 PDF 的完整路径。</p>`;
+    <div class="open-actions">
+      ${editBtnHtml}
+      <p style="color:var(--ink-700);font-size:.76rem;margin:0;align-self:center;">未设置本地路径。可在「编辑」中填写本地 PDF 的完整路径。</p>
+    </div>`;
 
   $("#drawer-body").innerHTML = `
     <div class="drawer-stats">
@@ -921,10 +927,7 @@ function renderPaperDrawer(p) {
     <table class="meta-table">${metaRows}</table>
     ${openBtns}
 
-    <div class="drawer-section-title">
-      <span>我的思考</span>
-      <button class="scan-button scan-button--sm" id="edit-paper-btn" type="button" style="min-height:30px;padding:0 12px;font-size:.74rem;"><svg style="width:13px;height:13px;"><use href="#i-edit"/></svg>编辑论文</button>
-    </div>
+    <div class="drawer-section-title"><span>我的思考</span></div>
 
     <div class="note-bulk-bar" id="note-bulk-bar" ${state.selNotes.size ? "" : "hidden"}>
       <span id="note-bulk-count">已选中 ${state.selNotes.size} 条思考</span>
@@ -1412,7 +1415,8 @@ function openPaperModal(existing) {
         await req("PUT", "/api/papers", { id: existing.id, ...payload });
         toast("已保存修改");
         closeModal();
-        await refreshPaper(existing.id);
+        await openPaperDrawer(existing.id);
+        await loadPapers();
       } else {
         const fid = targetFolderId();
         if (!fid) {
