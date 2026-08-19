@@ -1591,7 +1591,24 @@ function renderPaperView(p) {
     });
   });
 
+  layoutViewImages(list);
+
   $("#pv-back-btn").onclick = closePaperView;
+}
+
+function layoutViewImages(root) {
+  if (!root) return;
+  root.querySelectorAll(".pv-block--media img").forEach(img => {
+    const classify = () => {
+      const ratio = img.naturalWidth / (img.naturalHeight || 1);
+      const block = img.closest(".pv-block--media");
+      if (!block) return;
+      block.classList.toggle("is-wide", ratio >= 1);
+      block.classList.toggle("is-tall", ratio < 1);
+    };
+    if (img.complete && img.naturalHeight) classify();
+    else img.addEventListener("load", classify, { once: true });
+  });
 }
 
 async function deleteViewNote(note, paperId) {

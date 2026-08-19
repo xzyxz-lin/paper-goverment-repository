@@ -1339,6 +1339,7 @@ body.view-paper-view header.topbar > .topbar-actions { display: none !important;
   cursor: zoom-in;
   transition: box-shadow .16s ease;
 }
+.pv-block--media.is-wide { grid-column: 1 / -1; }
 .pv-block--media img:hover { box-shadow: 0 8px 28px rgba(20,28,29,.1); }
 .pv-block:empty { display: none; }
 .pv-empty {
