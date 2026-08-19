@@ -1255,16 +1255,48 @@ function renderPaperView(p) {
     list.innerHTML = notes.map((n, idx) => renderViewNoteCard(n, idx + 1)).join("");
   }
 
+  // 绑定每条思考的全屏按钮
+  $$(".pv-card__action[data-action='fullscreen']").forEach(btn => {
+    btn.onclick = () => {
+      const nid = parseInt(btn.closest(".pv-card").dataset.noteId);
+      const note = (state._viewPaper?.notes || []).find(n => n.id === nid);
+      if (note) openNoteFullscreen(note);
+    };
+  });
+
   $("#pv-back-btn").onclick = closePaperView;
+}
+
+function openNoteFullscreen(n) {
+  const overlay = $("#note-fullscreen");
+  const content = $("#note-fullscreen-content");
+  content.innerHTML = `
+    <div class="pv-card__head" style="border-color:rgba(255,255,255,.12);">
+      <span class="pv-card__time" style="color:rgba(255,255,255,.7);">${esc((n.created_at || "").replace("T", " ").slice(0, 16))}</span>
+      <span class="pv-card__index" style="color:rgba(255,255,255,.55);">#${esc(String(state._viewPaper?.notes?.indexOf(n) + 1 || ""))}</span>
+    </div>
+    <div class="note-fullscreen__body">${renderViewNoteBlocks(n)}</div>`;
+  overlay.hidden = false;
+  document.body.style.overflow = "hidden";
+  $("#note-fullscreen-close").onclick = closeNoteFullscreen;
+}
+
+function closeNoteFullscreen() {
+  $("#note-fullscreen").hidden = true;
+  $("#note-fullscreen-content").innerHTML = "";
+  document.body.style.overflow = "";
 }
 
 function renderViewNoteCard(n, idx) {
   const time = esc((n.created_at || "").replace("T", " ").slice(0, 16));
   return `
-    <article class="pv-card">
+    <article class="pv-card" data-note-id="${n.id}">
       <div class="pv-card__head">
         <span class="pv-card__time">${time}</span>
-        <span class="pv-card__index">#${idx}</span>
+        <div class="pv-card__actions">
+          <button class="pv-card__action" data-action="fullscreen" type="button" title="全屏查看"><svg><use href="#i-image"/></svg><span>全屏</span></button>
+          <span class="pv-card__index">#${idx}</span>
+        </div>
       </div>
       <div class="pv-card__body">
         ${renderViewNoteBlocks(n)}

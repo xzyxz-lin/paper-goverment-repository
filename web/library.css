@@ -1187,8 +1187,52 @@ body.view-paper-view header.topbar > .topbar-actions { display: none !important;
 .pv-empty h4 { margin: 10px 0 0; font: 540 1.25rem var(--font-display); }
 .pv-empty p { margin: 0; color: var(--ink-700); font-size: .84rem; }
 
+.pv-card__actions { display: flex; align-items: center; gap: 12px; }
+.pv-card__action {
+  display: inline-flex; align-items: center; gap: 5px;
+  padding: 5px 10px; color: var(--oxide-700); background: rgba(31,91,87,.08);
+  border: 1px solid rgba(31,91,87,.22); border-radius: 3px;
+  font: 600 .7rem var(--font-data); cursor: pointer; transition: background .15s ease;
+}
+.pv-card__action:hover { background: rgba(31,91,87,.16); }
+.pv-card__action svg { width: 13px; height: 13px; }
+
+/* 单条思考全屏查看 */
+.note-fullscreen {
+  position: fixed; inset: 0; z-index: 120;
+  background: rgba(14,23,24,.97);
+  overflow-y: auto; overflow-x: hidden;
+}
+.note-fullscreen__close {
+  position: fixed; top: 18px; right: 22px; z-index: 121;
+  display: inline-flex; align-items: center; gap: 6px;
+  padding: 8px 14px; color: var(--white); background: rgba(255,255,255,.12);
+  border: 1px solid rgba(255,255,255,.2); border-radius: 3px;
+  font: 600 .78rem var(--font-data); cursor: pointer; backdrop-filter: blur(4px);
+}
+.note-fullscreen__close:hover { background: rgba(255,255,255,.2); }
+.note-fullscreen__close svg { width: 15px; height: 15px; }
+.note-fullscreen__content {
+  max-width: 1100px; margin: 0 auto; padding: 72px 28px 48px;
+}
+.note-fullscreen__body {
+  display: flex; flex-direction: column; gap: 28px;
+}
+.note-fullscreen__body .pv-block { width: 100%; max-width: 100%; }
+.note-fullscreen__body .pv-block--media img {
+  max-width: 100%; max-height: 86vh; width: auto; height: auto;
+  margin: 0 auto; cursor: default;
+}
+.note-fullscreen__body .pv-block--text {
+  color: var(--white); background: rgba(255,255,255,.06);
+  border-color: rgba(255,255,255,.12);
+}
+.note-fullscreen__body .pv-block__label { background: var(--oxide-500); }
+.note-fullscreen__body .pv-block--text .pv-block__label { background: var(--ink-500); }
+
 @media (max-width: 900px) {
   .pv-hero { flex-direction: column; }
   .pv-card__body { grid-template-columns: 1fr; gap: 20px; }
   .pv-card__head { margin-bottom: 14px; }
+  .note-fullscreen__body .pv-block--media img { max-height: 72vh; }
 }
