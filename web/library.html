@@ -220,6 +220,14 @@
           </div>
         </div>
         <div class="pv-stats" id="pv-stats"></div>
+        <div class="pv-bulk-bar" id="pv-bulk-bar" hidden>
+          <span id="pv-bulk-count">已选中 0 条思考</span>
+          <div>
+            <button class="scan-button scan-button--ghost" id="pv-bulk-sel-all" type="button"><svg><use href="#i-plus"/></svg><span>全选</span></button>
+            <button class="scan-button scan-button--ghost" id="pv-bulk-del" type="button"><svg><use href="#i-trash"/></svg><span>删除选中</span></button>
+            <button class="note-bulk-clear" id="pv-bulk-clear" type="button">取消选择</button>
+          </div>
+        </div>
         <div class="pv-list" id="pv-list"></div>
       </section>
     </main>
@@ -238,6 +246,7 @@
   <!-- 批量操作工具条（仿照论文观察台，多选后出现） -->
   <div id="bulk-delete-bar" class="bulk-delete-bar" hidden>
     <span id="bulk-delete-count" class="bdb-count"></span>
+    <button type="button" id="bulk-continuous-selection" class="bdb-btn">连续选择</button>
     <button type="button" id="bulk-delete-btn" class="bdb-btn bdb-danger">删除选中</button>
     <button type="button" id="bulk-clear-sel" class="bdb-btn">取消选择</button>
   </div>

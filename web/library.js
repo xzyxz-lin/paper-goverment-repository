@@ -134,7 +134,9 @@ const state = {
   selFolders: new Set(),   // 文件夹 id
   selRecycle: new Set(),   // 回收记录 id
   selNotes: new Set(),     // 当前论文的思考 id（抽屉内批量删除）
+  selViewNotes: new Set(), // VIEW 全屏页的思考 id 多选删除
   selectionAnchor: { paper: null, project: null, folder: null, recycle: null }, // Shift 范围选择的起点
+  continuousSelection: false, // 连续选择模式：普通点击直接多选，不必按 Ctrl/Cmd
   currentView: "projects",
   deletedCount: { projects: 0, folders: 0, papers: 0 },
   composeDrafts: new Map(), // paperId -> { html, images } 未保存的思考草稿
@@ -306,9 +308,19 @@ function updateSelectionUI() {
   const bar = $("#bulk-delete-bar");
   if (!bar) return;
   const total = isAnySelected();
-  if (total > 0) {
+  const continuousBtn = $("#bulk-continuous-selection");
+  const deleteBtn = $("#bulk-delete-btn");
+  if (total > 0 || state.continuousSelection) {
     bar.hidden = false;
-    $("#bulk-delete-count").textContent = `已选中 ${total} 项`;
+    $("#bulk-delete-count").textContent = state.continuousSelection
+      ? `已选中 ${total} 项 · 连续选择已开启`
+      : `已选中 ${total} 项`;
+    if (continuousBtn) {
+      continuousBtn.classList.toggle("is-active", state.continuousSelection);
+      continuousBtn.setAttribute("aria-pressed", String(state.continuousSelection));
+      continuousBtn.textContent = state.continuousSelection ? "连续选择：开" : "连续选择";
+    }
+    if (deleteBtn) deleteBtn.disabled = total === 0;
   } else {
     bar.hidden = true;
   }
@@ -347,7 +359,7 @@ function rangeSelectInContainer(container, anchorEl, kind) {
   }
 }
 
-// 通用点击处理：单击行为取决于是否按住 Ctrl/Shift
+// 通用点击处理：单击行为取决于是否按住 Ctrl/Shift/连续选择模式
 function handleSelectableClick(el, kind, openFn, e) {
   const id = parseInt(el.dataset[kind === "paper" ? "pid" : (kind === "project" ? "project" : "fid")]);
   if (!id) return;
@@ -360,6 +372,13 @@ function handleSelectableClick(el, kind, openFn, e) {
   }
   if (e.shiftKey) {
     rangeSelectInContainer(el.parentElement, el, kind);
+    updateSelectionUI();
+    return;
+  }
+  // 连续选择模式：普通点击直接切换选择，不打开
+  if (state.continuousSelection) {
+    if (set.has(id)) set.delete(id); else set.add(id);
+    state.selectionAnchor[kind] = id;
     updateSelectionUI();
     return;
   }
@@ -1229,7 +1248,12 @@ function renderPaperDrawer(p) {
   $("#compose-view-btn").onclick = () => { closeDrawer(); openPaperView(p.id); };
   $("#add-note-btn").onclick = () => addNote(p.id, editor);
 
-  // 已有笔记的删除
+  // 已有笔记的编辑 / 删除
+  $$("#notes-list .note-card__edit").forEach(btn => btn.addEventListener("click", () => {
+    const nid = parseInt(btn.dataset.note);
+    const note = (p.notes || []).find(n => n.id === nid);
+    if (note) openNoteEditor(note);
+  }));
   $$("#notes-list .note-card__del").forEach(btn => btn.addEventListener("click", () => deleteNote(parseInt(btn.dataset.note), p.id)));
 
   // 思考多选删除
@@ -1262,7 +1286,10 @@ function renderNoteCard(n) {
           <input type="checkbox" data-note="${n.id}" ${checked}>
           <span>${esc((n.created_at || "").replace("T", " ").slice(0, 16))}</span>
         </label>
-        <button class="note-card__del" data-note="${n.id}" type="button"><svg style="width:12px;height:12px;"><use href="#i-trash"/></svg>删除</button>
+        <div class="note-card__actions">
+          <button class="note-card__edit" data-note="${n.id}" type="button"><svg style="width:12px;height:12px;"><use href="#i-edit"/></svg>编辑</button>
+          <button class="note-card__del" data-note="${n.id}" type="button"><svg style="width:12px;height:12px;"><use href="#i-trash"/></svg>删除</button>
+        </div>
       </div>
       <div class="note-body">${renderNoteContent(n)}</div>
     </div>`;
@@ -1462,6 +1489,7 @@ async function openPaperView(pid) {
   const paper = data.paper;
   state._viewPaper = paper;
   state._viewPaperReturnTo = state.currentView || "project";
+  state.selViewNotes.clear();
   renderPaperView(paper);
   showView("paper-view");
 }
@@ -1471,6 +1499,7 @@ function closePaperView() {
   const back = state._viewPaperReturnTo || "project";
   state._viewPaper = null;
   state._viewPaperReturnTo = null;
+  state.selViewNotes.clear();
   // 退出观察后回到该论文的抽屉状态，而不是退回到无选中的初始界面
   if (paper && paper.id) {
     showView(back);
@@ -1486,7 +1515,7 @@ function renderPaperView(p) {
 
   $("#paper-view-subtitle").textContent = notes.length
     ? `共 ${notes.length} 条思考，${imgCount} 张截图。滚动查看完整回顾。`
-    : "这篇论文还没有思考记录。在抽屉里点击「新增思考」写下第一条。";
+    : "这篇论文还没有思考记录。点击「新增思考」写下第一条。";
 
   $("#pv-stats").innerHTML = `
     <div><span>思考标注</span><strong>${notes.length}</strong></div>
@@ -1499,13 +1528,44 @@ function renderPaperView(p) {
       <div class="pv-empty">
         <svg><use href="#i-image"/></svg>
         <h4>还没有思考</h4>
-        <p>回到论文抽屉，在「新增思考」里写文字、贴截图，保存后就会出现在这里。</p>
+        <p>点击上方「新增思考」写下第一条，或回到抽屉添加。</p>
       </div>`;
   } else {
     list.innerHTML = notes.map((n, idx) => renderViewNoteCard(n, idx + 1)).join("");
   }
 
-  // 绑定每条思考的编辑 / 全屏按钮
+  // VIEW 页批量操作条
+  const bulkBar = $("#pv-bulk-bar");
+  const bulkCount = $("#pv-bulk-count");
+  if (bulkBar) {
+    bulkBar.hidden = state.selViewNotes.size === 0;
+    if (bulkCount) bulkCount.textContent = `已选中 ${state.selViewNotes.size} 条思考`;
+  }
+  const bulkSelAll = $("#pv-bulk-sel-all");
+  if (bulkSelAll) {
+    bulkSelAll.innerHTML = `<svg><use href="#i-plus"/></svg><span>${notes.length && state.selViewNotes.size === notes.length ? "取消全选" : "全选"}</span>`;
+    bulkSelAll.onclick = () => {
+      if (state.selViewNotes.size === notes.length) state.selViewNotes.clear();
+      else notes.forEach(n => state.selViewNotes.add(n.id));
+      renderPaperView(p);
+    };
+  }
+  const bulkDel = $("#pv-bulk-del");
+  if (bulkDel) bulkDel.onclick = () => deleteSelectedViewNotes(p.id);
+  const bulkClear = $("#pv-bulk-clear");
+  if (bulkClear) bulkClear.onclick = () => { state.selViewNotes.clear(); renderPaperView(p); };
+
+  // 绑定每条思考的 新增 / 删除 / 编辑 / 全屏 按钮
+  $$(".pv-card__action[data-action='add']").forEach(btn => {
+    btn.onclick = () => openAddNoteModal(p.id);
+  });
+  $$(".pv-card__action[data-action='delete']").forEach(btn => {
+    btn.onclick = () => {
+      const nid = parseInt(btn.closest(".pv-card").dataset.noteId);
+      const note = (state._viewPaper?.notes || []).find(n => n.id === nid);
+      if (note) deleteViewNote(note, p.id);
+    };
+  });
   $$(".pv-card__action[data-action='edit']").forEach(btn => {
     btn.onclick = () => {
       const nid = parseInt(btn.closest(".pv-card").dataset.noteId);
@@ -1521,7 +1581,135 @@ function renderPaperView(p) {
     };
   });
 
+  // 多选复选框
+  $$(".pv-card__check input").forEach(cb => {
+    cb.addEventListener("change", (e) => {
+      const nid = parseInt(cb.dataset.note);
+      if (e.target.checked) state.selViewNotes.add(nid);
+      else state.selViewNotes.delete(nid);
+      renderPaperView(p);
+    });
+  });
+
   $("#pv-back-btn").onclick = closePaperView;
+}
+
+async function deleteViewNote(note, paperId) {
+  if (!confirm("删除这条思考？删除后可在历史版本中保留 7 天。")) return;
+  await req("DELETE", "/api/notes?id=" + note.id);
+  toast("已删除");
+  await openPaperView(paperId);
+}
+
+async function deleteSelectedViewNotes(paperId) {
+  const ids = Array.from(state.selViewNotes);
+  if (!ids.length) return;
+  if (!confirm(`确定删除选中的 ${ids.length} 条思考？删除后可在历史版本中保留 7 天。`)) return;
+  await req("DELETE", "/api/notes?ids=" + ids.join(","));
+  state.selViewNotes.clear();
+  toast(`已删除 ${ids.length} 条思考`);
+  await openPaperView(paperId);
+}
+
+function openAddNoteModal(paperId) {
+  state.addNoteImages = [];
+  openModal(`
+    <button class="icon-button" id="m-close" type="button" aria-label="关闭"><svg><use href="#i-close"/></svg></button>
+    <p class="eyebrow">NEW NOTE</p>
+    <h3>新增思考</h3>
+    <div class="note-editor" id="m-add-note-editor" contenteditable="true" data-placeholder="写文字、Ctrl+V 贴图，点「保存思考」新增一条。"></div>
+    <p class="field-help">新增的思考会排在这篇论文的最后。</p>
+    <div style="display:flex; gap:10px; justify-content:flex-end; margin-top:16px;">
+      <button class="scan-button scan-button--ghost" id="m-note-cancel" type="button">取消</button>
+      <button class="scan-button" id="m-note-save" type="button">保存思考</button>
+    </div>`);
+
+  const editor = $("#m-add-note-editor");
+  editor.focus();
+
+  editor.addEventListener("paste", (e) => {
+    const items = e.clipboardData && e.clipboardData.items;
+    if (!items) return;
+    for (const it of items) {
+      if (it.type.startsWith("image/")) {
+        e.preventDefault();
+        const blob = it.getAsFile();
+        insertAddNoteImage(blob, editor);
+        return;
+      }
+    }
+  });
+
+  $("#m-close").onclick = closeModal;
+  $("#m-note-cancel").onclick = closeModal;
+  $("#m-note-save").onclick = async () => {
+    const { content, images } = serializeAddNoteEditor(editor);
+    const textOnly = content.replace(/\[\[img:\d+\]\]/g, "").trim();
+    if (!textOnly && images.length === 0) {
+      toast("先写点内容或加张图");
+      return;
+    }
+    try {
+      const nd = await req("POST", "/api/notes", { paper_id: paperId, content });
+      const nid = nd.id;
+      for (const img of images) {
+        await req("POST", "/api/notes/images", { note_id: nid, data: img.data, ext: img.ext });
+      }
+      toast("已新增思考");
+      closeModal();
+      await openPaperView(paperId);
+      if (state._currentPaper && state._currentPaper.id === paperId) await refreshPaper(paperId);
+    } catch (e) { toast(e.message, true); }
+  };
+}
+
+function serializeAddNoteEditor(editor) {
+  let content = "";
+  const images = [];
+  const idxMap = {};
+  const walk = (node) => {
+    node.childNodes.forEach(ch => {
+      if (ch.nodeType === 3) { content += ch.textContent; }
+      else if (ch.nodeName === "IMG") {
+        const oidx = parseInt(ch.dataset.idx);
+        if (!(oidx in idxMap) && state.addNoteImages[oidx]) {
+          idxMap[oidx] = images.length;
+          images.push(state.addNoteImages[oidx]);
+        }
+        if (oidx in idxMap) content += `[[img:${idxMap[oidx]}]]`;
+      }
+      else if (ch.nodeName === "BR") { content += "\n"; }
+      else if (ch.nodeName === "DIV" || ch.nodeName === "P") { walk(ch); content += "\n"; }
+      else { walk(ch); }
+    });
+  };
+  walk(editor);
+  return { content, images };
+}
+
+function insertAddNoteImage(blob, editor) {
+  blobToBase64(blob).then(b64 => {
+    const ext = blob.type.includes("png") ? "png" : "jpg";
+    const idx = state.addNoteImages.length;
+    state.addNoteImages.push({ data: b64, ext });
+    const img = document.createElement("img");
+    img.src = "data:image/" + ext + ";base64," + b64;
+    img.dataset.idx = idx;
+    img.className = "compose-img";
+    const sel = window.getSelection();
+    if (sel.rangeCount && editor.contains(sel.anchorNode)) {
+      const range = sel.getRangeAt(0);
+      range.deleteContents();
+      range.insertNode(img);
+      range.setStartAfter(img);
+      range.collapse(true);
+      sel.removeAllRanges();
+      sel.addRange(range);
+    } else {
+      editor.appendChild(img);
+    }
+    editor.focus();
+  });
 }
 
 function openNoteFullscreen(n) {
@@ -1546,11 +1734,17 @@ function closeNoteFullscreen() {
 
 function renderViewNoteCard(n, idx) {
   const time = esc((n.created_at || "").replace("T", " ").slice(0, 16));
+  const checked = state.selViewNotes.has(n.id) ? "checked" : "";
   return `
-    <article class="pv-card" data-note-id="${n.id}">
+    <article class="pv-card ${checked ? "is-selected" : ""}" data-note-id="${n.id}">
       <div class="pv-card__head">
-        <span class="pv-card__time">${time}</span>
+        <label class="pv-card__check">
+          <input type="checkbox" data-note="${n.id}" ${checked}>
+          <span class="pv-card__time">${time}</span>
+        </label>
         <div class="pv-card__actions">
+          <button class="pv-card__action" data-action="add" type="button" title="新增思考"><svg><use href="#i-plus"/></svg><span>新增</span></button>
+          <button class="pv-card__action pv-card__action--danger" data-action="delete" type="button" title="删除思考"><svg><use href="#i-trash"/></svg><span>删除</span></button>
           <button class="pv-card__action" data-action="edit" type="button" title="编辑思考"><svg><use href="#i-edit"/></svg><span>编辑</span></button>
           <button class="pv-card__action" data-action="fullscreen" type="button" title="全屏查看"><svg><use href="#i-image"/></svg><span>全屏</span></button>
           <span class="pv-card__index">#${idx}</span>
@@ -1969,7 +2163,15 @@ function bindGlobal() {
   $("#drawer-close").addEventListener("click", closeDrawer);
   // 批量删除工具条
   $("#bulk-delete-btn").addEventListener("click", doBulkDelete);
-  $("#bulk-clear-sel").addEventListener("click", clearSelection);
+  $("#bulk-clear-sel").addEventListener("click", () => {
+    state.continuousSelection = false;
+    clearSelection();
+  });
+  $("#bulk-continuous-selection").addEventListener("click", () => {
+    state.continuousSelection = !state.continuousSelection;
+    updateSelectionUI();
+    toast(state.continuousSelection ? "连续选择已开启：点击行直接多选" : "连续选择已关闭");
+  });
   // 回收站
   const recycleBtn = $("#recycle-btn");
   if (recycleBtn) recycleBtn.addEventListener("click", openRecycle);
