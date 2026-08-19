@@ -651,20 +651,21 @@ body.view-paper-view header.topbar > .topbar-actions { display: none !important;
 
 /* 思考标记：未想透待复查的大叹号 */
 .note-flag {
-  position: absolute; top: -10px; left: -10px; z-index: 2;
+  position: absolute; top: -14px; left: -14px; z-index: 2;
   display: inline-flex; align-items: center; justify-content: center;
-  width: 26px; height: 26px;
-  font: 800 1rem/1 var(--font-display); color: #fff;
+  width: 34px; height: 34px;
+  font: 800 1.35rem/1 var(--font-display); color: #fff;
   background: var(--danger-600);
-  border: 2px solid var(--paper-50);
+  border: 3px solid var(--paper-50);
   border-radius: 50%;
-  box-shadow: 0 3px 10px rgba(166,58,53,.35);
+  box-shadow: 0 4px 14px rgba(166,58,53,.38);
 }
-.pv-card .note-flag { top: -12px; left: -12px; }
+.pv-card .note-flag { top: -18px; left: -18px; width: 42px; height: 42px; font-size: 1.7rem; border-width: 4px; }
 .note-fullscreen__body .note-flag,
 .note-fullscreen__content .note-flag {
-  top: -14px; left: -14px; width: 30px; height: 30px;
-  box-shadow: 0 3px 12px rgba(0,0,0,.45);
+  top: -22px; left: -22px; width: 50px; height: 50px;
+  font-size: 2rem; border-width: 4px;
+  box-shadow: 0 4px 18px rgba(0,0,0,.5);
 }
 
 /* 思考批量删除工具条 */
