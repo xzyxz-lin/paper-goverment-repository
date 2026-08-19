@@ -700,6 +700,13 @@ def init_db() -> None:
             created_at TEXT NOT NULL
         );
         CREATE INDEX IF NOT EXISTS idx_note_version_note ON note_version(note_id, created_at);
+        CREATE TABLE IF NOT EXISTS session (
+            token TEXT PRIMARY KEY,
+            user_id INTEGER NOT NULL REFERENCES user(id) ON DELETE CASCADE,
+            created_at TEXT NOT NULL,
+            expires_at TEXT NOT NULL
+        );
+        CREATE INDEX IF NOT EXISTS idx_session_user ON session(user_id, expires_at);
         CREATE TABLE IF NOT EXISTS recycle_item (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             user_id INTEGER NOT NULL REFERENCES user(id) ON DELETE CASCADE,
@@ -778,23 +785,32 @@ def row_to_dict(row: sqlite3.Row | None) -> dict | None:
     return dict(row) if row is not None else None
 
 
-# ===== 会话 token（内存，重启需重新登录） =====
-SESSIONS: dict[str, int] = {}  # token -> user_id
-SESSIONS_LOCK = threading.Lock()
+# ===== 会话 token（持久化到 SQLite，重启不丢登录） =====
+SESSION_DURATION_DAYS = 30
 
 
 def create_session(user_id: int) -> str:
     token = secrets.token_hex(24)
-    with SESSIONS_LOCK:
-        SESSIONS[token] = user_id
+    now = now_iso()
+    expires = (datetime.utcnow() + timedelta(days=SESSION_DURATION_DAYS)).isoformat()
+    conn = get_db()
+    conn.execute(
+        "INSERT INTO session (token, user_id, created_at, expires_at) VALUES (?,?,?,?)",
+        (token, user_id, now, expires),
+    )
+    conn.commit()
     return token
 
 
 def session_user(token: str | None) -> int | None:
     if not token:
         return None
-    with SESSIONS_LOCK:
-        return SESSIONS.get(token)
+    conn = get_db()
+    row = conn.execute(
+        "SELECT user_id FROM session WHERE token = ? AND expires_at > ?",
+        (token, datetime.utcnow().isoformat()),
+    ).fetchone()
+    return row["user_id"] if row else None
 
 
 def require_user(handler: BaseHTTPRequestHandler) -> int | None:
@@ -1526,8 +1542,10 @@ class Handler(BaseHTTPRequestHandler):
             elif path == "/api/logout":
                 auth = self.headers.get("Authorization", "")
                 if auth.startswith("Bearer "):
-                    with SESSIONS_LOCK:
-                        SESSIONS.pop(auth[7:].strip(), None)
+                    token = auth[7:].strip()
+                    conn = get_db()
+                    conn.execute("DELETE FROM session WHERE token = ?", (token,))
+                    conn.commit()
                 json_response(self, {"ok": True})
             # ===== 批量软删除 + 恢复（仿照论文观察台 data/deleted.json）=====
             elif path == "/api/projects/delete":
