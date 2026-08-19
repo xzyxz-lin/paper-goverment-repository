@@ -130,6 +130,7 @@ const state = {
   selProjects: new Set(),  // 项目卡片 id
   selFolders: new Set(),   // 文件夹 id
   selRecycle: new Set(),   // 回收记录 id
+  selNotes: new Set(),     // 当前论文的思考 id（抽屉内批量删除）
   selectionAnchor: { paper: null, project: null, folder: null, recycle: null }, // Shift 范围选择的起点
   currentView: "projects",
   deletedCount: { projects: 0, folders: 0, papers: 0 },
@@ -217,6 +218,11 @@ function showView(view) {
     $("#page-title").textContent = p ? (p.title_en || p.title_zh || "论文思考") : "论文思考";
     $("#page-eyebrow").textContent = "PAPER / VIEW";
   }
+
+  // 在 VIEW 全屏浏览页隐藏 topbar 的「回收站」「新建项目」，避免干扰阅读
+  const hideTopActions = view === "paper-view";
+  $("#recycle-open-btn").hidden = hideTopActions;
+  $("#new-project-btn").hidden = hideTopActions;
 }
 
 /* ============ 项目总览 ============ */
@@ -848,6 +854,7 @@ function renderPapers() {
 
 /* ============ 论文详情抽屉 ============ */
 async function openPaperDrawer(pid) {
+  state.selNotes.clear(); // 打开新论文时清空思考多选
   const data = await req("GET", "/api/paper?id=" + pid);
   state._currentPaper = data.paper;
   renderPaperDrawer(data.paper);
@@ -899,6 +906,14 @@ function renderPaperDrawer(p) {
       <button class="scan-button scan-button--sm" id="edit-paper-btn" type="button" style="min-height:30px;padding:0 12px;font-size:.74rem;"><svg style="width:13px;height:13px;"><use href="#i-edit"/></svg>编辑论文</button>
     </div>
 
+    <div class="note-bulk-bar" id="note-bulk-bar" ${state.selNotes.size ? "" : "hidden"}>
+      <span id="note-bulk-count">已选中 ${state.selNotes.size} 条思考</span>
+      <div>
+        <button class="scan-button scan-button--ghost" id="note-bulk-del" type="button"><svg><use href="#i-trash"/></svg><span>删除选中</span></button>
+        <button class="note-bulk-clear" id="note-bulk-clear" type="button">取消选择</button>
+      </div>
+    </div>
+
     <div id="notes-list">
       ${notes.map(n => renderNoteCard(n)).join("")}
     </div>
@@ -908,7 +923,7 @@ function renderPaperDrawer(p) {
       <div class="note-editor" id="note-editor" contenteditable="true" data-placeholder="这篇文章带给我什么启发？可写文字、可 Ctrl+V 贴图（插在光标处）、图文穿插、换行缩进，写完点「保存思考」才算一条。"></div>
       <div class="note-compose__bar">
         <span class="note-compose__hint">支持：文字 + 多张截图 + 图间插话 + 换行缩进</span>
-        <button class="scan-button scan-button--ghost" id="compose-view-btn" type="button" style="min-height:38px;padding:0 12px;"><svg style="width:15px;height:15px;"><use href="#i-image"/></svg><span>VIEW</span></button>
+        <button class="scan-button scan-button--ghost" id="compose-view-btn" type="button" style="min-height:38px;padding:0 12px;"><svg style="width:15px;height:15px;"><use href="#i-image"/></svg><span>View</span></button>
         <button class="scan-button" id="add-note-btn" type="button"><svg><use href="#i-plus"/></svg><span>保存思考</span></button>
       </div>
     </div>`;
@@ -941,13 +956,31 @@ function renderPaperDrawer(p) {
 
   // 已有笔记的删除
   $$("#notes-list .note-card__del").forEach(btn => btn.addEventListener("click", () => deleteNote(parseInt(btn.dataset.note), p.id)));
+
+  // 思考多选删除
+  $$("#notes-list .note-card__check input").forEach(cb => {
+    cb.addEventListener("change", (e) => {
+      const nid = parseInt(cb.dataset.note);
+      if (e.target.checked) state.selNotes.add(nid);
+      else state.selNotes.delete(nid);
+      renderPaperDrawer(p);
+    });
+  });
+  const bulkDel = $("#note-bulk-del");
+  if (bulkDel) bulkDel.onclick = () => deleteSelectedNotes(p.id);
+  const bulkClear = $("#note-bulk-clear");
+  if (bulkClear) bulkClear.onclick = () => { state.selNotes.clear(); renderPaperDrawer(p); };
 }
 
 function renderNoteCard(n) {
+  const checked = state.selNotes.has(n.id) ? "checked" : "";
   return `
-    <div class="note-card">
+    <div class="note-card ${checked ? "is-selected" : ""}" data-note="${n.id}">
       <div class="note-card__head">
-        <span class="note-card__time">${esc((n.created_at || "").replace("T", " ").slice(0, 16))}</span>
+        <label class="note-card__check">
+          <input type="checkbox" data-note="${n.id}" ${checked}>
+          <span>${esc((n.created_at || "").replace("T", " ").slice(0, 16))}</span>
+        </label>
         <button class="note-card__del" data-note="${n.id}" type="button"><svg style="width:12px;height:12px;"><use href="#i-trash"/></svg>删除</button>
       </div>
       <div class="note-body">${renderNoteContent(n)}</div>
@@ -1068,6 +1101,18 @@ async function deleteNote(nid, paperId) {
   await refreshPaper(paperId);
 }
 
+async function deleteSelectedNotes(paperId) {
+  const ids = Array.from(state.selNotes);
+  if (!ids.length) return;
+  if (!confirm(`确定删除选中的 ${ids.length} 条思考？`)) return;
+  for (const nid of ids) {
+    await req("DELETE", "/api/notes?id=" + nid);
+  }
+  state.selNotes.clear();
+  toast(`已删除 ${ids.length} 条思考`);
+  await refreshPaper(paperId);
+}
+
 async function deleteImage(iid, paperId) {
   await req("DELETE", "/api/notes/images?id=" + iid);
   toast("已删除图片");
@@ -1164,8 +1209,6 @@ function renderPaperView(p) {
 }
 
 function renderViewNoteCard(n, idx) {
-  const images = n.images || [];
-  const text = (n.content || "").replace(/\[\[img:\d+\]\]/g, "").trim();
   const time = esc((n.created_at || "").replace("T", " ").slice(0, 16));
   return `
     <article class="pv-card">
@@ -1173,13 +1216,48 @@ function renderViewNoteCard(n, idx) {
         <span class="pv-card__time">${time}</span>
         <span class="pv-card__index">#${idx}</span>
       </div>
-      <div class="pv-card__media">
-        ${images.length
-          ? images.map(img => `<img src="/assets/${encodeURI(img.rel_path)}" alt="截图" loading="lazy">`).join("")
-          : `<div class="pv-empty" style="min-height:160px;padding:28px 20px;"><p style="margin:0;color:var(--ink-500);font-size:.8rem;">（这条思考没有截图）</p></div>`}
+      <div class="pv-card__body">
+        ${renderViewNoteBlocks(n)}
       </div>
-      <div class="pv-card__body">${text ? esc(text) : ""}</div>
     </article>`;
+}
+
+// 把一条思考按内容顺序拆成「文字块 / 图片块」，在 2 列网格里依次排列，
+// 保留原文中「先文字 → 再图片 → 再文字」的逻辑关系。
+function renderViewNoteBlocks(n) {
+  const content = n.content || "";
+  const images = n.images || [];
+  const re = /\[\[img:(\d+)\]\]/g;
+  let html = "";
+  let last = 0;
+  let m;
+  const used = new Set();
+
+  const pushText = (txt) => {
+    const t = txt.trim();
+    if (t) html += `<div class="pv-block pv-block--text">${esc(t)}</div>`;
+  };
+
+  while ((m = re.exec(content)) !== null) {
+    pushText(content.slice(last, m.index));
+    const idx = parseInt(m[1]);
+    const img = images[idx];
+    if (img) {
+      html += `<div class="pv-block pv-block--media"><img src="/assets/${encodeURI(img.rel_path)}" alt="截图" loading="lazy"></div>`;
+      used.add(idx);
+    }
+    last = m.index + m[0].length;
+  }
+  pushText(content.slice(last));
+
+  // 兼容旧数据：未被占位符引用的图片追加在最后
+  images.forEach((img, idx) => {
+    if (!used.has(idx)) {
+      html += `<div class="pv-block pv-block--media"><img src="/assets/${encodeURI(img.rel_path)}" alt="截图" loading="lazy"></div>`;
+    }
+  });
+
+  return html || `<div class="pv-block pv-block--text" style="color:var(--ink-500);">（空）</div>`;
 }
 
 /* ============ 弹窗 ============ */
