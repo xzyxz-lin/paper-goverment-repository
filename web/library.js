@@ -1712,18 +1712,35 @@ function insertAddNoteImage(blob, editor) {
   });
 }
 
+const FULLSCREEN_SCALE_CLASSES = ["is-small", "is-default", "is-large"];
+let fullscreenScaleIndex = 1;
+
+function applyFullscreenScale() {
+  const content = $("#note-fullscreen-content");
+  if (!content) return;
+  FULLSCREEN_SCALE_CLASSES.forEach((c, i) => content.classList.toggle(c, i === fullscreenScaleIndex));
+}
+
 function openNoteFullscreen(n) {
   const overlay = $("#note-fullscreen");
   const content = $("#note-fullscreen-content");
+  fullscreenScaleIndex = 1; // 默认标准大小
   content.innerHTML = `
     <div class="pv-card__head" style="border-color:rgba(255,255,255,.12);">
       <span class="pv-card__time" style="color:rgba(255,255,255,.7);">${esc((n.created_at || "").replace("T", " ").slice(0, 16))}</span>
       <span class="pv-card__index" style="color:rgba(255,255,255,.55);">#${esc(String(state._viewPaper?.notes?.indexOf(n) + 1 || ""))}</span>
     </div>
     <div class="note-fullscreen__body">${renderViewNoteBlocks(n)}</div>`;
+  applyFullscreenScale();
   overlay.hidden = false;
   document.body.style.overflow = "hidden";
   $("#note-fullscreen-close").onclick = closeNoteFullscreen;
+  $("#note-fullscreen-zoomin").onclick = () => {
+    if (fullscreenScaleIndex < FULLSCREEN_SCALE_CLASSES.length - 1) { fullscreenScaleIndex++; applyFullscreenScale(); }
+  };
+  $("#note-fullscreen-zoomout").onclick = () => {
+    if (fullscreenScaleIndex > 0) { fullscreenScaleIndex--; applyFullscreenScale(); }
+  };
 }
 
 function closeNoteFullscreen() {
