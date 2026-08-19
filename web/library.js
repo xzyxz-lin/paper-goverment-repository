@@ -1255,7 +1255,14 @@ function renderPaperView(p) {
     list.innerHTML = notes.map((n, idx) => renderViewNoteCard(n, idx + 1)).join("");
   }
 
-  // 绑定每条思考的全屏按钮
+  // 绑定每条思考的编辑 / 全屏按钮
+  $$(".pv-card__action[data-action='edit']").forEach(btn => {
+    btn.onclick = () => {
+      const nid = parseInt(btn.closest(".pv-card").dataset.noteId);
+      const note = (state._viewPaper?.notes || []).find(n => n.id === nid);
+      if (note) openNoteEditor(note);
+    };
+  });
   $$(".pv-card__action[data-action='fullscreen']").forEach(btn => {
     btn.onclick = () => {
       const nid = parseInt(btn.closest(".pv-card").dataset.noteId);
@@ -1294,6 +1301,7 @@ function renderViewNoteCard(n, idx) {
       <div class="pv-card__head">
         <span class="pv-card__time">${time}</span>
         <div class="pv-card__actions">
+          <button class="pv-card__action" data-action="edit" type="button" title="编辑思考"><svg><use href="#i-edit"/></svg><span>编辑</span></button>
           <button class="pv-card__action" data-action="fullscreen" type="button" title="全屏查看"><svg><use href="#i-image"/></svg><span>全屏</span></button>
           <span class="pv-card__index">#${idx}</span>
         </div>
@@ -1340,6 +1348,134 @@ function renderViewNoteBlocks(n) {
   });
 
   return html || `<div class="pv-block pv-block--text" style="color:var(--ink-500);">（空）</div>`;
+}
+
+/* ============ 编辑已有思考 ============ */
+function renderNoteEditorContent(n) {
+  const content = n.content || "";
+  const images = n.images || [];
+  const re = /\[\[img:(\d+)\]\]/g;
+  let html = "";
+  let last = 0;
+  let m;
+  while ((m = re.exec(content)) !== null) {
+    html += esc(content.slice(last, m.index));
+    const idx = parseInt(m[1]);
+    const img = images[idx];
+    if (img) {
+      html += `<img src="/assets/${encodeURI(img.rel_path)}" data-existing-id="${img.id}" class="compose-img" alt="截图">`;
+    }
+    last = m.index + m[0].length;
+  }
+  html += esc(content.slice(last));
+  return html || "<div><br></div>";
+}
+
+function serializeNoteEditor(editor) {
+  let content = "";
+  const images = [];
+  const idxMap = {};
+  const existingIdMap = {};
+  const walk = (node) => {
+    node.childNodes.forEach(ch => {
+      if (ch.nodeType === 3) { content += ch.textContent; }
+      else if (ch.nodeName === "IMG") {
+        const existingId = ch.dataset.existingId;
+        if (existingId) {
+          if (!(existingId in existingIdMap)) {
+            existingIdMap[existingId] = Object.keys(existingIdMap).length;
+          }
+          content += `[[existing-img:${existingId}]]`;
+        } else {
+          const oidx = parseInt(ch.dataset.idx);
+          if (!(oidx in idxMap) && state.editImages[oidx]) {
+            idxMap[oidx] = images.length;
+            images.push(state.editImages[oidx]);
+          }
+          if (oidx in idxMap) content += `[[img:${idxMap[oidx]}]]`;
+        }
+      }
+      else if (ch.nodeName === "BR") { content += "\n"; }
+      else if (ch.nodeName === "DIV" || ch.nodeName === "P") { walk(ch); content += "\n"; }
+      else { walk(ch); }
+    });
+  };
+  walk(editor);
+  return { content, images };
+}
+
+function insertEditImage(blob, editor) {
+  blobToBase64(blob).then(b64 => {
+    const ext = blob.type.includes("png") ? "png" : "jpg";
+    const idx = state.editImages.length;
+    state.editImages.push({ data: b64, ext });
+    const img = document.createElement("img");
+    img.src = "data:image/" + ext + ";base64," + b64;
+    img.dataset.idx = idx;
+    img.className = "compose-img";
+    const sel = window.getSelection();
+    if (sel.rangeCount && editor.contains(sel.anchorNode)) {
+      const range = sel.getRangeAt(0);
+      range.deleteContents();
+      range.insertNode(img);
+      range.setStartAfter(img);
+      range.collapse(true);
+      sel.removeAllRanges();
+      sel.addRange(range);
+    } else {
+      editor.appendChild(img);
+    }
+    editor.focus();
+  });
+}
+
+function openNoteEditor(note) {
+  state.editImages = [];
+  openModal(`
+    <button class="icon-button" id="m-close" type="button" aria-label="关闭"><svg><use href="#i-close"/></svg></button>
+    <p class="eyebrow">EDIT NOTE</p>
+    <h3>编辑思考</h3>
+    <div class="note-editor" id="m-note-editor" contenteditable="true" data-placeholder="修改文字、删除截图、Ctrl+V 贴新图…">${renderNoteEditorContent(note)}</div>
+    <p class="field-help">支持修改文字、删除截图、粘贴新截图。</p>
+    <div style="display:flex; gap:10px; justify-content:flex-end; margin-top:16px;">
+      <button class="scan-button scan-button--ghost" id="m-note-cancel" type="button">取消</button>
+      <button class="scan-button" id="m-note-save" type="button">保存修改</button>
+    </div>`);
+
+  const editor = $("#m-note-editor");
+  editor.focus();
+
+  editor.addEventListener("paste", (e) => {
+    const items = e.clipboardData && e.clipboardData.items;
+    if (!items) return;
+    for (const it of items) {
+      if (it.type.startsWith("image/")) {
+        e.preventDefault();
+        const blob = it.getAsFile();
+        insertEditImage(blob, editor);
+        return;
+      }
+    }
+  });
+
+  $("#m-close").onclick = closeModal;
+  $("#m-note-cancel").onclick = closeModal;
+  $("#m-note-save").onclick = async () => {
+    const { content, images } = serializeNoteEditor(editor);
+    const hasExistingImages = /\[\[existing-img:\d+\]\]/.test(content);
+    const textOnly = content.replace(/\[\[(?:existing-img:\d+|img:\d+)\]\]/g, "").trim();
+    if (!textOnly && images.length === 0 && !hasExistingImages) {
+      toast("内容为空，未保存");
+      return;
+    }
+    try {
+      await req("PUT", "/api/notes", { id: note.id, content, images });
+      toast("已保存修改");
+      closeModal();
+      if (state._viewPaper) await openPaperView(state._viewPaper.id);
+      if (state._currentPaper && state._currentPaper.id === note.paper_id) await refreshPaper(note.paper_id);
+    } catch (e) { toast(e.message, true); }
+  };
 }
 
 /* ============ 弹窗 ============ */

@@ -781,6 +781,7 @@ body.view-paper-view header.topbar > .topbar-actions { display: none !important;
   object-fit: contain;
   background: var(--paper-100);
 }
+#m-note-editor { min-height: 220px; max-height: 52vh; background: white; }
 
 /* 已保存笔记的混排展示 */
 .note-body { margin-top: 2px; }

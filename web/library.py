@@ -692,6 +692,13 @@ def init_db() -> None:
             rel_path TEXT NOT NULL,
             created_at TEXT NOT NULL
         );
+        CREATE TABLE IF NOT EXISTS note_version (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            note_id INTEGER NOT NULL REFERENCES note(id) ON DELETE CASCADE,
+            content TEXT NOT NULL,
+            created_at TEXT NOT NULL
+        );
+        CREATE INDEX IF NOT EXISTS idx_note_version_note ON note_version(note_id, created_at);
         CREATE TABLE IF NOT EXISTS recycle_item (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             user_id INTEGER NOT NULL REFERENCES user(id) ON DELETE CASCADE,
@@ -1710,15 +1717,85 @@ class Handler(BaseHTTPRequestHandler):
                     return
                 body = _read_json_body(self)
                 nid = int(body.get("id"))
+                content = body.get("content", "")
+                new_images = body.get("images", [])
                 conn = get_db()
-                cur = conn.execute(
-                    """UPDATE note SET content=? WHERE id=? AND paper_id IN
-                       (SELECT pa.id FROM paper pa JOIN folder f ON f.id = pa.folder_id
-                        JOIN project p ON p.id = f.project_id WHERE p.user_id = ?)""",
-                    (body.get("content", ""), nid, uid),
+                note = conn.execute(
+                    """SELECT n.id, n.content, n.paper_id, f.project_id
+                       FROM note n
+                       JOIN paper pa ON pa.id = n.paper_id
+                       JOIN folder f ON f.id = pa.folder_id
+                       JOIN project p ON p.id = f.project_id
+                       WHERE n.id = ? AND p.user_id = ?""",
+                    (nid, uid),
+                ).fetchone()
+                if not note:
+                    self._error(404, "思考不存在")
+                    return
+
+                # 保存当前版本到历史
+                conn.execute(
+                    "INSERT INTO note_version (note_id, content, created_at) VALUES (?,?,?)",
+                    (nid, note["content"], now_iso()),
                 )
+
+                # 解析新内容中的图片占位符：保留的现有图 [[existing-img:ID]] 和新图 [[img:IDX]]
+                placeholder_re = re.compile(r"\[\[(?:existing-img:(\d+)|img:(\d+))\]\]")
+                kept_image_ids = []
+                for m in placeholder_re.finditer(content):
+                    if m.group(1):
+                        kept_image_ids.append(int(m.group(1)))
+
+                # 验证保留的图片确实属于本条思考
+                valid_ids = set()
+                if kept_image_ids:
+                    placeholders = ",".join("?" for _ in kept_image_ids)
+                    valid_rows = conn.execute(
+                        f"SELECT id FROM image WHERE note_id = ? AND id IN ({placeholders})",
+                        (nid, *kept_image_ids),
+                    ).fetchall()
+                    valid_ids = {r["id"] for r in valid_rows}
+
+                # 删除未被引用的现有图片（文件 + 记录）
+                all_image_ids = [r["id"] for r in conn.execute("SELECT id FROM image WHERE note_id = ?", (nid,)).fetchall()]
+                for iid in all_image_ids:
+                    if iid not in valid_ids:
+                        img = conn.execute("SELECT file_path FROM image WHERE id = ?", (iid,)).fetchone()
+                        if img:
+                            try:
+                                Path(img["file_path"]).unlink(missing_ok=True)
+                            except Exception:
+                                pass
+                        conn.execute("DELETE FROM image WHERE id = ?", (iid,))
+
+                # 按内容顺序重建图片列表，并生成最终 content
+                image_id_to_idx = {}
+                new_idx_map = {}
+                output = []
+                last = 0
+                for m in placeholder_re.finditer(content):
+                    output.append(content[last:m.start()])
+                    if m.group(1):
+                        iid = int(m.group(1))
+                        if iid in valid_ids:
+                            image_id_to_idx.setdefault(iid, len(image_id_to_idx))
+                            output.append(f"[[img:{image_id_to_idx[iid]}]]")
+                    else:
+                        idx = int(m.group(2))
+                        if idx not in new_idx_map:
+                            img_data = new_images[idx] if idx < len(new_images) else {}
+                            inserted = store_image(note["project_id"], note["paper_id"], nid, img_data.get("data", ""), img_data.get("ext", "png"))
+                            new_idx_map[idx] = inserted["id"]
+                        iid = new_idx_map[idx]
+                        image_id_to_idx.setdefault(iid, len(image_id_to_idx))
+                        output.append(f"[[img:{image_id_to_idx[iid]}]]")
+                    last = m.end()
+                output.append(content[last:])
+                final_content = "".join(output)
+
+                conn.execute("UPDATE note SET content = ? WHERE id = ?", (final_content, nid))
                 conn.commit()
-                json_response(self, {"ok": True, "updated": cur.rowcount})
+                json_response(self, {"ok": True})
             else:
                 self._error(404, "Not Found")
         except Exception as e:
