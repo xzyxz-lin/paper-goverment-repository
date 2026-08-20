@@ -1578,6 +1578,13 @@ function renderPaperView(p) {
       if (note) openNoteEditor(note);
     };
   });
+  $$(".pv-card__action[data-action='layout']").forEach(btn => {
+    btn.onclick = () => {
+      const nid = parseInt(btn.closest(".pv-card").dataset.noteId);
+      const note = (state._viewPaper?.notes || []).find(n => n.id === nid);
+      if (note) openNoteLayoutEditor(note);
+    };
+  });
   $$(".pv-card__action[data-action='fullscreen']").forEach(btn => {
     btn.onclick = () => {
       const nid = parseInt(btn.closest(".pv-card").dataset.noteId);
@@ -1608,8 +1615,12 @@ function layoutViewImages(root) {
       const ratio = img.naturalWidth / (img.naturalHeight || 1);
       const block = img.closest(".pv-block--media");
       if (!block) return;
-      block.classList.toggle("is-wide", ratio >= 1);
-      block.classList.toggle("is-tall", ratio < 1);
+      // 只有用户未手动指定列（data-auto）时才按宽高比自动调整
+      if (block.dataset.auto === "1") {
+        block.classList.toggle("pv-block--col-full", ratio >= 1);
+        block.classList.toggle("pv-block--col-2", ratio < 1);
+        block.classList.remove(ratio >= 1 ? "pv-block--col-2" : "pv-block--col-full");
+      }
     };
     if (img.complete && img.naturalHeight) classify();
     else img.addEventListener("load", classify, { once: true });
@@ -1787,6 +1798,7 @@ function renderViewNoteCard(n, idx) {
           <button class="pv-card__action" data-action="add" type="button" title="新增思考"><svg><use href="#i-plus"/></svg><span>新增</span></button>
           <button class="pv-card__action pv-card__action--danger" data-action="delete" type="button" title="删除思考"><svg><use href="#i-trash"/></svg><span>删除</span></button>
           <button class="pv-card__action" data-action="edit" type="button" title="编辑思考"><svg><use href="#i-edit"/></svg><span>编辑</span></button>
+          <button class="pv-card__action" data-action="layout" type="button" title="排版"><svg><use href="#i-layout"/></svg><span>排版</span></button>
           <button class="pv-card__action" data-action="fullscreen" type="button" title="全屏查看"><svg><use href="#i-image"/></svg><span>全屏</span></button>
           <span class="pv-card__index">#${idx}</span>
         </div>
@@ -1797,20 +1809,19 @@ function renderViewNoteCard(n, idx) {
     </article>`;
 }
 
-// 把一条思考按内容顺序拆成「文字块 / 图片块」，在 2 列网格里依次排列，
-// 保留原文中「先文字 → 再图片 → 再文字」的逻辑关系。
-function renderViewNoteBlocks(n) {
+// 从 content + images 生成 blocks 数组（text / image）
+function buildNoteBlocks(n) {
   const content = n.content || "";
   const images = n.images || [];
   const re = /\[\[img:(\d+)\]\]/g;
-  let html = "";
-  let last = 0;
-  let m;
+  const blocks = [];
+  let last = 0, m;
   const used = new Set();
+  let textIndex = 0;
 
   const pushText = (txt) => {
     const t = txt.trim();
-    if (t) html += `<div class="pv-block pv-block--text"><span class="pv-block__label">文字</span><div class="pv-block__content">${esc(t).replace(/\n/g, "<br>")}</div></div>`;
+    if (t) blocks.push({ type: "text", key: `text_${textIndex++}`, text: t, index: textIndex - 1 });
   };
 
   while ((m = re.exec(content)) !== null) {
@@ -1818,7 +1829,7 @@ function renderViewNoteBlocks(n) {
     const idx = parseInt(m[1]);
     const img = images[idx];
     if (img) {
-      html += `<div class="pv-block pv-block--media"><span class="pv-block__label">截图</span><img src="/assets/${encodeURI(img.rel_path)}" alt="截图" loading="lazy"></div>`;
+      blocks.push({ type: "image", key: `img_${img.id}`, image: img, image_id: img.id });
       used.add(idx);
     }
     last = m.index + m[0].length;
@@ -1827,12 +1838,149 @@ function renderViewNoteBlocks(n) {
 
   // 兼容旧数据：未被占位符引用的图片追加在最后
   images.forEach((img, idx) => {
-    if (!used.has(idx)) {
-      html += `<div class="pv-block pv-block--media"><span class="pv-block__label">截图</span><img src="/assets/${encodeURI(img.rel_path)}" alt="截图" loading="lazy"></div>`;
-    }
+    if (!used.has(idx)) blocks.push({ type: "image", key: `img_${img.id}`, image: img, image_id: img.id });
   });
 
-  return html || `<div class="pv-block pv-block--text" style="color:var(--ink-500);">（空）</div>`;
+  return blocks;
+}
+
+// 合并用户保存的 layout 与默认布局；未指定 col 的块保持 null（由渲染时自动决定）。
+function applyLayout(blocks, layout) {
+  const map = new Map((layout.blocks || []).map(b => [b.key, b]));
+  return blocks.map((b, i) => {
+    const saved = map.get(b.key);
+    return {
+      ...b,
+      col: saved && saved.col != null ? saved.col : null,
+      order: saved && saved.order != null ? saved.order : i,
+    };
+  }).sort((a, b) => a.order - b.order);
+}
+
+// 把一条思考按内容顺序拆成「文字块 / 图片块」，在 2 列网格里依次排列，
+// 保留原文中「先文字 → 再图片 → 再文字」的逻辑关系。
+// 如果用户保存过 layout，按 layout 中指定的列(1左/2右/full全宽)与顺序渲染。
+function renderViewNoteBlocks(n) {
+  const blocks = applyLayout(buildNoteBlocks(n), n.layout || {});
+  if (!blocks.length) return `<div class="pv-block pv-block--text" style="color:var(--ink-500);">（空）</div>`;
+
+  return blocks.map(b => {
+    const isAuto = b.col == null;
+    const col = b.type === "text" ? (b.col || 1) : (b.col || 2);
+    const colClass = col === 1 ? "pv-block--col-1" : (col === 2 ? "pv-block--col-2" : "pv-block--col-full");
+    const autoAttr = isAuto ? ' data-auto="1"' : "";
+    if (b.type === "text") {
+      return `<div class="pv-block pv-block--text ${colClass}" data-key="${b.key}"${autoAttr}><span class="pv-block__label">文字</span><div class="pv-block__content">${esc(b.text).replace(/\n/g, "<br>")}</div></div>`;
+    }
+    return `<div class="pv-block pv-block--media ${colClass}" data-key="${b.key}"${autoAttr}><span class="pv-block__label">截图</span><img src="/assets/${encodeURI(b.image.rel_path)}" alt="截图" loading="lazy"></div>`;
+  }).join("");
+}
+
+/* ============ 排版编辑器：拖拽块到左/右/全宽 ============ */
+function openNoteLayoutEditor(note) {
+  let blocks = applyLayout(buildNoteBlocks(note), note.layout || {});
+  const render = () => {
+    const byCol = (col) => blocks.filter(b => String(b.col) === String(col));
+    const colBlocks = (items) => items.map((b, idx) => {
+      const preview = b.type === "text"
+        ? `<div class="layout-block__text">${esc(b.text).replace(/\n/g, " ").slice(0, 120)}${b.text.length > 120 ? "…" : ""}</div>`
+        : `<img src="/assets/${encodeURI(b.image.rel_path)}" alt="截图">`;
+      return `<div class="layout-block ${b.type === "text" ? "layout-block--text" : "layout-block--image"}" draggable="true" data-key="${b.key}">${preview}</div>`;
+    }).join("");
+    openModal(`
+      <button class="icon-button" id="m-close" type="button" aria-label="关闭"><svg><use href="#i-close"/></svg></button>
+      <p class="eyebrow">LAYOUT</p>
+      <h3>拖拽排版</h3>
+      <p class="field-help">把文字或图片拖到左栏、右栏或全宽；同一栏内可上下拖动排序。保存后仅在 VIEW 页生效。</p>
+      <div class="layout-editor">
+        <div class="layout-dropzone" data-col="1">
+          <header>左栏</header>
+          <div class="layout-dropzone__items">${colBlocks(byCol(1))}</div>
+        </div>
+        <div class="layout-dropzone" data-col="2">
+          <header>右栏</header>
+          <div class="layout-dropzone__items">${colBlocks(byCol(2))}</div>
+        </div>
+        <div class="layout-dropzone" data-col="full">
+          <header>全宽</header>
+          <div class="layout-dropzone__items">${colBlocks(byCol("full"))}</div>
+        </div>
+      </div>
+      <div style="display:flex; gap:10px; justify-content:flex-end; margin-top:16px;">
+        <button class="scan-button scan-button--ghost" id="m-layout-reset" type="button">恢复默认</button>
+        <button class="scan-button scan-button--ghost" id="m-layout-cancel" type="button">取消</button>
+        <button class="scan-button" id="m-layout-save" type="button">保存排版</button>
+      </div>`);
+    bindLayoutDrag();
+    $("#m-close").onclick = closeModal;
+    $("#m-layout-cancel").onclick = closeModal;
+    $("#m-layout-reset").onclick = () => {
+      blocks = buildNoteBlocks(note).map((b, i) => ({ ...b, col: null, order: i }));
+      render();
+    };
+    $("#m-layout-save").onclick = async () => {
+      const layout = { blocks: blocks.map((b, i) => ({ key: b.key, col: b.col, order: i })) };
+      try {
+        await req("PUT", "/api/notes/layout", { id: note.id, layout });
+        toast("已保存排版");
+        note.layout = layout;
+        closeModal();
+        if (state._viewPaper) await openPaperView(state._viewPaper.id);
+      } catch (e) { toast(e.message, true); }
+    };
+  };
+
+  function bindLayoutDrag() {
+    let dragged = null;
+    $$(".layout-block").forEach(el => {
+      el.addEventListener("dragstart", (e) => {
+        dragged = el;
+        el.classList.add("is-dragging");
+        e.dataTransfer.effectAllowed = "move";
+        e.dataTransfer.setData("text/plain", el.dataset.key);
+      });
+      el.addEventListener("dragend", () => el.classList.remove("is-dragging"));
+    });
+    $$(".layout-dropzone__items").forEach(zone => {
+      zone.addEventListener("dragover", (e) => {
+        e.preventDefault();
+        const after = getDragAfterElement(zone, e.clientY);
+        if (dragged && after == null) zone.appendChild(dragged);
+        else if (dragged && after) zone.insertBefore(dragged, after);
+      });
+    });
+    $$(".layout-dropzone").forEach(zone => {
+      zone.addEventListener("drop", (e) => {
+        e.preventDefault();
+        const col = zone.dataset.col;
+        const key = e.dataTransfer.getData("text/plain");
+        const item = blocks.find(b => b.key === key);
+        if (item) item.col = col === "full" ? "full" : parseInt(col);
+        // 按 DOM 顺序重建 blocks
+        const newBlocks = [];
+        $$(".layout-dropzone__items").forEach(z => {
+          const c = z.parentElement.dataset.col;
+          z.querySelectorAll(".layout-block").forEach(el => {
+            const b = blocks.find(x => x.key === el.dataset.key);
+            if (b) newBlocks.push({ ...b, col: c === "full" ? "full" : parseInt(c) });
+          });
+        });
+        blocks = newBlocks;
+      });
+    });
+  }
+
+  function getDragAfterElement(container, y) {
+    const els = [...container.querySelectorAll(".layout-block:not(.is-dragging)")];
+    return els.reduce((closest, child) => {
+      const box = child.getBoundingClientRect();
+      const offset = y - box.top - box.height / 2;
+      if (offset < 0 && offset > closest.offset) return { offset, element: child };
+      return closest;
+    }, { offset: Number.NEGATIVE_INFINITY }).element;
+  }
+
+  render();
 }
 
 /* ============ 编辑已有思考 ============ */

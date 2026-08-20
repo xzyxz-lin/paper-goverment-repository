@@ -823,6 +823,7 @@ def init_db() -> None:
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             paper_id INTEGER NOT NULL REFERENCES paper(id) ON DELETE CASCADE,
             content TEXT DEFAULT '',
+            layout_json TEXT DEFAULT '{}',
             created_at TEXT NOT NULL
         );
         CREATE TABLE IF NOT EXISTS image (
@@ -870,6 +871,7 @@ def init_db() -> None:
     _migrate_recycle_item_kind(conn)
     _migrate_note_version_image_ids(conn)
     _migrate_note_flagged(conn)
+    _migrate_note_layout(conn)
 
 
 def _migrate_note_flagged(conn: sqlite3.Connection) -> None:
@@ -880,6 +882,31 @@ def _migrate_note_flagged(conn: sqlite3.Connection) -> None:
     cols = {r[1] for r in conn.execute("PRAGMA table_info(note)")}
     if "flagged" not in cols:
         conn.execute("ALTER TABLE note ADD COLUMN flagged INTEGER NOT NULL DEFAULT 0")
+
+
+def _migrate_note_layout(conn: sqlite3.Connection) -> None:
+    """为已存在的老数据库 note 表补 layout_json 布局列。"""
+    cur = conn.execute("SELECT name FROM sqlite_master WHERE type='table' AND name='note'")
+    if not cur.fetchone():
+        return
+    cols = {r[1] for r in conn.execute("PRAGMA table_info(note)")}
+    if "layout_json" not in cols:
+        conn.execute("ALTER TABLE note ADD COLUMN layout_json TEXT DEFAULT '{}'")
+
+
+def _parse_layout_json(layout_json):
+    """把 note 表的 layout_json 字符串解析为字典；失败返回空 dict。"""
+    if not layout_json:
+        return {}
+    try:
+        v = json.loads(layout_json)
+        if isinstance(v, dict):
+            return v
+        if isinstance(v, list):
+            return {"blocks": v}
+    except Exception:
+        pass
+    return {}
 
 
 def _migrate_note_version_image_ids(conn: sqlite3.Connection) -> None:
@@ -1601,6 +1628,7 @@ class Handler(BaseHTTPRequestHandler):
                         nd["images"] = [dict(i) for i in conn.execute(
                             "SELECT * FROM image WHERE note_id = ? ORDER BY id", (n["id"],)
                         ).fetchall()]
+                        nd["layout"] = _parse_layout_json(nd.get("layout_json"))
                         d["notes"].append(nd)
                     papers.append(d)
                 json_response(self, {"papers": papers})
@@ -1642,6 +1670,7 @@ class Handler(BaseHTTPRequestHandler):
                     nd["images"] = [dict(i) for i in conn.execute(
                         "SELECT * FROM image WHERE note_id = ? ORDER BY id", (n["id"],)
                     ).fetchall()]
+                    nd["layout"] = _parse_layout_json(nd.get("layout_json"))
                     d["notes"].append(nd)
                 json_response(self, {"paper": d})
 
@@ -2111,6 +2140,31 @@ class Handler(BaseHTTPRequestHandler):
                 )
                 conn.commit()
                 json_response(self, {"ok": True, "updated": cur.rowcount})
+            elif path == "/api/notes/layout":
+                uid = require_user(self)
+                if not uid:
+                    self._error(401, "未登录")
+                    return
+                body = _read_json_body(self)
+                nid = int(body.get("id"))
+                layout = body.get("layout")
+                conn = get_db()
+                note = conn.execute(
+                    """SELECT n.id
+                       FROM note n
+                       JOIN paper pa ON pa.id = n.paper_id
+                       JOIN folder f ON f.id = pa.folder_id
+                       JOIN project p ON p.id = f.project_id
+                       WHERE n.id = ? AND p.user_id = ?""",
+                    (nid, uid),
+                ).fetchone()
+                if not note:
+                    self._error(404, "思考不存在")
+                    return
+                conn.execute("UPDATE note SET layout_json = ? WHERE id = ?", (json.dumps(layout or {}), nid))
+                conn.commit()
+                json_response(self, {"ok": True})
+                return
             elif path == "/api/notes":
                 uid = require_user(self)
                 if not uid:
@@ -2121,6 +2175,7 @@ class Handler(BaseHTTPRequestHandler):
                 content = body.get("content", "")
                 new_images = body.get("images", [])
                 flagged = 1 if body.get("flagged") else 0
+                layout = body.get("layout")
                 conn = get_db()
                 note = conn.execute(
                     """SELECT n.id, n.content, n.paper_id, f.project_id
@@ -2207,7 +2262,11 @@ class Handler(BaseHTTPRequestHandler):
                 output.append(content[last:])
                 final_content = "".join(output)
 
-                conn.execute("UPDATE note SET content = ?, flagged = ? WHERE id = ?", (final_content, flagged, nid))
+                layout_json = json.dumps(layout) if layout is not None else None
+                if layout_json is not None:
+                    conn.execute("UPDATE note SET content = ?, flagged = ?, layout_json = ? WHERE id = ?", (final_content, flagged, layout_json, nid))
+                else:
+                    conn.execute("UPDATE note SET content = ?, flagged = ? WHERE id = ?", (final_content, flagged, nid))
                 conn.commit()
                 json_response(self, {"ok": True})
             else:
