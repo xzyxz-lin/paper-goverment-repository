@@ -1416,10 +1416,13 @@ body.view-paper-view header.topbar > .topbar-actions { display: none !important;
 .pv-card.is-arranging .pv-block:hover { outline-color: var(--oxide-600); }
 .pv-card.is-arranging .pv-block:active { cursor: grabbing; }
 .pv-card.is-arranging .pv-block.is-dragging { opacity: .35; }
-.pv-card.is-arranging .pv-block.is-drop-target {
-  outline: 3px dashed var(--copper-500);
+/* 插入位置指示线：上/下边缘一条铜橙粗线 */
+.pv-card.is-arranging .pv-block.is-insert-before { box-shadow: 0 -5px 0 0 var(--copper-500); }
+.pv-card.is-arranging .pv-block.is-insert-after { box-shadow: 0 5px 0 0 var(--copper-500); }
+/* 点选锁定（等待 Ctrl+点击另一块对换） */
+.pv-card.is-arranging .pv-block.is-selected {
+  outline: 3px solid var(--copper-500);
   outline-offset: 4px;
-  transform: scale(1.01);
 }
 .pv-card.is-arranging .pv-block--media img { cursor: grab; pointer-events: none; }
 .pv-card.is-arranging .pv-card__action[data-action='arrange'] {

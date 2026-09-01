@@ -1492,7 +1492,7 @@ async function openPaperView(pid) {
 }
 
 function closePaperView() {
-  state.arrange = null;
+  exitArrangeMode(false);
   const paper = state._viewPaper;
   const back = state._viewPaperReturnTo || "project";
   state._viewPaper = null;
@@ -1508,7 +1508,7 @@ function closePaperView() {
 }
 
 function renderPaperView(p) {
-  state.arrange = null; // 重渲染后旧的排版拖拽句柄已失效
+  exitArrangeMode(false); // 重渲染前清理排版模式（含自动滚动定时器与全局 dragover 监听）
   const notes = p.notes || [];
   const imgCount = notes.reduce((s, n) => s + (n.images ? n.images.length : 0), 0);
 
@@ -1631,9 +1631,14 @@ async function deleteViewNote(note, paperId) {
   await openPaperView(paperId);
 }
 
-/* ============ 大屏直接拖拽排版（对换式） ============ */
-// 进入排版模式：把当前卡片的块按 DOM 顺序与已生效的列（含宽高比自动判定的列）固化下来，
-// 之后每次「拖 A 到 B 上」就对换两者的列与顺序，并立即保存 layout。
+/* ============ 大屏直接拖拽排版（插入 + 对换） ============ */
+// 进入排版模式：把当前卡片的块按 DOM 顺序与已生效的列（含宽高比自动判定的列）固化下来。
+// 两种操作：
+//  ① 拖拽插入：拖到目标块的上半部/下半部，插入到它前面/后面（列属性跟着块走），
+//     适合把全宽块插到两行中间这类「插缝」需求；
+//  ② 点选对换：点击选中一块（铜橙框），滚动到任意位置后按住 Ctrl 点另一块，两块对换槽位
+//    （列属性留在槽位上，内容互换），适合跨长距离交换。
+// 每次操作都立即保存 layout。拖拽接近视口边缘时页面自动滚动。
 function enterArrangeMode(card, note) {
   if (state.arrange) exitArrangeMode(false);
   const body = card.querySelector(".pv-card__body");
@@ -1643,24 +1648,38 @@ function enterArrangeMode(card, note) {
     order: i,
   }));
   if (blocks.length < 2) { toast("这条思考只有 1 个块，无需排版"); return; }
-  state.arrange = { noteId: note.id, blocks, dirty: false };
+  state.arrange = { noteId: note.id, blocks, dirty: false, selectedKey: null };
   card.classList.add("is-arranging");
   const btn = card.querySelector(".pv-card__action[data-action='arrange'] span");
   if (btn) btn.textContent = "完成";
   bindArrangeDrag(card);
-  toast("排版模式：按住任意块拖到另一块上即可对换位置，点「完成」退出");
+  // 拖拽接近视口边缘时自动滚动（dragover 只间歇触发，用定时器做平滑滚动）
+  state._arrangeDragY = null;
+  state._arrangeScrollTimer = setInterval(() => {
+    const y = state._arrangeDragY;
+    if (y == null) return;
+    const margin = 90, speed = 18;
+    if (y < margin) window.scrollBy(0, -speed);
+    else if (y > window.innerHeight - margin) window.scrollBy(0, speed);
+  }, 50);
+  state._arrangeDragoverFn = (e) => { state._arrangeDragY = e.clientY; };
+  document.addEventListener("dragover", state._arrangeDragoverFn);
+  toast("排版模式：拖到某块上/下半部即插入到它前/后；点选一块后 Ctrl+点另一块可对换。点「完成」退出");
 }
 
 function exitArrangeMode(notify = true) {
   const a = state.arrange;
   if (!a) return;
   state.arrange = null;
+  if (state._arrangeScrollTimer) { clearInterval(state._arrangeScrollTimer); state._arrangeScrollTimer = null; }
+  if (state._arrangeDragoverFn) { document.removeEventListener("dragover", state._arrangeDragoverFn); state._arrangeDragoverFn = null; }
+  state._arrangeDragY = null;
   const card = document.querySelector(`.pv-card[data-note-id="${a.noteId}"]`);
   if (card) {
     card.classList.remove("is-arranging");
     $$(".pv-block", card).forEach(el => {
       el.draggable = false;
-      el.classList.remove("is-dragging", "is-drop-target");
+      el.classList.remove("is-dragging", "is-insert-before", "is-insert-after", "is-selected");
     });
     const btn = card.querySelector(".pv-card__action[data-action='arrange'] span");
     if (btn) btn.textContent = "排版";
@@ -1684,26 +1703,70 @@ function bindArrangeDrag(card) {
     });
     el.addEventListener("dragend", () => {
       el.classList.remove("is-dragging");
-      $$(".pv-block.is-drop-target", card).forEach(x => x.classList.remove("is-drop-target"));
+      state._arrangeDragY = null;
+      $$(".pv-block", card).forEach(x => x.classList.remove("is-insert-before", "is-insert-after"));
     });
     el.addEventListener("dragover", (e) => {
       const dragging = card.querySelector(".pv-block.is-dragging");
       if (!dragging || dragging === el) return;
       e.preventDefault();
       e.dataTransfer.dropEffect = "move";
-      el.classList.add("is-drop-target");
+      // 上半部 = 插到它前面，下半部 = 插到它后面
+      const rect = el.getBoundingClientRect();
+      const before = (e.clientY - rect.top) < rect.height / 2;
+      $$(".pv-block", card).forEach(x => x.classList.remove("is-insert-before", "is-insert-after"));
+      el.classList.add(before ? "is-insert-before" : "is-insert-after");
     });
-    el.addEventListener("dragleave", () => el.classList.remove("is-drop-target"));
+    el.addEventListener("dragleave", () => el.classList.remove("is-insert-before", "is-insert-after"));
     el.addEventListener("drop", (e) => {
       e.preventDefault();
-      el.classList.remove("is-drop-target");
+      const before = el.classList.contains("is-insert-before");
+      el.classList.remove("is-insert-before", "is-insert-after");
       const key = e.dataTransfer.getData("text/plain");
       if (!key || key === el.dataset.key || !state.arrange) return;
-      swapArrangeBlocks(key, el.dataset.key, card);
+      insertArrangeBlock(key, el.dataset.key, before, card);
+    });
+    // 点选 / Ctrl+点选对换
+    el.addEventListener("click", (e) => {
+      const a = state.arrange;
+      if (!a) return;
+      if ((e.ctrlKey || e.metaKey) && a.selectedKey && a.selectedKey !== el.dataset.key) {
+        const fromKey = a.selectedKey;
+        a.selectedKey = null;
+        $$(".pv-block.is-selected", card).forEach(x => x.classList.remove("is-selected"));
+        if (confirm("将选中的块与这个块对换位置？")) swapArrangeBlocks(fromKey, el.dataset.key, card);
+        return;
+      }
+      // 普通点击（或 Ctrl+点击但尚未有选中块）：切换选中
+      if (a.selectedKey === el.dataset.key) {
+        a.selectedKey = null;
+        el.classList.remove("is-selected");
+      } else {
+        a.selectedKey = el.dataset.key;
+        $$(".pv-block.is-selected", card).forEach(x => x.classList.remove("is-selected"));
+        el.classList.add("is-selected");
+        toast("已选中一块。滚动找到目标块后，按住 Ctrl 点击它即可对换；再点一下取消选中");
+      }
     });
   });
 }
 
+// 拖拽插入：把 dragKey 块移到 targetKey 块的前/后，列属性跟着块走
+async function insertArrangeBlock(dragKey, targetKey, before, card) {
+  const a = state.arrange;
+  if (!a) return;
+  const from = a.blocks.findIndex(b => b.key === dragKey);
+  let to = a.blocks.findIndex(b => b.key === targetKey);
+  if (from < 0 || to < 0) return;
+  const [moved] = a.blocks.splice(from, 1);
+  if (from < to) to--; // 删除后目标索引前移
+  a.blocks.splice(before ? to : to + 1, 0, moved);
+  a.blocks.forEach((b, i) => { b.order = i; });
+  a.dirty = true;
+  await applyArrangeAndSave(card);
+}
+
+// 点选对换：两块互换槽位（列与顺序互换，内容换位）
 async function swapArrangeBlocks(keyA, keyB, card) {
   const a = state.arrange;
   if (!a) return;
@@ -1712,7 +1775,15 @@ async function swapArrangeBlocks(keyA, keyB, card) {
   if (!ba || !bb) return;
   [ba.col, bb.col] = [bb.col, ba.col];
   [ba.order, bb.order] = [bb.order, ba.order];
+  a.blocks.sort((x, y) => x.order - y.order);
   a.dirty = true;
+  await applyArrangeAndSave(card);
+}
+
+// 重渲染卡片 body + 重新绑定拖拽 + 保存 layout
+async function applyArrangeAndSave(card) {
+  const a = state.arrange;
+  if (!a) return;
   const note = (state._viewPaper?.notes || []).find(n => n.id === a.noteId);
   if (!note) return;
   const layout = arrangeLayout();
