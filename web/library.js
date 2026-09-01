@@ -46,6 +46,15 @@ function esc(s) {
   return String(s == null ? "" : s).replace(/[&<>"']/g, c => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c]));
 }
 
+function placeCaretAtEnd(el) {
+  const range = document.createRange();
+  range.selectNodeContents(el);
+  range.collapse(false);
+  const sel = window.getSelection();
+  sel.removeAllRanges();
+  sel.addRange(range);
+}
+
 /* ============ 认证 ============ */
 let authMode = "login";
 
@@ -135,6 +144,7 @@ const state = {
   selRecycle: new Set(),   // 回收记录 id
   selNotes: new Set(),     // 当前论文的思考 id（抽屉内批量删除）
   selViewNotes: new Set(), // VIEW 全屏页的思考 id 多选删除
+  arrange: null,           // VIEW 大屏拖拽排版状态 { noteId, blocks:[{key,col,order}], dirty }
   selectionAnchor: { paper: null, project: null, folder: null, recycle: null }, // Shift 范围选择的起点
   continuousSelection: false, // 连续选择模式：普通点击直接多选，不必按 Ctrl/Cmd
   currentView: "projects",
@@ -651,6 +661,13 @@ function formatHistoryTime(iso) {
 
 const HISTORY_EVENT_LABEL = { create: "新增", edit: "修改", delete: "删除" };
 
+function historyNoteTitle(v) {
+  const t = (v.content || "").replace(/\[\[img:\d+\]\]/g, " ").replace(/\s+/g, " ").trim();
+  if (t) return t.length > 34 ? t.slice(0, 34) + "…" : t;
+  const imgCount = (v.image_ids || []).length;
+  return imgCount ? `（${imgCount} 张图片）` : "（空）";
+}
+
 function renderHistoryVersions() {
   const crumbs = $("#history-crumbs");
   const level = $("#history-level");
@@ -772,7 +789,8 @@ function renderHistoryVersions() {
   }
 
   // 事件列表
-  const items = paper.events.filter(e => e.event_type === eventType);
+  const items = paper.events.filter(e => e.event_type === eventType)
+    .sort((a, b) => new Date(b.created_at) - new Date(a.created_at));
   if (!items.length) {
     level.innerHTML = `<div class="recycle-empty"><svg><use href="#i-clock"/></svg><h4>该类型下没有历史记录</h4></div>`;
     return;
@@ -782,7 +800,7 @@ function renderHistoryVersions() {
   level.innerHTML = `
     <p class="history-type-hint">${esc(paper.paper_title)} — ${esc(label)}的思考 · ${items.length} 条</p>
     <div class="history-group__items">
-      ${items.map(v => {
+      ${items.map((v, idx) => {
         const text = (v.content || "").replace(/\[\[img:\d+\]\]/g, " [图片] ").replace(/\s+/g, " ").trim();
         const preview = text.length > 160 ? text.slice(0, 160) + "…" : text;
         const imgCount = (v.image_ids || []).length;
@@ -795,7 +813,7 @@ function renderHistoryVersions() {
         return `
         <article class="history-row history-row--${v.event_type}" data-vid="${v.id}" data-nid="${v.note_id}">
           <div class="history-row__main">
-            <h5>思考标注 <span>· ${formatHistoryTime(v.created_at)}${imgCount ? ` · ${imgCount} 张图片` : ""}</span></h5>
+            <h5>思考 #${idx + 1} · ${esc(historyNoteTitle(v))}<span> · ${formatHistoryTime(v.created_at)}${imgCount ? ` · ${imgCount} 张图片` : ""}</span></h5>
             ${preview ? `<p class="history-row__preview">${esc(preview)}</p>` : ""}
           </div>
           <div class="history-row__time">
@@ -858,7 +876,7 @@ async function viewHistoryVersion(v) {
       content: v.content,
       images: imgIds.map(id => ({ id, rel_path: relMap[id] || "" })).filter(x => x.rel_path),
     };
-    bodyHtml = `<div class="pv-card__body" style="grid-template-columns:1fr; margin-top:14px;">${renderViewNoteBlocks(pseudoNote)}</div>`;
+    bodyHtml = `<div class="pv-card__body" style="margin-top:14px;">${renderViewNoteBlocks(pseudoNote)}</div>`;
   } catch (e) {
     bodyHtml = `<p style="color:var(--danger-600);font-size:.8rem;">加载图片失败：${esc(e.message)}</p>`;
   }
@@ -1192,26 +1210,22 @@ function renderPaperDrawer(p) {
 
     <div class="drawer-section-title"><span>我的思考</span></div>
 
-    <div class="note-bulk-bar" id="note-bulk-bar" ${state.selNotes.size ? "" : "hidden"}>
-      <span id="note-bulk-count">已选中 ${state.selNotes.size} 条思考</span>
-      <div>
-        <button class="scan-button scan-button--ghost" id="note-bulk-sel-all" type="button"><svg><use href="#i-plus"/></svg><span>${notes.length && state.selNotes.size === notes.length ? "取消全选" : "全选"}</span></button>
-        <button class="scan-button scan-button--ghost" id="note-bulk-del" type="button"><svg><use href="#i-trash"/></svg><span>删除选中</span></button>
-        <button class="note-bulk-clear" id="note-bulk-clear" type="button">取消选择</button>
-      </div>
-    </div>
-
     <div id="notes-list">
       ${notes.map(n => renderNoteCard(n)).join("")}
     </div>
 
-    <div class="drawer-section-title"><span>新增思考</span></div>
-    <div class="note-compose">
-      <div class="note-editor" id="note-editor" contenteditable="true" data-placeholder="写文字、Ctrl+V 贴图，点「保存思考」成一条。"></div>
-      <div class="note-compose__bar">
-        <span class="note-compose__hint">支持：文字 + 多张截图 + 图间插话 + 换行缩进</span>
-        <button class="scan-button scan-button--ghost" id="compose-view-btn" type="button" style="min-height:38px;padding:0 12px;"><svg style="width:15px;height:15px;"><use href="#i-image"/></svg><span>View</span></button>
-        <button class="scan-button" id="add-note-btn" type="button"><svg><use href="#i-plus"/></svg><span>保存思考</span></button>
+    <div class="drawer-footer">
+      <div class="note-bulk-bar" id="note-bulk-bar" ${state.selNotes.size ? "" : "hidden"}>
+        <span id="note-bulk-count">已选中 ${state.selNotes.size} 条思考</span>
+        <div>
+          <button class="scan-button scan-button--ghost" id="note-bulk-sel-all" type="button"><svg><use href="#i-plus"/></svg><span>${notes.length && state.selNotes.size === notes.length ? "取消全选" : "全选"}</span></button>
+          <button class="scan-button scan-button--ghost" id="note-bulk-del" type="button"><svg><use href="#i-trash"/></svg><span>删除选中</span></button>
+          <button class="note-bulk-clear" id="note-bulk-clear" type="button">取消选择</button>
+        </div>
+      </div>
+      <div class="drawer-footer__actions">
+        <button class="scan-button" id="add-note-btn" type="button"><svg><use href="#i-plus"/></svg><span>新增思考</span></button>
+        <button class="scan-button scan-button--ghost" id="compose-view-btn" type="button"><svg style="width:15px;height:15px;"><use href="#i-image"/></svg><span>View</span></button>
       </div>
     </div>`;
 
@@ -1223,36 +1237,14 @@ function renderPaperDrawer(p) {
     $("#reveal-file-btn").onclick = (e) => { e.preventDefault(); openLocal(p.local_path, true); };
   }
 
-  // 思考编辑区：图文混排（暂存图片，点保存才提交）
-  state.composeImages = [];
-  const editor = $("#note-editor");
-
-  // 恢复同一篇论文未保存的草稿
-  const draft = state.composeDrafts.get(p.id);
-  if (draft) {
-    editor.innerHTML = draft.html;
-    state.composeImages = draft.images.slice();
-  }
-  editor.addEventListener("paste", (e) => {
-    const items = e.clipboardData && e.clipboardData.items;
-    if (!items) return;
-    for (const it of items) {
-      if (it.type.startsWith("image/")) {
-        e.preventDefault();
-        const blob = it.getAsFile();
-        insertComposeImage(blob, editor);
-        return;
-      }
-    }
-  });
   $("#compose-view-btn").onclick = () => { closeDrawer(); openPaperView(p.id); };
-  $("#add-note-btn").onclick = () => addNote(p.id, editor);
+  $("#add-note-btn").onclick = () => openNoteComposeEditor({ paperId: p.id });
 
   // 已有笔记的编辑 / 删除
   $$("#notes-list .note-card__edit").forEach(btn => btn.addEventListener("click", () => {
     const nid = parseInt(btn.dataset.note);
     const note = (p.notes || []).find(n => n.id === nid);
-    if (note) openNoteEditor(note);
+    if (note) openNoteComposeEditor({ note });
   }));
   $$("#notes-list .note-card__del").forEach(btn => btn.addEventListener("click", () => deleteNote(parseInt(btn.dataset.note), p.id)));
 
@@ -1500,6 +1492,7 @@ async function openPaperView(pid) {
 }
 
 function closePaperView() {
+  state.arrange = null;
   const paper = state._viewPaper;
   const back = state._viewPaperReturnTo || "project";
   state._viewPaper = null;
@@ -1515,6 +1508,7 @@ function closePaperView() {
 }
 
 function renderPaperView(p) {
+  state.arrange = null; // 重渲染后旧的排版拖拽句柄已失效
   const notes = p.notes || [];
   const imgCount = notes.reduce((s, n) => s + (n.images ? n.images.length : 0), 0);
 
@@ -1562,7 +1556,7 @@ function renderPaperView(p) {
 
   // 绑定每条思考的 新增 / 删除 / 编辑 / 全屏 按钮
   $$(".pv-card__action[data-action='add']").forEach(btn => {
-    btn.onclick = () => openAddNoteModal(p.id);
+    btn.onclick = () => openNoteComposeEditor({ paperId: p.id });
   });
   $$(".pv-card__action[data-action='delete']").forEach(btn => {
     btn.onclick = () => {
@@ -1575,14 +1569,7 @@ function renderPaperView(p) {
     btn.onclick = () => {
       const nid = parseInt(btn.closest(".pv-card").dataset.noteId);
       const note = (state._viewPaper?.notes || []).find(n => n.id === nid);
-      if (note) openNoteEditor(note);
-    };
-  });
-  $$(".pv-card__action[data-action='layout']").forEach(btn => {
-    btn.onclick = () => {
-      const nid = parseInt(btn.closest(".pv-card").dataset.noteId);
-      const note = (state._viewPaper?.notes || []).find(n => n.id === nid);
-      if (note) openNoteLayoutEditor(note);
+      if (note) openNoteComposeEditor({ note });
     };
   });
   $$(".pv-card__action[data-action='fullscreen']").forEach(btn => {
@@ -1590,6 +1577,16 @@ function renderPaperView(p) {
       const nid = parseInt(btn.closest(".pv-card").dataset.noteId);
       const note = (state._viewPaper?.notes || []).find(n => n.id === nid);
       if (note) openNoteFullscreen(note);
+    };
+  });
+  $$(".pv-card__action[data-action='arrange']").forEach(btn => {
+    btn.onclick = () => {
+      const card = btn.closest(".pv-card");
+      const nid = parseInt(card.dataset.noteId);
+      const note = (state._viewPaper?.notes || []).find(n => n.id === nid);
+      if (!note) return;
+      if (state.arrange && state.arrange.noteId === nid) exitArrangeMode();
+      else enterArrangeMode(card, note);
     };
   });
 
@@ -1634,6 +1631,103 @@ async function deleteViewNote(note, paperId) {
   await openPaperView(paperId);
 }
 
+/* ============ 大屏直接拖拽排版（对换式） ============ */
+// 进入排版模式：把当前卡片的块按 DOM 顺序与已生效的列（含宽高比自动判定的列）固化下来，
+// 之后每次「拖 A 到 B 上」就对换两者的列与顺序，并立即保存 layout。
+function enterArrangeMode(card, note) {
+  if (state.arrange) exitArrangeMode(false);
+  const body = card.querySelector(".pv-card__body");
+  const blocks = $$(".pv-block", body).map((el, i) => ({
+    key: el.dataset.key,
+    col: el.classList.contains("pv-block--col-full") ? "full" : (el.classList.contains("pv-block--col-1") ? 1 : 2),
+    order: i,
+  }));
+  if (blocks.length < 2) { toast("这条思考只有 1 个块，无需排版"); return; }
+  state.arrange = { noteId: note.id, blocks, dirty: false };
+  card.classList.add("is-arranging");
+  const btn = card.querySelector(".pv-card__action[data-action='arrange'] span");
+  if (btn) btn.textContent = "完成";
+  bindArrangeDrag(card);
+  toast("排版模式：按住任意块拖到另一块上即可对换位置，点「完成」退出");
+}
+
+function exitArrangeMode(notify = true) {
+  const a = state.arrange;
+  if (!a) return;
+  state.arrange = null;
+  const card = document.querySelector(`.pv-card[data-note-id="${a.noteId}"]`);
+  if (card) {
+    card.classList.remove("is-arranging");
+    $$(".pv-block", card).forEach(el => {
+      el.draggable = false;
+      el.classList.remove("is-dragging", "is-drop-target");
+    });
+    const btn = card.querySelector(".pv-card__action[data-action='arrange'] span");
+    if (btn) btn.textContent = "排版";
+  }
+  if (notify && a.dirty) toast("排版已保存");
+}
+
+function arrangeLayout() {
+  return { blocks: state.arrange.blocks.map(b => ({ key: b.key, col: b.col, order: b.order })) };
+}
+
+function bindArrangeDrag(card) {
+  $$(".pv-block", card).forEach(el => {
+    el.draggable = true;
+    // 阻止图片自身的原生拖拽，让整块作为拖拽源
+    el.querySelectorAll("img").forEach(im => { im.draggable = false; });
+    el.addEventListener("dragstart", (e) => {
+      e.dataTransfer.effectAllowed = "move";
+      e.dataTransfer.setData("text/plain", el.dataset.key);
+      el.classList.add("is-dragging");
+    });
+    el.addEventListener("dragend", () => {
+      el.classList.remove("is-dragging");
+      $$(".pv-block.is-drop-target", card).forEach(x => x.classList.remove("is-drop-target"));
+    });
+    el.addEventListener("dragover", (e) => {
+      const dragging = card.querySelector(".pv-block.is-dragging");
+      if (!dragging || dragging === el) return;
+      e.preventDefault();
+      e.dataTransfer.dropEffect = "move";
+      el.classList.add("is-drop-target");
+    });
+    el.addEventListener("dragleave", () => el.classList.remove("is-drop-target"));
+    el.addEventListener("drop", (e) => {
+      e.preventDefault();
+      el.classList.remove("is-drop-target");
+      const key = e.dataTransfer.getData("text/plain");
+      if (!key || key === el.dataset.key || !state.arrange) return;
+      swapArrangeBlocks(key, el.dataset.key, card);
+    });
+  });
+}
+
+async function swapArrangeBlocks(keyA, keyB, card) {
+  const a = state.arrange;
+  if (!a) return;
+  const ba = a.blocks.find(b => b.key === keyA);
+  const bb = a.blocks.find(b => b.key === keyB);
+  if (!ba || !bb) return;
+  [ba.col, bb.col] = [bb.col, ba.col];
+  [ba.order, bb.order] = [bb.order, ba.order];
+  a.dirty = true;
+  const note = (state._viewPaper?.notes || []).find(n => n.id === a.noteId);
+  if (!note) return;
+  const layout = arrangeLayout();
+  const body = card.querySelector(".pv-card__body");
+  body.innerHTML = renderViewNoteBlocks({ ...note, layout });
+  layoutViewImages(body);
+  bindArrangeDrag(card);
+  try {
+    await req("PUT", "/api/notes/layout", { id: note.id, layout });
+    note.layout = layout; // 同步内存，后续重渲染保持新排版
+  } catch (err) {
+    toast("排版保存失败：" + (err && err.message || err));
+  }
+}
+
 async function deleteSelectedViewNotes(paperId) {
   const ids = Array.from(state.selViewNotes);
   if (!ids.length) return;
@@ -1645,55 +1739,7 @@ async function deleteSelectedViewNotes(paperId) {
 }
 
 function openAddNoteModal(paperId) {
-  state.addNoteImages = [];
-  openModal(`
-    <button class="icon-button" id="m-close" type="button" aria-label="关闭"><svg><use href="#i-close"/></svg></button>
-    <p class="eyebrow">NEW NOTE</p>
-    <h3>新增思考</h3>
-    <div class="note-editor" id="m-add-note-editor" contenteditable="true" data-placeholder="写文字、Ctrl+V 贴图，点「保存思考」新增一条。"></div>
-    <p class="field-help">新增的思考会排在这篇论文的最后。</p>
-    <div style="display:flex; gap:10px; justify-content:flex-end; margin-top:16px;">
-      <button class="scan-button scan-button--ghost" id="m-note-cancel" type="button">取消</button>
-      <button class="scan-button" id="m-note-save" type="button">保存思考</button>
-    </div>`);
-
-  const editor = $("#m-add-note-editor");
-  editor.focus();
-
-  editor.addEventListener("paste", (e) => {
-    const items = e.clipboardData && e.clipboardData.items;
-    if (!items) return;
-    for (const it of items) {
-      if (it.type.startsWith("image/")) {
-        e.preventDefault();
-        const blob = it.getAsFile();
-        insertAddNoteImage(blob, editor);
-        return;
-      }
-    }
-  });
-
-  $("#m-close").onclick = closeModal;
-  $("#m-note-cancel").onclick = closeModal;
-  $("#m-note-save").onclick = async () => {
-    const { content, images } = serializeAddNoteEditor(editor);
-    const textOnly = content.replace(/\[\[img:\d+\]\]/g, "").trim();
-    if (!textOnly && images.length === 0) {
-      toast("先写点内容或加张图");
-      return;
-    }
-    try {
-      const nd = await req("POST", "/api/notes", { paper_id: paperId, content });
-      const nid = nd.id;
-      for (const img of images) {
-        await req("POST", "/api/notes/images", { note_id: nid, data: img.data, ext: img.ext });
-      }
-      toast("已新增思考");
-      closeModal();
-      await openPaperView(paperId);
-      if (state._currentPaper && state._currentPaper.id === paperId) await refreshPaper(paperId);
-    } catch (e) { toast(e.message, true); }
-  };
+  openNoteComposeEditor({ paperId });
 }
 
 function serializeAddNoteEditor(editor) {
@@ -1798,7 +1844,7 @@ function renderViewNoteCard(n, idx) {
           <button class="pv-card__action" data-action="add" type="button" title="新增思考"><svg><use href="#i-plus"/></svg><span>新增</span></button>
           <button class="pv-card__action pv-card__action--danger" data-action="delete" type="button" title="删除思考"><svg><use href="#i-trash"/></svg><span>删除</span></button>
           <button class="pv-card__action" data-action="edit" type="button" title="编辑思考"><svg><use href="#i-edit"/></svg><span>编辑</span></button>
-          <button class="pv-card__action" data-action="layout" type="button" title="排版"><svg><use href="#i-layout"/></svg><span>排版</span></button>
+          <button class="pv-card__action" data-action="arrange" type="button" title="拖拽排版：按住块拖到另一块上对换位置"><svg><use href="#i-layout"/></svg><span>排版</span></button>
           <button class="pv-card__action" data-action="fullscreen" type="button" title="全屏查看"><svg><use href="#i-image"/></svg><span>全屏</span></button>
           <span class="pv-card__index">#${idx}</span>
         </div>
@@ -1844,17 +1890,32 @@ function buildNoteBlocks(n) {
   return blocks;
 }
 
-// 合并用户保存的 layout 与默认布局；未指定 col 的块保持 null（由渲染时自动决定）。
+// 未保存过排版时的默认列：文字在左栏，图片默认在右栏。
+function defaultBlockCol(block) {
+  return block.type === "text" ? 1 : 2;
+}
+
+// 合并用户保存的 layout 与默认布局。
+// 兼容两种格式：① 旧格式带 key，按 key 匹配；② 新格式只存 {col, order}，按 order 位置套用（不依赖 key）。
 function applyLayout(blocks, layout) {
-  const map = new Map((layout.blocks || []).map(b => [b.key, b]));
+  const saved = (layout && layout.blocks) || [];
+  const byKey = saved.length && saved[0] && saved[0].key != null;
+  if (byKey) {
+    const map = new Map(saved.map(b => [b.key, b]));
+    return blocks.map((b, i) => {
+      const s = map.get(b.key);
+      return {
+        ...b,
+        col: s && s.col != null ? s.col : defaultBlockCol(b),
+        order: s && s.order != null ? s.order : i,
+      };
+    }).sort((a, b) => a.order - b.order);
+  }
+  const ordered = saved.slice().sort((a, b) => a.order - b.order);
   return blocks.map((b, i) => {
-    const saved = map.get(b.key);
-    return {
-      ...b,
-      col: saved && saved.col != null ? saved.col : null,
-      order: saved && saved.order != null ? saved.order : i,
-    };
-  }).sort((a, b) => a.order - b.order);
+    const s = ordered[i];
+    return { ...b, col: s && s.col != null ? s.col : defaultBlockCol(b) };
+  });
 }
 
 // 把一条思考按内容顺序拆成「文字块 / 图片块」，在 2 列网格里依次排列，
@@ -1865,10 +1926,9 @@ function renderViewNoteBlocks(n) {
   if (!blocks.length) return `<div class="pv-block pv-block--text" style="color:var(--ink-500);">（空）</div>`;
 
   return blocks.map(b => {
-    const isAuto = b.col == null;
-    const col = b.type === "text" ? (b.col || 1) : (b.col || 2);
+    const col = b.col == null ? defaultBlockCol(b) : b.col;
     const colClass = col === 1 ? "pv-block--col-1" : (col === 2 ? "pv-block--col-2" : "pv-block--col-full");
-    const autoAttr = isAuto ? ' data-auto="1"' : "";
+    const autoAttr = b.col == null ? ' data-auto="1"' : "";
     if (b.type === "text") {
       return `<div class="pv-block pv-block--text ${colClass}" data-key="${b.key}"${autoAttr}><span class="pv-block__label">文字</span><div class="pv-block__content">${esc(b.text).replace(/\n/g, "<br>")}</div></div>`;
     }
@@ -1876,102 +1936,327 @@ function renderViewNoteBlocks(n) {
   }).join("");
 }
 
-/* ============ 排版编辑器：拖拽块到左/右/全宽 ============ */
-function openNoteLayoutEditor(note) {
-  let blocks = applyLayout(buildNoteBlocks(note), note.layout || {});
+/* ============ 排版编辑器：可排序的功能栏（左/右/全宽） ============ */
+// 把一条思考按已保存 layout 还原成「栏（section）」列表；连续同列的块归为同一栏。
+function buildSectionsFromNote(note) {
+  const blocks = applyLayout(buildNoteBlocks(note), note.layout || {});
+  const sections = [];
+  let counter = 0;
+  let cur = null;
+  blocks.forEach(b => {
+    if (!cur || String(cur.col) !== String(b.col)) {
+      cur = { id: "s" + (++counter), col: b.col, items: [] };
+      sections.push(cur);
+    }
+    cur.items.push(b);
+  });
+  return { sections, nextId: counter };
+}
+
+function openNoteComposeEditor(opts) {
+  const { paperId, note } = opts || {};
+  const isEdit = !!note;
+  let sections;
+  let composeImgSeq = 0;
+  let flagged = isEdit ? !!note.flagged : false;
+
+  const normBlock = (b) => b.type === "text"
+    ? { key: b.key, type: "text", text: b.text || "" }
+    : { key: b.key, type: "image", image_id: b.image_id, rel_path: b.image ? b.image.rel_path : (b.rel_path || "") };
+
+  if (isEdit) {
+    const built = buildSectionsFromNote(note);
+    sections = built.sections.map(sec => ({ id: sec.id, col: sec.col, items: sec.items.map(normBlock) }));
+    composeImgSeq = built.nextId;
+  } else {
+    sections = [{ id: "s1", col: "full", items: [{ key: "t" + Date.now(), type: "text", text: "" }] }];
+    composeImgSeq = 1;
+  }
+  let secCounter = sections.length;
+  const newKey = (p) => p + (++composeImgSeq) + "_" + Math.random().toString(36).slice(2, 6);
+
   const render = () => {
-    const byCol = (col) => blocks.filter(b => String(b.col) === String(col));
-    const colBlocks = (items) => items.map((b, idx) => {
-      const preview = b.type === "text"
-        ? `<div class="layout-block__text">${esc(b.text).replace(/\n/g, " ").slice(0, 120)}${b.text.length > 120 ? "…" : ""}</div>`
-        : `<img src="/assets/${encodeURI(b.image.rel_path)}" alt="截图">`;
-      return `<div class="layout-block ${b.type === "text" ? "layout-block--text" : "layout-block--image"}" draggable="true" data-key="${b.key}">${preview}</div>`;
-    }).join("");
+    const secHtml = sections.map(sec => sectionHtml(sec)).join("");
     openModal(`
       <button class="icon-button" id="m-close" type="button" aria-label="关闭"><svg><use href="#i-close"/></svg></button>
-      <p class="eyebrow">LAYOUT</p>
-      <h3>拖拽排版</h3>
-      <p class="field-help">把文字或图片拖到左栏、右栏或全宽；同一栏内可上下拖动排序。保存后仅在 VIEW 页生效。</p>
-      <div class="layout-editor">
-        <div class="layout-dropzone" data-col="1">
-          <header>左栏</header>
-          <div class="layout-dropzone__items">${colBlocks(byCol(1))}</div>
-        </div>
-        <div class="layout-dropzone" data-col="2">
-          <header>右栏</header>
-          <div class="layout-dropzone__items">${colBlocks(byCol(2))}</div>
-        </div>
-        <div class="layout-dropzone" data-col="full">
-          <header>全宽</header>
-          <div class="layout-dropzone__items">${colBlocks(byCol("full"))}</div>
-        </div>
+      <p class="eyebrow">${isEdit ? "EDIT NOTE" : "NEW NOTE"}</p>
+      <h3>${isEdit ? "编辑思考" : "新增思考"}</h3>
+      <div class="layout-sections" id="layout-sections">
+        ${secHtml}
+        <button class="layout-section__add" id="m-layout-add" type="button">＋ 新增一栏</button>
       </div>
-      <div style="display:flex; gap:10px; justify-content:flex-end; margin-top:16px;">
-        <button class="scan-button scan-button--ghost" id="m-layout-reset" type="button">恢复默认</button>
+      <div style="display:flex; gap:10px; align-items:center; margin-top:18px; flex-wrap:wrap;">
+        <button class="scan-button scan-button--ghost note-flag-btn ${flagged ? "is-active" : ""}" id="m-note-flag" type="button" title="标记：这条思考可能还没想透，待复查">
+          <svg style="width:13px;height:13px;"><use href="#i-flag"/></svg><span>${flagged ? "已标记" : "标记"}</span>
+        </button>
+        <button class="scan-button scan-button--ghost" id="m-compose-addimg" type="button"><svg style="width:13px;height:13px;"><use href="#i-image"/></svg><span>图片</span></button>
+        <button class="scan-button scan-button--ghost" id="m-compose-addtext" type="button"><svg style="width:13px;height:13px;"><use href="#i-edit"/></svg><span>文字</span></button>
+        <div style="flex:1;"></div>
         <button class="scan-button scan-button--ghost" id="m-layout-cancel" type="button">取消</button>
-        <button class="scan-button" id="m-layout-save" type="button">保存排版</button>
+        <button class="scan-button" id="m-layout-save" type="button">${isEdit ? "保存修改" : "保存思考"}</button>
       </div>`);
-    bindLayoutDrag();
+    bindComposeDrag();
     $("#m-close").onclick = closeModal;
     $("#m-layout-cancel").onclick = closeModal;
-    $("#m-layout-reset").onclick = () => {
-      blocks = buildNoteBlocks(note).map((b, i) => ({ ...b, col: null, order: i }));
+    $("#m-layout-add").onclick = () => {
+      sections.push({ id: "s" + (++secCounter), col: "full", items: [{ key: newKey("t"), type: "text", text: "" }] });
       render();
     };
-    $("#m-layout-save").onclick = async () => {
-      const layout = { blocks: blocks.map((b, i) => ({ key: b.key, col: b.col, order: i })) };
-      try {
-        await req("PUT", "/api/notes/layout", { id: note.id, layout });
-        toast("已保存排版");
-        note.layout = layout;
-        closeModal();
-        if (state._viewPaper) await openPaperView(state._viewPaper.id);
-      } catch (e) { toast(e.message, true); }
+    $("#m-compose-addimg").onclick = () => {
+      const input = document.createElement("input");
+      input.type = "file";
+      input.accept = "image/*";
+      input.onchange = () => {
+        const file = input.files && input.files[0];
+        if (file) addImageBlock(sections[sections.length - 1].id, file);
+      };
+      input.click();
+    };
+    $("#m-compose-addtext").onclick = () => {
+      sections[sections.length - 1].items.push({ key: newKey("t"), type: "text", text: "" });
+      render();
+      // focus the new empty text block
+      const edits = $$(".layout-block__edit");
+      const last = edits[edits.length - 1];
+      if (last) { last.focus(); placeCaretAtEnd(last); }
+    };
+    const flagBtn = $("#m-note-flag");
+    flagBtn.onclick = () => {
+      flagged = !flagged;
+      flagBtn.classList.toggle("is-active", flagged);
+      flagBtn.querySelector("span").textContent = flagged ? "已标记" : "标记";
+    };
+    $("#m-layout-save").onclick = () => saveCompose();
+    const modalBody = $("#modal");
+    modalBody.onpaste = (e) => {
+      if (!document.getElementById("layout-sections")) return;
+      const items = e.clipboardData && e.clipboardData.items;
+      if (!items) return;
+      for (const it of items) {
+        if (it.type.startsWith("image/")) {
+          e.preventDefault();
+          const blob = it.getAsFile();
+          const secEl = e.target.closest && e.target.closest(".layout-section");
+          addImageBlock(secEl ? secEl.dataset.secid : sections[sections.length - 1].id, blob);
+          return;
+        }
+      }
     };
   };
 
-  function bindLayoutDrag() {
-    let dragged = null;
+  function sectionHtml(sec) {
+    const blocksHtml = sec.items.map(b => {
+      if (b.type === "text") {
+        return `<div class="layout-block layout-block--text" draggable="true" data-key="${b.key}">
+          <div class="layout-block__edit" contenteditable="true" data-key="${b.key}">${esc(b.text).replace(/\n/g, "<br>")}</div>
+          <button class="layout-block__del" data-key="${b.key}" type="button" title="删除此块">×</button>
+        </div>`;
+      }
+      const src = b.data ? `data:image/${b.ext};base64,${b.data}` : `/assets/${encodeURI(b.rel_path)}`;
+      return `<div class="layout-block layout-block--image" draggable="true" data-key="${b.key}">
+        <img src="${src}" alt="截图" loading="lazy">
+        <button class="layout-block__del" data-key="${b.key}" type="button" title="删除此图">×</button>
+      </div>`;
+    }).join("");
+    return `
+      <section class="layout-section" data-secid="${sec.id}" data-col="${sec.col}">
+        <header class="layout-section__head" draggable="true" data-secid="${sec.id}">
+          <span class="layout-section__grip" title="拖动排序">⠿</span>
+          <select class="layout-section__type" data-secid="${sec.id}">
+            <option value="1" ${sec.col == 1 ? "selected" : ""}>左栏</option>
+            <option value="2" ${sec.col == 2 ? "selected" : ""}>右栏</option>
+            <option value="full" ${sec.col === "full" ? "selected" : ""}>全宽</option>
+          </select>
+          <button class="layout-section__del" data-secid="${sec.id}" type="button" title="删除此栏">✕</button>
+        </header>
+        <div class="layout-section__items" data-secid="${sec.id}">${blocksHtml}</div>
+      </section>`;
+  }
+
+  function addImageBlock(secId, blob) {
+    blobToBase64(blob).then(b64 => {
+      const ext = blob.type.includes("png") ? "png" : "jpg";
+      const sec = sections.find(s => s.id === secId);
+      if (!sec) return;
+      sec.items.push({ key: newKey("n"), type: "image", data: b64, ext });
+      render();
+    });
+  }
+
+  function syncSectionsFromDOM() {
+    const next = [];
+    $$(".layout-section").forEach(secEl => {
+      const secId = secEl.dataset.secid;
+      const col = secEl.dataset.col === "full" ? "full" : parseInt(secEl.dataset.col);
+      const items = $$(".layout-block", secEl).map(el => {
+        const key = el.dataset.key;
+        let found = null;
+        sections.forEach(s => { const hit = s.items.find(b => b.key === key); if (hit) found = hit; });
+        if (found && found.type === "text") found = { ...found, text: el.querySelector(".layout-block__edit").innerText };
+        return found;
+      }).filter(Boolean);
+      next.push({ id: secId, col, items });
+    });
+    sections = next;
+  }
+
+  function bindComposeDrag() {
+    let drag = null;
+
     $$(".layout-block").forEach(el => {
       el.addEventListener("dragstart", (e) => {
-        dragged = el;
+        drag = { type: "block", key: el.dataset.key };
         el.classList.add("is-dragging");
         e.dataTransfer.effectAllowed = "move";
-        e.dataTransfer.setData("text/plain", el.dataset.key);
+        e.dataTransfer.setData("text/plain", "block:" + el.dataset.key);
+        e.stopPropagation();
       });
-      el.addEventListener("dragend", () => el.classList.remove("is-dragging"));
+      el.addEventListener("dragend", () => {
+        el.classList.remove("is-dragging");
+        if (drag && drag.type === "block") { syncSectionsFromDOM(); drag = null; }
+      });
     });
-    $$(".layout-dropzone__items").forEach(zone => {
+
+    $$(".layout-section__head").forEach(el => {
+      el.addEventListener("dragstart", (e) => {
+        drag = { type: "section", secId: el.dataset.secid };
+        el.closest(".layout-section").classList.add("is-dragging");
+        e.dataTransfer.effectAllowed = "move";
+        e.dataTransfer.setData("text/plain", "section:" + el.dataset.secid);
+      });
+    });
+
+    $$(".layout-section__items").forEach(zone => {
       zone.addEventListener("dragover", (e) => {
+        if (!drag || drag.type !== "block") return;
         e.preventDefault();
+        const dragging = document.querySelector(".layout-block.is-dragging");
+        if (!dragging) return;
         const after = getDragAfterElement(zone, e.clientY);
-        if (dragged && after == null) zone.appendChild(dragged);
-        else if (dragged && after) zone.insertBefore(dragged, after);
+        if (after == null) zone.appendChild(dragging);
+        else zone.insertBefore(dragging, after);
+      });
+      zone.addEventListener("drop", (e) => {
+        if (!drag || drag.type !== "block") return;
+        e.preventDefault();
+        syncSectionsFromDOM();
+        drag = null;
       });
     });
-    $$(".layout-dropzone").forEach(zone => {
-      zone.addEventListener("drop", (e) => {
+
+    $$(".layout-section").forEach(sec => {
+      sec.addEventListener("dragover", (e) => {
+        if (!drag || drag.type !== "section") return;
         e.preventDefault();
-        const col = zone.dataset.col;
-        const key = e.dataTransfer.getData("text/plain");
-        const item = blocks.find(b => b.key === key);
-        if (item) item.col = col === "full" ? "full" : parseInt(col);
-        // 按 DOM 顺序重建 blocks
-        const newBlocks = [];
-        $$(".layout-dropzone__items").forEach(z => {
-          const c = z.parentElement.dataset.col;
-          z.querySelectorAll(".layout-block").forEach(el => {
-            const b = blocks.find(x => x.key === el.dataset.key);
-            if (b) newBlocks.push({ ...b, col: c === "full" ? "full" : parseInt(c) });
-          });
-        });
-        blocks = newBlocks;
+        if (sec.dataset.secid === drag.secId) return;
+        const dragging = document.querySelector(".layout-section.is-dragging");
+        if (!dragging) return;
+        const after = getDragAfterSection(e.clientY);
+        const container = $("#layout-sections");
+        if (after == null) container.insertBefore(dragging, $("#m-layout-add"));
+        else container.insertBefore(dragging, after);
+      });
+      sec.addEventListener("dragend", () => {
+        const d = document.querySelector(".layout-section.is-dragging");
+        if (d) d.classList.remove("is-dragging");
+        if (drag && drag.type === "section") { syncSectionsFromDOM(); drag = null; }
+      });
+    });
+
+    $$(".layout-section__type").forEach(sel => {
+      sel.addEventListener("change", () => {
+        const sec = sections.find(s => s.id === sel.dataset.secid);
+        if (sec) { sec.col = sel.value === "full" ? "full" : parseInt(sel.value); render(); }
+      });
+    });
+
+    $$(".layout-section__del").forEach(btn => {
+      btn.addEventListener("click", (e) => {
+        e.stopPropagation();
+        const id = btn.dataset.secid;
+        const idx = sections.findIndex(s => s.id === id);
+        if (idx < 0 || sections.length <= 1) return;
+        const [removed] = sections.splice(idx, 1);
+        const target = sections[idx] || sections[idx - 1];
+        target.items = target.items.concat(removed.items);
+        render();
+      });
+    });
+
+    $$(".layout-block__del").forEach(btn => {
+      btn.addEventListener("click", (e) => {
+        e.stopPropagation();
+        const key = btn.dataset.key;
+        sections.forEach(s => { s.items = s.items.filter(b => b.key !== key); });
+        render();
       });
     });
   }
 
+  async function saveCompose() {
+    syncSectionsFromDOM();
+    const flat = [];
+    let content = "";
+    let newImages = [];
+    let order = 0;
+    sections.forEach(sec => {
+      sec.items.forEach(b => {
+        if (b.type === "text") {
+          const t = b.text || "";
+          if (!t.trim()) return;
+          content += (content ? "\n" : "") + t;
+          flat.push({ col: sec.col, order: order++ });
+        } else {
+          if (b.image_id) {
+            content += (content ? "\n" : "") + `[[existing-img:${b.image_id}]]`;
+          } else {
+            const idx = newImages.length;
+            newImages.push({ data: b.data, ext: b.ext });
+            content += (content ? "\n" : "") + `[[img:${idx}]]`;
+          }
+          flat.push({ col: sec.col, order: order++ });
+        }
+      });
+    });
+    content = content.trim();
+    if (!content && newImages.length === 0) {
+      toast("先写点内容或加张图");
+      return;
+    }
+    const layout = { blocks: flat };
+    try {
+      if (!isEdit) {
+        const nd = await req("POST", "/api/notes", { paper_id: paperId, content });
+        const nid = nd.id;
+        for (const img of newImages) {
+          await req("POST", "/api/notes/images", { note_id: nid, data: img.data, ext: img.ext });
+        }
+        await req("PUT", "/api/notes/layout", { id: nid, layout });
+        toast("已新增思考");
+      } else {
+        await req("PUT", "/api/notes", { id: note.id, content, images: newImages, flagged });
+        await req("PUT", "/api/notes/layout", { id: note.id, layout });
+        toast("已保存修改");
+      }
+      closeModal();
+      if (state._viewPaper) await openPaperView(state._viewPaper.id);
+      if (paperId && state._currentPaper && state._currentPaper.id === paperId) await refreshPaper(paperId);
+      else if (isEdit && state._currentPaper && state._currentPaper.id === note.paper_id) await refreshPaper(note.paper_id);
+    } catch (e) { toast(e.message, true); }
+  }
+
   function getDragAfterElement(container, y) {
     const els = [...container.querySelectorAll(".layout-block:not(.is-dragging)")];
+    return els.reduce((closest, child) => {
+      const box = child.getBoundingClientRect();
+      const offset = y - box.top - box.height / 2;
+      if (offset < 0 && offset > closest.offset) return { offset, element: child };
+      return closest;
+    }, { offset: Number.NEGATIVE_INFINITY }).element;
+  }
+
+  function getDragAfterSection(y) {
+    const els = [...document.querySelectorAll(".layout-section:not(.is-dragging)")];
     return els.reduce((closest, child) => {
       const box = child.getBoundingClientRect();
       const offset = y - box.top - box.height / 2;
@@ -2064,64 +2349,7 @@ function insertEditImage(blob, editor) {
 }
 
 function openNoteEditor(note) {
-  state.editImages = [];
-  let flagged = !!note.flagged;
-  openModal(`
-    <button class="icon-button" id="m-close" type="button" aria-label="关闭"><svg><use href="#i-close"/></svg></button>
-    <p class="eyebrow">EDIT NOTE</p>
-    <h3>编辑思考</h3>
-    <div class="note-editor" id="m-note-editor" contenteditable="true" data-placeholder="修改文字、删除截图、Ctrl+V 贴新图…">${renderNoteEditorContent(note)}</div>
-    <p class="field-help">支持修改文字、删除截图、粘贴新截图。</p>
-    <div style="display:flex; gap:10px; align-items:center; margin-top:16px;">
-      <button class="scan-button scan-button--ghost note-flag-btn ${flagged ? "is-active" : ""}" id="m-note-flag" type="button" title="标记：这条思考可能还没想透，待复查">
-        <svg style="width:13px;height:13px;"><use href="#i-flag"/></svg><span>${flagged ? "已标记" : "标记"}</span>
-      </button>
-      <div style="flex:1;"></div>
-      <button class="scan-button scan-button--ghost" id="m-note-cancel" type="button">取消</button>
-      <button class="scan-button" id="m-note-save" type="button">保存修改</button>
-    </div>`);
-
-  const editor = $("#m-note-editor");
-  editor.focus();
-
-  const flagBtn = $("#m-note-flag");
-  flagBtn.onclick = () => {
-    flagged = !flagged;
-    flagBtn.classList.toggle("is-active", flagged);
-    flagBtn.querySelector("span").textContent = flagged ? "已标记" : "标记";
-  };
-
-  editor.addEventListener("paste", (e) => {
-    const items = e.clipboardData && e.clipboardData.items;
-    if (!items) return;
-    for (const it of items) {
-      if (it.type.startsWith("image/")) {
-        e.preventDefault();
-        const blob = it.getAsFile();
-        insertEditImage(blob, editor);
-        return;
-      }
-    }
-  });
-
-  $("#m-close").onclick = closeModal;
-  $("#m-note-cancel").onclick = closeModal;
-  $("#m-note-save").onclick = async () => {
-    const { content, images } = serializeNoteEditor(editor);
-    const hasExistingImages = /\[\[existing-img:\d+\]\]/.test(content);
-    const textOnly = content.replace(/\[\[(?:existing-img:\d+|img:\d+)\]\]/g, "").trim();
-    if (!textOnly && images.length === 0 && !hasExistingImages) {
-      toast("内容为空，未保存");
-      return;
-    }
-    try {
-      await req("PUT", "/api/notes", { id: note.id, content, images, flagged });
-      toast("已保存修改");
-      closeModal();
-      if (state._viewPaper) await openPaperView(state._viewPaper.id);
-      if (state._currentPaper && state._currentPaper.id === note.paper_id) await refreshPaper(note.paper_id);
-    } catch (e) { toast(e.message, true); }
-  };
+  openNoteComposeEditor({ note });
 }
 
 /* ============ 弹窗 ============ */
