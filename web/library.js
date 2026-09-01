@@ -1751,17 +1751,74 @@ function bindArrangeDrag(card) {
   });
 }
 
-// 拖拽插入：把 dragKey 块移到 targetKey 块的前/后，列属性跟着块走
+// 模拟 CSS grid（2 列 + dense 回填）的实际放置，返回视觉行数组 [{c1, c2}]。
+// 注意：视觉行序 ≠ 数据顺序（dense 会让后序列的块回填到前面的空位），
+// 插入锚点必须按视觉行计算，否则会出现「拖到右上角下沿没反应」的错觉。
+function computeVisualRows(blocks) {
+  const rows = [];
+  const newRow = () => ({ c1: null, c2: null });
+  blocks.forEach(b => {
+    if (b.col === "full") {
+      let row = rows.find(r => !r.c1 && !r.c2); // full 需要整行空
+      if (!row) { row = newRow(); rows.push(row); }
+      row.c1 = row.c2 = b;
+    } else if (b.col === 1) {
+      let row = rows.find(r => !r.c1);
+      if (!row) { row = newRow(); rows.push(row); }
+      row.c1 = b;
+    } else {
+      let row = rows.find(r => !r.c2);
+      if (!row) { row = newRow(); rows.push(row); }
+      row.c2 = b;
+    }
+  });
+  return rows;
+}
+
+// 一行内按数据顺序最早的成员（插入锚点用）
+function visualRowAnchor(row) {
+  const members = [];
+  if (row.c1) members.push(row.c1);
+  if (row.c2 && row.c2 !== row.c1) members.push(row.c2);
+  members.sort((x, y) => x.order - y.order);
+  return members[0] || null;
+}
+
+// 拖拽插入：把 dragKey 块移到 targetKey 块所在「视觉行」的前/后，列属性跟着块走
 async function insertArrangeBlock(dragKey, targetKey, before, card) {
   const a = state.arrange;
   if (!a) return;
-  const from = a.blocks.findIndex(b => b.key === dragKey);
-  let to = a.blocks.findIndex(b => b.key === targetKey);
-  if (from < 0 || to < 0) return;
-  const [moved] = a.blocks.splice(from, 1);
-  if (from < to) to--; // 删除后目标索引前移
-  a.blocks.splice(before ? to : to + 1, 0, moved);
-  a.blocks.forEach((b, i) => { b.order = i; });
+  const blocks = a.blocks;
+  const from = blocks.findIndex(b => b.key === dragKey);
+  if (from < 0) return;
+  // 1. 模拟当前视觉行，找目标块在第几行
+  const rows = computeVisualRows(blocks);
+  let targetRowIdx = -1;
+  rows.forEach((r, i) => {
+    if ((r.c1 && r.c1.key === targetKey) || (r.c2 && r.c2.key === targetKey)) targetRowIdx = i;
+  });
+  if (targetRowIdx < 0) return;
+  // 2. 锚点：before → 目标行最早成员；after → 下一行最早成员（无则末尾）
+  let anchorKey = null;
+  if (before) {
+    const anchor = visualRowAnchor(rows[targetRowIdx]);
+    anchorKey = anchor ? anchor.key : null;
+  } else {
+    const next = rows[targetRowIdx + 1];
+    if (next) {
+      const anchor = visualRowAnchor(next);
+      anchorKey = anchor ? anchor.key : null;
+    }
+  }
+  // 3. 重排
+  const [moved] = blocks.splice(from, 1);
+  if (anchorKey == null) blocks.push(moved);
+  else {
+    const idx = blocks.findIndex(b => b.key === anchorKey);
+    if (idx < 0) blocks.push(moved);
+    else blocks.splice(idx, 0, moved);
+  }
+  blocks.forEach((b, i) => { b.order = i; });
   a.dirty = true;
   await applyArrangeAndSave(card);
 }
