@@ -28,11 +28,14 @@ if (-not (Test-Path -LiteralPath $venvPython)) {
     exit 1
 }
 
-# 若端口已被旧进程占用，先释放，避免用到旧代码（8040 专用于私人文献库）
-$occupied = Get-NetTCPConnection -LocalPort $Port -ErrorAction SilentlyContinue
+# 若端口被旧进程占用，先全部释放，避免用到旧代码（8040 专用于私人文献库）
+# 注意：可能残留多个实例叠在同一端口上，必须逐个杀干净
+$occupied = Get-NetTCPConnection -LocalPort $Port -State Listen -ErrorAction SilentlyContinue
 if ($occupied) {
-    $oldPid = $occupied.OwningProcess | Select-Object -First 1
-    try { Stop-Process -Id $oldPid -Force -ErrorAction SilentlyContinue } catch {}
+    $oldPids = $occupied | Select-Object -ExpandProperty OwningProcess -Unique
+    foreach ($oldPid in $oldPids) {
+        try { Stop-Process -Id $oldPid -Force -ErrorAction SilentlyContinue } catch {}
+    }
     Start-Sleep -Seconds 1
 }
 
