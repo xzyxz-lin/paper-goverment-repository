@@ -1622,7 +1622,11 @@ body.view-paper-view header.topbar > .topbar-actions { display: none !important;
   background: var(--white);
 }
 .layout-block__edit {
-  outline: none; min-height: 1.6em;
+  outline: none;
+  /* 最小高度给到 2 行：避免中文输入法拼音串撑宽→换行→块从 1 行涨到 2 行，
+     选候选字后缩回 1 行，造成打字时整个弹窗“一下变大一下变小”的抖动。
+     2 行高时拼音宽窄不再触发换行，故稳定。 */
+  min-height: 3.4em;
   font-size: .84rem; line-height: 1.55; color: var(--ink-900);
   white-space: pre-wrap; word-break: break-word;
   /* 写字区域内必须是文本光标，不能继承外层拖拽用的 grab（白色小手看不清） */
