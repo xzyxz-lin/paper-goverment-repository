@@ -1611,8 +1611,15 @@ body.view-paper-view header.topbar > .topbar-actions { display: none !important;
   outline: none; min-height: 1.6em;
   font-size: .84rem; line-height: 1.55; color: var(--ink-900);
   white-space: pre-wrap; word-break: break-word;
+  /* 写字区域内必须是文本光标，不能继承外层拖拽用的 grab（白色小手看不清） */
+  cursor: text;
+  caret-color: var(--ink-900);
 }
-.layout-block__edit:focus { background: rgba(31,91,87,.04); }
+.layout-block__edit:focus {
+  background: rgba(31,91,87,.07);
+  box-shadow: inset 0 0 0 1.5px rgba(31,91,87,.35);
+  border-radius: 3px;
+}
 .layout-block__text {
   color: var(--ink-900); font-size: .84rem; line-height: 1.5;
   white-space: pre-wrap; word-break: break-word;
