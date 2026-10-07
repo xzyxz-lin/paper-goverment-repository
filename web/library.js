@@ -55,6 +55,34 @@ function placeCaretAtEnd(el) {
   sel.addRange(range);
 }
 
+// 取光标在 contenteditable 内的字符偏移（用于重渲染后恢复位置）
+function getCaretOffset(el) {
+  const sel = window.getSelection();
+  if (!sel || !sel.rangeCount) return null;
+  const r = sel.getRangeAt(0).cloneRange();
+  r.selectNodeContents(el);
+  r.setEnd(sel.getRangeAt(0).endContainer, sel.getRangeAt(0).endOffset);
+  return r.toString().length;
+}
+
+// 按字符偏移把光标放回 contenteditable
+function setCaretOffset(el, offset) {
+  const sel = window.getSelection();
+  if (!sel) return;
+  let remaining = offset, target = null;
+  const walker = document.createTreeWalker(el, NodeFilter.SHOW_TEXT);
+  let cur;
+  while ((cur = walker.nextNode())) {
+    if (remaining <= cur.nodeValue.length) { target = cur; break; }
+    remaining -= cur.nodeValue.length;
+  }
+  const range = document.createRange();
+  if (target) { range.setStart(target, remaining); range.collapse(true); }
+  else { range.selectNodeContents(el); range.collapse(false); }
+  sel.removeAllRanges();
+  sel.addRange(range);
+}
+
 /* ============ 认证 ============ */
 let authMode = "login";
 
@@ -2104,6 +2132,14 @@ function openNoteComposeEditor(opts) {
   const newKey = (p) => p + (++composeImgSeq) + "_" + Math.random().toString(36).slice(2, 6);
 
   const render = () => {
+    // 防丢字：重渲染前必须把用户已经敲在输入框里的文字先同步回 sections，
+    // 否则贴图/换栏/新增一栏/增删块都会用旧数据覆盖输入（用户写的话不能被挤没！）
+    syncTextFromDOM();
+    // 记住当前焦点所在的文本块与光标位置，重渲染后恢复
+    const activeEl = document.activeElement;
+    const activeBlock = activeEl && activeEl.closest ? activeEl.closest(".layout-block__edit") : null;
+    const focusKey = activeBlock ? activeBlock.dataset.key : null;
+    const caret = activeBlock ? getCaretOffset(activeBlock) : null;
     const secHtml = sections.map(sec => sectionHtml(sec)).join("");
     openModal(`
       <button class="icon-button" id="m-close" type="button" aria-label="关闭"><svg><use href="#i-close"/></svg></button>
@@ -2155,6 +2191,15 @@ function openNoteComposeEditor(opts) {
       flagBtn.querySelector("span").textContent = flagged ? "已标记" : "标记";
     };
     $("#m-layout-save").onclick = () => saveCompose();
+    // 恢复焦点与光标位置（贴图/改栏等重渲染不打断输入）
+    if (focusKey) {
+      const el = document.querySelector(`.layout-block__edit[data-key="${CSS.escape(focusKey)}"]`);
+      if (el) {
+        el.focus();
+        if (caret != null) setCaretOffset(el, caret);
+        else placeCaretAtEnd(el);
+      }
+    }
     const modalBody = $("#modal");
     modalBody.onpaste = (e) => {
       if (!document.getElementById("layout-sections")) return;
@@ -2208,6 +2253,17 @@ function openNoteComposeEditor(opts) {
       if (!sec) return;
       sec.items.push({ key: newKey("n"), type: "image", data: b64, ext });
       render();
+    });
+  }
+
+  // 只把 DOM 里已输入的文字回写到 sections 对应的 text 块，
+  // 不重建结构（结构变动仍由各操作 handler 自己改 sections）。
+  function syncTextFromDOM() {
+    $$(".layout-block__edit").forEach(el => {
+      sections.forEach(s => {
+        const hit = s.items.find(b => b.key === el.dataset.key);
+        if (hit && hit.type === "text") hit.text = el.innerText;
+      });
     });
   }
 
