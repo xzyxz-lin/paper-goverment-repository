@@ -2221,12 +2221,14 @@ function openNoteComposeEditor(opts) {
     const blocksHtml = sec.items.map(b => {
       if (b.type === "text") {
         return `<div class="layout-block layout-block--text" draggable="true" data-key="${b.key}">
+          <span class="layout-block__grip" title="拖动排序">⠿</span>
           <div class="layout-block__edit" contenteditable="true" data-key="${b.key}">${esc(b.text).replace(/\n/g, "<br>")}</div>
           <button class="layout-block__del" data-key="${b.key}" type="button" title="删除此块">×</button>
         </div>`;
       }
       const src = b.data ? `data:image/${b.ext};base64,${b.data}` : `/assets/${encodeURI(b.rel_path)}`;
       return `<div class="layout-block layout-block--image" draggable="true" data-key="${b.key}">
+        <span class="layout-block__grip" title="拖动排序">⠿</span>
         <img src="${src}" alt="截图" loading="lazy">
         <button class="layout-block__del" data-key="${b.key}" type="button" title="删除此图">×</button>
       </div>`;

@@ -1593,14 +1593,25 @@ body.view-paper-view header.topbar > .topbar-actions { display: none !important;
 .layout-section__add:hover { background: rgba(31,91,87,.08); }
 .layout-block {
   position: relative;
-  padding: 10px 12px;
+  padding: 10px 12px 10px 24px;
   background: var(--white);
   border: 1px solid var(--paper-300);
   border-left: 3px solid var(--copper-500);
   border-radius: 3px;
-  cursor: grab;
+  /* 不用 grab：白色小手在白底上看不清，且会盖住写字框的 text 光标。
+     块仍可拖拽（draggable=true），拖拽手感由 .layout-block__grip 提供 */
+  cursor: default;
   transition: box-shadow .15s ease, transform .1s ease;
 }
+.layout-block__grip {
+  position: absolute; top: 8px; left: 5px;
+  width: 14px; height: 14px;
+  display: inline-flex; align-items: center; justify-content: center;
+  color: var(--paper-300); cursor: grab; user-select: none;
+  font-size: 13px; line-height: 1; opacity: .7;
+}
+.layout-block__grip:active { cursor: grabbing; }
+.layout-block:hover .layout-block__grip { opacity: 1; color: var(--paper-300); }
 .layout-block--text { border-left-color: var(--ink-700); }
 .layout-block--image { padding: 6px; background: var(--paper-100); }
 .layout-block--image img {

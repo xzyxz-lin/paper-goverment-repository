@@ -25,6 +25,7 @@ import secrets
 import shutil
 import sqlite3
 import subprocess
+import sys
 import threading
 import uuid
 from datetime import datetime, timedelta, timezone
@@ -38,9 +39,42 @@ PROJECT_DIR = APP_DIR.parent
 DB_PATH = PROJECT_DIR / "data" / "library.db"
 ASSET_DIR = PROJECT_DIR / "picture asset"
 DELETED_PATH = PROJECT_DIR / "data" / "deleted.json"
+LOCK_PATH = DB_PATH.parent / "library.lock"
 RECYCLE_RETENTION_DAYS = 7
 DB_PATH.parent.mkdir(parents=True, exist_ok=True)
 ASSET_DIR.mkdir(parents=True, exist_ok=True)
+
+
+# ===== 单实例锁 =====
+# 用 OS 级文件锁保证全局只有一个 library.py 进程在跑，从根上杜绝
+# 「双实例叠在同一端口」导致用户重启无效的问题。进程退出（含崩溃）锁自动释放。
+_LOCK_FD = None
+
+def acquire_single_instance_lock(lock_path: Path):
+    """尝试获取单实例文件锁。成功返回 fd（需在进程生命周期内保持打开），失败返回 None。"""
+    global _LOCK_FD
+    try:
+        fd = os.open(str(lock_path), os.O_CREAT | os.O_RDWR)
+    except OSError:
+        return None
+    try:
+        if os.name == "nt":
+            import msvcrt
+            msvcrt.locking(fd, msvcrt.LK_NBLCK, 1)
+        else:
+            import fcntl
+            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except OSError:
+        os.close(fd)
+        return None
+    _LOCK_FD = fd
+    try:
+        os.ftruncate(fd, 0)
+        os.write(fd, str(os.getpid()).encode())
+        os.lseek(fd, 0, 0)
+    except OSError:
+        pass
+    return fd
 
 
 # ===== 删除索引（仿照论文观察台：标记删除，非物理删除，可恢复）=====
@@ -2341,6 +2375,15 @@ def main():
     parser.add_argument("--host", default="0.0.0.0")
     parser.add_argument("--port", type=int, default=8040)
     args = parser.parse_args()
+
+    # 单实例：拿不到锁说明已有一个实例在跑，直接退出，绝不重复占用端口
+    if acquire_single_instance_lock(LOCK_PATH) is None:
+        print(
+            "私人文献库已在运行（单实例模式），本次启动自动取消，"
+            "如需重启请用桌面快捷方式或先结束旧进程。",
+            flush=True,
+        )
+        sys.exit(0)
 
     init_db()
     migrate_legacy_deleted_index()

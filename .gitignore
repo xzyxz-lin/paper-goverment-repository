@@ -9,6 +9,7 @@ data/library.db-*
 data/*.cfg
 data/deleted.json
 data/.translation_cache.json
+data/library.lock
 picture asset/
 
 # Workbuddy 本地运行状态
