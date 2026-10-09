@@ -2642,6 +2642,7 @@ function openPaperModal(existing) {
       <div class="form-row"><label>链接（可选）</label><input id="m-url" value="${esc(existing?.url || "")}"></div>
     </div>
     <div class="form-row"><label>本地 PDF 路径（可选，用于「打开论文」跳转）</label><input id="m-path" value="${esc(existing?.local_path || "")}" placeholder="D:\\科研\\课题A\\paper.pdf"><div class="field-help">指向你电脑里那篇真实 PDF 的完整路径，之后可一键打开。</div></div>
+    <div id="m-path-cands"></div>
     <button class="scan-button" id="m-save" type="button"><span>${isEdit ? "保存修改" : "保存论文"}</span></button>`);
 
   $("#m-close").onclick = closeModal;
@@ -2735,16 +2736,34 @@ async function handlePdfFile(file) {
     if (meta.authors) $("#m-authors").value = meta.authors;
     if (meta.publish_date) $("#m-date").value = meta.publish_date;
     if (meta.doi) $("#m-doi").value = meta.doi;
-    // 自动定位本地路径：按文件名在论文目录搜索同名 PDF
+    // 自动定位本地路径：按文件名在论文目录搜索同名 PDF。
+    // 多个同名时不许静默取第一个——必须让用户挑（否则会绑到专利材料等错误位置）。
     try {
       const fl = await req("POST", "/api/find_local", { filename: file.name });
-      if (fl.paths && fl.paths.length) {
-        $("#m-path").value = fl.paths[0];
-        sub.textContent = fl.paths.length > 1
-          ? `已自动提取，并定位到本地文件（共找到 ${fl.paths.length} 个同名，已取第一个，可改）`
-          : "已自动提取，并已定位到本地文件路径";
+      const cands = fl.paths || [];
+      const candsBox = $("#m-path-cands");
+      if (cands.length === 1) {
+        $("#m-path").value = cands[0].path;
+        sub.textContent = "已自动提取，并定位到本地文件路径";
+        if (candsBox) candsBox.innerHTML = "";
+      } else if (cands.length > 1) {
+        const fmtSize = (n) => n >= 1024 * 1024 ? (n / 1024 / 1024).toFixed(2) + " MB" : (n / 1024).toFixed(0) + " KB";
+        $("#m-path").value = "";
+        sub.textContent = `已自动提取；发现 ${cands.length} 个同名 PDF，请在下方选择实际位置`;
+        if (candsBox) {
+          candsBox.innerHTML = `
+            <div class="form-row"><label>发现 ${cands.length} 个同名 PDF，请选择实际位置（必选）</label>
+              <select id="m-path-pick" style="width:100%;min-height:36px;padding:4px 8px;font:500 .84rem var(--font-data);color:var(--ink-900);background:white;border:1px solid var(--paper-300);border-radius:3px;box-sizing:border-box;">
+                <option value="">— 请选择 —</option>
+                ${cands.map((c, i) => `<option value="${esc(c.path)}">${i + 1}. ${esc(c.path.replace(/^[A-Za-z]:\\/, ""))}（${fmtSize(c.size || 0)}，${esc(c.modified || "未知时间")}）</option>`).join("")}
+              </select>
+              <div class="field-help">同名文件出现在多个位置（如论文目录和专利材料目录），选错会导致「打开所在文件夹」跳错地方。</div>
+            </div>`;
+          $("#m-path-pick").onchange = () => { $("#m-path").value = $("#m-path-pick").value; };
+        }
       } else {
         sub.textContent = "已自动提取，但未在论文目录找到同名文件，本地路径需手动填写";
+        if (candsBox) candsBox.innerHTML = "";
       }
     } catch (e2) {
       sub.textContent = "已自动提取，请核对后保存";

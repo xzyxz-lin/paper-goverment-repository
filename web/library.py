@@ -1389,6 +1389,15 @@ DEFAULT_SEARCH_DIRS = [
 ]
 
 
+def _clean_local_path(raw: str) -> str:
+    """清洗本地路径：去首尾空白与成对引号。
+    用户常从资源管理器「复制文件地址」粘贴，结果带一对双引号，导致 os.path.exists 永远 False。"""
+    p = (raw or "").strip()
+    while len(p) >= 2 and p[0] == p[-1] and p[0] in ('"', "'"):
+        p = p[1:-1].strip()
+    return p
+
+
 def _search_dirs() -> list[str]:
     """读取搜索目录配置（data/search_dirs.json），缺省用默认目录。"""
     if SEARCH_DIRS_PATH.exists():
@@ -1401,14 +1410,15 @@ def _search_dirs() -> list[str]:
     return DEFAULT_SEARCH_DIRS
 
 
-def find_local_pdf(filename: str) -> list[str]:
-    """按文件名在搜索目录里递归查找本地 PDF，返回完整路径列表（最多 20 个）。"""
+def find_local_pdf(filename: str) -> list[dict]:
+    """按文件名在搜索目录里递归查找本地 PDF。
+    返回 [{path, size, modified}]（最多 20 个），供前端在多个同名时让用户挑选。"""
     filename = (filename or "").strip()
     if not filename:
         return []
     target = filename.lower()
     base = re.sub(r"\.pdf$", "", filename, flags=re.I).lower()
-    matches: list[str] = []
+    matches: list[dict] = []
     for root_dir in _search_dirs():
         root_dir = (root_dir or "").strip()
         if not root_dir or not os.path.isdir(root_dir):
@@ -1424,7 +1434,16 @@ def find_local_pdf(filename: str) -> list[str]:
                 if not fl.endswith(".pdf"):
                     continue
                 if fl == target or re.sub(r"\.pdf$", "", fl) == base:
-                    matches.append(os.path.join(dirpath, fn))
+                    full = os.path.join(dirpath, fn)
+                    try:
+                        st = os.stat(full)
+                        matches.append({
+                            "path": full,
+                            "size": st.st_size,
+                            "modified": datetime.fromtimestamp(st.st_mtime).strftime("%Y-%m-%d %H:%M"),
+                        })
+                    except OSError:
+                        matches.append({"path": full, "size": 0, "modified": ""})
                     if len(matches) >= 20:
                         return matches
     return matches
@@ -1985,7 +2004,7 @@ class Handler(BaseHTTPRequestHandler):
                         body.get("publish_date", "").strip(),
                         body.get("doi", "").strip(),
                         body.get("url", "").strip(),
-                        body.get("local_path", "").strip(),
+                        _clean_local_path(body.get("local_path", "")),
                         now_iso(),
                     ),
                 )
@@ -2167,7 +2186,7 @@ class Handler(BaseHTTPRequestHandler):
                         body.get("publish_date", "").strip(),
                         body.get("doi", "").strip(),
                         body.get("url", "").strip(),
-                        body.get("local_path", "").strip(),
+                        _clean_local_path(body.get("local_path", "")),
                         pid,
                         uid,
                     ),
