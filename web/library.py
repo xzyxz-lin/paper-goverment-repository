@@ -899,6 +899,30 @@ def init_db() -> None:
         );
         CREATE INDEX IF NOT EXISTS idx_recycle_item_user_expiry
             ON recycle_item(user_id, expires_at);
+        -- 观点库：全局一套树（用户级，不隶属于项目）
+        -- kind: topic=顶层观点 / folder=文件夹 / file=叶子"文件"（打开后是条目编辑器）
+        CREATE TABLE IF NOT EXISTS topic_node (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            user_id INTEGER NOT NULL REFERENCES user(id) ON DELETE CASCADE,
+            parent_id INTEGER REFERENCES topic_node(id) ON DELETE CASCADE,
+            kind TEXT NOT NULL CHECK(kind IN ('topic','folder','file')),
+            name TEXT NOT NULL,
+            sort_order INTEGER DEFAULT 0,
+            created_at TEXT NOT NULL
+        );
+        CREATE INDEX IF NOT EXISTS idx_topic_node_user ON topic_node(user_id, parent_id);
+        -- 论文放置位置：一篇论文可被多个项目共享（同一条记录，不重复导入）
+        CREATE TABLE IF NOT EXISTS paper_placement (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            paper_id INTEGER NOT NULL REFERENCES paper(id) ON DELETE CASCADE,
+            project_id INTEGER NOT NULL REFERENCES project(id) ON DELETE CASCADE,
+            folder_id INTEGER NOT NULL REFERENCES folder(id) ON DELETE CASCADE,
+            is_primary INTEGER NOT NULL DEFAULT 0,
+            created_at TEXT NOT NULL,
+            UNIQUE(paper_id, folder_id)
+        );
+        CREATE INDEX IF NOT EXISTS idx_placement_project ON paper_placement(project_id);
+        CREATE INDEX IF NOT EXISTS idx_placement_paper ON paper_placement(paper_id);
         """
     )
     conn.commit()
@@ -906,6 +930,11 @@ def init_db() -> None:
     _migrate_note_version_image_ids(conn)
     _migrate_note_flagged(conn)
     _migrate_note_layout(conn)
+    _migrate_note_topic_file(conn)
+    _migrate_paper_placement_backfill(conn)
+    # 注意：Python sqlite3 只对 INSERT/UPDATE/DELETE 开启隐式事务，DDL(ALTER TABLE) 走自动提交。
+    # 因此像「回填放置位置」这类 INSERT 必须显式提交，否则进程退出即回滚。
+    conn.commit()
 
 
 def _migrate_note_flagged(conn: sqlite3.Connection) -> None:
@@ -926,6 +955,42 @@ def _migrate_note_layout(conn: sqlite3.Connection) -> None:
     cols = {r[1] for r in conn.execute("PRAGMA table_info(note)")}
     if "layout_json" not in cols:
         conn.execute("ALTER TABLE note ADD COLUMN layout_json TEXT DEFAULT '{}'")
+
+
+def _migrate_note_topic_file(conn: sqlite3.Connection) -> None:
+    """为 note 表补 topic_file_id 列：条目归属哪个观点"文件"。
+
+    单一归属：一条条目最多属于一个观点文件；NULL 表示"游民"（未归属任何观点）。
+    现有历史标注该列默认为 NULL，自动成为游民，无需删改任何数据。
+    """
+    cur = conn.execute("SELECT name FROM sqlite_master WHERE type='table' AND name='note'")
+    if not cur.fetchone():
+        return
+    cols = {r[1] for r in conn.execute("PRAGMA table_info(note)")}
+    if "topic_file_id" not in cols:
+        conn.execute("ALTER TABLE note ADD COLUMN topic_file_id INTEGER REFERENCES topic_node(id) ON DELETE SET NULL")
+
+
+def _migrate_paper_placement_backfill(conn: sqlite3.Connection) -> None:
+    """把现有论文按其 folder_id 回填为"主放置位置"。
+
+    paper.folder_id 仍保留作主位置，paper_placement 统一管理一篇论文出现在哪些项目/文件夹，
+    从而实现跨项目共享（同一条论文记录，不重复导入）。
+    """
+    cur = conn.execute("SELECT name FROM sqlite_master WHERE type='table' AND name='paper_placement'")
+    if not cur.fetchone():
+        return
+    rows = conn.execute(
+        """SELECT p.id AS pid, p.folder_id AS fid, f.project_id AS proj, p.created_at AS ts
+             FROM paper p JOIN folder f ON f.id = p.folder_id"""
+    ).fetchall()
+    for r in rows:
+        conn.execute(
+            """INSERT OR IGNORE INTO paper_placement
+               (paper_id, project_id, folder_id, is_primary, created_at)
+               VALUES (?,?,?,1,?)""",
+            (r["pid"], r["proj"], r["fid"], r["ts"] or now_iso()),
+        )
 
 
 def _parse_layout_json(layout_json):
@@ -1041,6 +1106,15 @@ def hash_password(password: str, salt: str | None = None) -> tuple[str, str]:
 
 def row_to_dict(row: sqlite3.Row | None) -> dict | None:
     return dict(row) if row is not None else None
+
+
+def norm_title(s: str | None) -> str:
+    """标题归一化：去掉标点/空格并小写，用于判断两篇是不是同一篇。
+    PDF 提取出来的标题常带换行、连字符、全半角差异，直接字符串比对会漏判。"""
+    return re.sub(r"[^0-9a-z\u4e00-\u9fff]", "", (s or "").lower())
+
+
+FUZZY_TITLE_PREFIX = 25  # 归一化后前 N 个字符一致即判为「疑似重复」
 
 
 # ===== 会话 token（持久化到 SQLite，重启不丢登录） =====
@@ -1536,6 +1610,61 @@ def asset_response(handler, rel_path: str) -> None:
     handler.wfile.write(body)
 
 
+def build_topic_tree(uid: int) -> list:
+    """构建用户的全局观点树（观点 → 文件夹 → 文件）。
+
+    全局一套，不隶属于项目。每个节点带 entry_count（含子孙的条目总数）。
+    """
+    conn = get_db()
+    rows = conn.execute(
+        "SELECT * FROM topic_node WHERE user_id = ? ORDER BY sort_order, id", (uid,)
+    ).fetchall()
+    nodes = {}
+    for r in rows:
+        d = dict(r)
+        d["children"] = []
+        nodes[d["id"]] = d
+    roots = []
+    for d in nodes.values():
+        pid = d.get("parent_id")
+        if pid and pid in nodes:
+            nodes[pid]["children"].append(d)
+        else:
+            roots.append(d)
+    own_counts = {}
+    for d in nodes.values():
+        if d["kind"] == "file":
+            own_counts[d["id"]] = conn.execute(
+                "SELECT COUNT(*) c FROM note WHERE topic_file_id = ?", (d["id"],)
+            ).fetchone()["c"]
+
+    def rollup(n):
+        total = own_counts.get(n["id"], 0)
+        for ch in n["children"]:
+            total += rollup(ch)
+        n["entry_count"] = total
+        return total
+
+    for r in roots:
+        rollup(r)
+    return roots
+
+
+def topic_path_name(conn, node_id) -> str:
+    """观点节点的完整路径名，如「操作参数 / 压力操作」。"""
+    parts = []
+    cur_id = node_id
+    guard = 0
+    while cur_id and guard < 50:
+        r = conn.execute("SELECT id, parent_id, name FROM topic_node WHERE id = ?", (cur_id,)).fetchone()
+        if not r:
+            break
+        parts.append(r["name"])
+        cur_id = r["parent_id"]
+        guard += 1
+    return " / ".join(reversed(parts))
+
+
 class Handler(BaseHTTPRequestHandler):
     def log_message(self, fmt, *args):
         pass
@@ -1629,6 +1758,140 @@ class Handler(BaseHTTPRequestHandler):
                     self._error(404, "项目已移入回收站")
                     return
                 json_response(self, {"folders": build_folder_tree(pid)})
+            elif path == "/api/topics/tree":
+                uid = require_user(self)
+                if not uid:
+                    self._error(401, "未登录")
+                    return
+                json_response(self, {"topics": build_topic_tree(uid)})
+            elif path == "/api/topics/file":
+                # 观点"文件"节点详情：返回该观点文件下的所有条目（含来源论文信息）
+                uid = require_user(self)
+                if not uid:
+                    self._error(401, "未登录")
+                    return
+                nid_raw = (qs.get("id") or [None])[0]
+                if not nid_raw:
+                    self._error(400, "缺少 id")
+                    return
+                nid = int(nid_raw)
+                conn = get_db()
+                node = conn.execute(
+                    "SELECT * FROM topic_node WHERE id = ? AND user_id = ?", (nid, uid)
+                ).fetchone()
+                if not node:
+                    self._error(404, "观点文件不存在")
+                    return
+                if node["kind"] != "file":
+                    self._error(400, "该节点不是观点「文件」")
+                    return
+                d = dict(node)
+                d["path_name"] = topic_path_name(conn, nid)
+                entries = []
+                note_filter, note_params = _deleted_filter_clause("notes", "n")
+                for n in conn.execute(
+                    f"SELECT n.* FROM note n WHERE n.topic_file_id = ?{note_filter} ORDER BY n.id",
+                    (nid, *note_params),
+                ).fetchall():
+                    nd = dict(n)
+                    nd["images"] = [dict(i) for i in conn.execute(
+                        "SELECT * FROM image WHERE note_id = ? ORDER BY id", (n["id"],)
+                    ).fetchall()]
+                    nd["layout"] = _parse_layout_json(nd.get("layout_json"))
+                    p = conn.execute(
+                        "SELECT id, title_en, title_zh, journal FROM paper WHERE id = ?", (n["paper_id"],)
+                    ).fetchone()
+                    nd["paper"] = dict(p) if p else None
+                    entries.append(nd)
+                d["notes"] = entries
+                json_response(self, {"file": d})
+            elif path == "/api/papers/search":
+                # 供观点视图选择「来源文献」：按项目/文件夹层级返回库内论文
+                uid = require_user(self)
+                if not uid:
+                    self._error(401, "未登录")
+                    return
+                q = (qs.get("q") or [""])[0]
+                conn = get_db()
+                deleted = load_deleted()
+                conds = ["pr.user_id = ?"]
+                params: list = [uid]
+                if q:
+                    conds.append("(pa.title_en LIKE ? OR pa.title_zh LIKE ? OR pa.journal LIKE ? OR pa.authors LIKE ?)")
+                    like = f"%{q}%"
+                    params += [like, like, like, like]
+                dp = list(deleted.get("papers", []))
+                if dp:
+                    conds.append("pa.id NOT IN ({})".format(",".join("?" for _ in dp)))
+                    params += dp
+                df = list(deleted.get("folders", []))
+                if df:
+                    conds.append("f.id NOT IN ({})".format(",".join("?" for _ in df)))
+                    params += df
+                dproj = list(deleted.get("projects", []))
+                if dproj:
+                    conds.append("pr.id NOT IN ({})".format(",".join("?" for _ in dproj)))
+                    params += dproj
+                rows = conn.execute(
+                    f"""SELECT pa.id, pa.title_en, pa.title_zh, pa.journal, pa.folder_id,
+                               f.name AS folder_name, pr.id AS project_id, pr.name AS project_name
+                        FROM paper pa
+                        JOIN folder f ON f.id = pa.folder_id
+                        JOIN project pr ON pr.id = f.project_id
+                        WHERE {' AND '.join(conds)}
+                        ORDER BY pr.name, pa.id DESC LIMIT 300""",
+                    params,
+                ).fetchall()
+                json_response(self, {"papers": [dict(r) for r in rows]})
+            elif path == "/api/papers/duplicates":
+                # 找出库内重复论文：优先按 DOI 分组，无 DOI 则按标题分组
+                uid = require_user(self)
+                if not uid:
+                    self._error(401, "未登录")
+                    return
+                conn = get_db()
+                deleted = load_deleted()
+                dp = set(deleted.get("papers", []))
+                df = set(deleted.get("folders", []))
+                dproj = set(deleted.get("projects", []))
+                rows = conn.execute(
+                    """SELECT pa.id, pa.title_en, pa.title_zh, pa.journal, pa.doi, pa.folder_id,
+                              pa.created_at, f.name AS folder_name, pr.id AS project_id,
+                              pr.name AS project_name
+                       FROM paper pa
+                       JOIN folder f ON f.id = pa.folder_id
+                       JOIN project pr ON pr.id = f.project_id
+                       WHERE pr.user_id = ? ORDER BY pa.id""", (uid,)
+                ).fetchall()
+                nfilter, nparams = _deleted_filter_clause("notes", "n")
+                groups: dict = {}
+                for r in rows:
+                    if r["id"] in dp or r["folder_id"] in df or r["project_id"] in dproj:
+                        continue
+                    key = (r["doi"] or "").strip().lower()
+                    if not key:
+                        key = norm_title(r["title_en"] or r["title_zh"])
+                    if not key:
+                        continue
+                    item = dict(r)
+                    item["note_count"] = conn.execute(
+                        "SELECT COUNT(*) c FROM note n WHERE n.paper_id = ?" + nfilter,
+                        [r["id"]] + nparams,
+                    ).fetchone()["c"]
+                    groups.setdefault(key, []).append(item)
+                out = []
+                for key, items in groups.items():
+                    if len(items) < 2:
+                        continue
+                    out.append({
+                        "key": key,
+                        "title": items[0]["title_zh"] or items[0]["title_en"] or "(无标题)",
+                        "doi": items[0]["doi"] or "",
+                        "total_notes": sum(i["note_count"] for i in items),
+                        "papers": items,
+                    })
+                out.sort(key=lambda g: -g["total_notes"])
+                json_response(self, {"groups": out})
             elif path == "/api/papers":
                 uid = require_user(self)
                 if not uid:
@@ -1647,8 +1910,13 @@ class Handler(BaseHTTPRequestHandler):
                 conds = ["pr.user_id = ?"]
                 params: list = [uid]
                 if fid:
-                    conds.append("pa.folder_id = ?")
-                    params.append(int(fid))
+                    # 既包含「原生属于该文件夹」的论文，也包含「从别处共享过来」的论文（paper_placement）
+                    # 二者用 OR + EXISTS 过滤，而不是 JOIN，避免同一篇被列出两次。
+                    conds.append(
+                        "(pa.folder_id = ? OR EXISTS ("
+                        "SELECT 1 FROM paper_placement pp WHERE pp.paper_id = pa.id AND pp.folder_id = ?))"
+                    )
+                    params += [int(fid), int(fid)]
                 if q:
                     conds.append("(pa.title_en LIKE ? OR pa.title_zh LIKE ? OR pa.authors LIKE ? OR pa.journal LIKE ?)")
                     like = f"%{q}%"
@@ -1716,15 +1984,33 @@ class Handler(BaseHTTPRequestHandler):
                 d = dict(r)
                 d["notes"] = []
                 note_filter, note_params = _deleted_filter_clause("notes", "n")
+                # 有观点归属的条目按「所属观点文件的创建时间」排序在前，游民（未归属）排在后面
                 for n in conn.execute(
-                    f"SELECT n.* FROM note n WHERE n.paper_id = ?{note_filter} ORDER BY n.id", (pid, *note_params)
+                    f"""SELECT n.*, tn.name AS topic_name, tn.created_at AS topic_created_at
+                        FROM note n
+                        LEFT JOIN topic_node tn ON tn.id = n.topic_file_id
+                        WHERE n.paper_id = ?{note_filter}
+                        ORDER BY (n.topic_file_id IS NULL), tn.created_at, n.id""",
+                    (pid, *note_params),
                 ).fetchall():
                     nd = dict(n)
                     nd["images"] = [dict(i) for i in conn.execute(
                         "SELECT * FROM image WHERE note_id = ? ORDER BY id", (n["id"],)
                     ).fetchall()]
                     nd["layout"] = _parse_layout_json(nd.get("layout_json"))
+                    nd["topic_path"] = topic_path_name(conn, nd["topic_file_id"]) if nd.get("topic_file_id") else ""
                     d["notes"].append(nd)
+                # 本篇论文被哪些观点引用（论文视图顶部展示「被 N 个观点引用」）
+                refs = []
+                for t in conn.execute(
+                    """SELECT n.topic_file_id AS file_id, COUNT(*) AS c
+                       FROM note n WHERE n.paper_id = ? AND n.topic_file_id IS NOT NULL
+                       GROUP BY n.topic_file_id ORDER BY n.topic_file_id""", (pid,)
+                ).fetchall():
+                    td = dict(t)
+                    td["path"] = topic_path_name(conn, td["file_id"])
+                    refs.append(td)
+                d["topic_refs"] = refs
                 json_response(self, {"paper": d})
 
             elif path == "/api/images":
@@ -2039,6 +2325,229 @@ class Handler(BaseHTTPRequestHandler):
                 filename = (body.get("filename") or "").strip()
                 paths = find_local_pdf(filename)
                 json_response(self, {"ok": True, "paths": paths})
+            elif path == "/api/topic_nodes":
+                # 新建观点树节点：topic=顶层观点 / folder=文件夹 / file=叶子文件
+                uid = require_user(self)
+                if not uid:
+                    self._error(401, "未登录")
+                    return
+                body = _read_json_body(self)
+                kind = body.get("kind", "folder")
+                name = (body.get("name") or "").strip()
+                parent_id = body.get("parent_id")
+                if kind not in ("topic", "folder", "file"):
+                    self._error(400, "节点类型不合法")
+                    return
+                if not name:
+                    self._error(400, "名称不能为空")
+                    return
+                conn = get_db()
+                if parent_id:
+                    p = conn.execute(
+                        "SELECT id FROM topic_node WHERE id = ? AND user_id = ?", (int(parent_id), uid)
+                    ).fetchone()
+                    if not p:
+                        self._error(404, "父节点不存在")
+                        return
+                cur = conn.execute(
+                    """INSERT INTO topic_node (user_id, parent_id, kind, name, sort_order, created_at)
+                       VALUES (?,?,?,?,?,?)""",
+                    (uid, int(parent_id) if parent_id else None, kind, name,
+                     int(body.get("sort_order") or 0), now_iso()),
+                )
+                conn.commit()
+                json_response(self, {"ok": True, "id": cur.lastrowid})
+            elif path == "/api/notes/assign":
+                # 条目归属操作：绑定 / 移动到另一观点文件 / 清除（变游民）
+                # topic_file_id 传 null 即清除归属
+                uid = require_user(self)
+                if not uid:
+                    self._error(401, "未登录")
+                    return
+                body = _read_json_body(self)
+                note_id = int(body.get("note_id"))
+                topic_file_id = body.get("topic_file_id")
+                conn = get_db()
+                n = conn.execute(
+                    """SELECT n.id FROM note n
+                       JOIN paper p ON p.id = n.paper_id
+                       JOIN folder f ON f.id = p.folder_id
+                       JOIN project pr ON pr.id = f.project_id
+                       WHERE n.id = ? AND pr.user_id = ?""", (note_id, uid)
+                ).fetchone()
+                if not n:
+                    self._error(404, "条目不存在")
+                    return
+                if topic_file_id:
+                    t = conn.execute(
+                        "SELECT id, kind FROM topic_node WHERE id = ? AND user_id = ?",
+                        (int(topic_file_id), uid),
+                    ).fetchone()
+                    if not t:
+                        self._error(404, "观点文件不存在")
+                        return
+                    if t["kind"] != "file":
+                        self._error(400, "只能归属到观点下的「文件」节点")
+                        return
+                    conn.execute("UPDATE note SET topic_file_id = ? WHERE id = ?", (int(topic_file_id), note_id))
+                else:
+                    conn.execute("UPDATE note SET topic_file_id = NULL WHERE id = ?", (note_id,))
+                conn.commit()
+                json_response(self, {"ok": True})
+            elif path == "/api/papers/share":
+                # 把库内已有论文共享到另一个项目的文件夹（同一条记录，不重复导入）
+                uid = require_user(self)
+                if not uid:
+                    self._error(401, "未登录")
+                    return
+                body = _read_json_body(self)
+                paper_id = int(body.get("paper_id"))
+                folder_id = int(body.get("folder_id"))
+                conn = get_db()
+                p = conn.execute(
+                    """SELECT pa.id FROM paper pa
+                       JOIN folder f0 ON f0.id = pa.folder_id
+                       JOIN project pr0 ON pr0.id = f0.project_id
+                       WHERE pa.id = ? AND pr0.user_id = ?""", (paper_id, uid)
+                ).fetchone()
+                if not p:
+                    self._error(404, "论文不存在")
+                    return
+                f = conn.execute(
+                    """SELECT f.id, f.project_id FROM folder f
+                       JOIN project pr ON pr.id = f.project_id
+                       WHERE f.id = ? AND pr.user_id = ?""", (folder_id, uid)
+                ).fetchone()
+                if not f:
+                    self._error(404, "目标文件夹不存在")
+                    return
+                conn.execute(
+                    """INSERT OR IGNORE INTO paper_placement
+                       (paper_id, project_id, folder_id, is_primary, created_at)
+                       VALUES (?,?,?,0,?)""",
+                    (paper_id, f["project_id"], folder_id, now_iso()),
+                )
+                conn.commit()
+                json_response(self, {"ok": True})
+            elif path == "/api/papers/merge":
+                # 合并重复论文：把 merge_ids 的标注与放置位置并入 keep_id，被合并者进回收站（7天可恢复）
+                uid = require_user(self)
+                if not uid:
+                    self._error(401, "未登录")
+                    return
+                body = _read_json_body(self)
+                keep_id = int(body.get("keep_id"))
+                merge_ids = [int(x) for x in (body.get("merge_ids") or []) if int(x) != keep_id]
+                if not merge_ids:
+                    self._error(400, "没有需要合并的论文")
+                    return
+                conn = get_db()
+                ok = conn.execute(
+                    """SELECT pa.id FROM paper pa
+                       JOIN folder f ON f.id = pa.folder_id
+                       JOIN project pj ON pj.id = f.project_id
+                       WHERE pa.id = ? AND pj.user_id = ?""", (keep_id, uid)
+                ).fetchone()
+                if not ok:
+                    self._error(404, "保留的论文不存在")
+                    return
+                moved_notes = 0
+                for mid in merge_ids:
+                    own = conn.execute(
+                        """SELECT pa.id FROM paper pa
+                           JOIN folder f ON f.id = pa.folder_id
+                           JOIN project pj ON pj.id = f.project_id
+                           WHERE pa.id = ? AND pj.user_id = ?""", (mid, uid)
+                    ).fetchone()
+                    if not own:
+                        continue
+                    c = conn.execute("UPDATE note SET paper_id = ? WHERE paper_id = ?", (keep_id, mid))
+                    moved_notes += c.rowcount or 0
+                    conn.execute(
+                        """INSERT OR IGNORE INTO paper_placement
+                           (paper_id, project_id, folder_id, is_primary, created_at)
+                           SELECT ?, project_id, folder_id, 0, ? FROM paper_placement WHERE paper_id = ?""",
+                        (keep_id, now_iso(), mid),
+                    )
+                    conn.execute("DELETE FROM paper_placement WHERE paper_id = ?", (mid,))
+                    move_to_recycle(uid, "paper", [mid])
+                conn.commit()
+                json_response(self, {"ok": True, "moved_notes": moved_notes, "merged": len(merge_ids)})
+            elif path == "/api/papers/check_duplicate":
+                # 导入前查重：先按 DOI 精确匹配，再按标题匹配
+                uid = require_user(self)
+                if not uid:
+                    self._error(401, "未登录")
+                    return
+                body = _read_json_body(self)
+                doi = (body.get("doi") or "").strip().lower()
+                title = (body.get("title") or "").strip().lower()
+                conn = get_db()
+                deleted = load_deleted()
+                dp = set(deleted.get("papers", []))
+                df = set(deleted.get("folders", []))
+                dproj = set(deleted.get("projects", []))
+                nfilter, nparams = _deleted_filter_clause("notes", "n")
+                base = """SELECT pa.id, pa.title_en, pa.title_zh, pa.journal, pa.folder_id, pa.doi,
+                                  pa.created_at, f.name AS folder_name, pr.name AS project_name,
+                                  pr.id AS project_id
+                           FROM paper pa
+                           JOIN folder f ON f.id = pa.folder_id
+                           JOIN project pr ON pr.id = f.project_id
+                           WHERE pr.user_id = ?"""
+                hits = []
+                if doi:
+                    hits = [dict(r) for r in conn.execute(base + " AND LOWER(pa.doi) = ?", (uid, doi)).fetchall()]
+                if not hits and title:
+                    for col in ("title_en", "title_zh"):
+                        hits = [dict(r) for r in conn.execute(
+                            base + f" AND LOWER(pa.{col}) = ?", (uid, title)).fetchall()]
+                        if hits:
+                            break
+                def _alive(h: dict) -> bool:
+                    return h["id"] not in dp and h["folder_id"] not in df and h["project_id"] not in dproj
+
+                def _attach(rows_: list[dict], match: str) -> list[dict]:
+                    out = []
+                    for h in rows_:
+                        h["match"] = match
+                        h["note_count"] = conn.execute(
+                            "SELECT COUNT(*) c FROM note n WHERE n.paper_id = ?" + nfilter,
+                            [h["id"]] + nparams,
+                        ).fetchone()["c"]
+                        out.append(h)
+                    return out
+
+                hits = [h for h in hits if _alive(h)]
+                if hits:
+                    json_response(self, {"duplicates": _attach(hits, "doi" if doi else "title")})
+                    return
+                # 兜底：归一化标题前 N 字符一致 —— PDF 解析出的标题常被截断或带多余标点
+                nt = norm_title(title)
+                if len(nt) >= FUZZY_TITLE_PREFIX:
+                    prefix = nt[:FUZZY_TITLE_PREFIX]
+                    fuzzy = []
+                    for r in conn.execute(
+                        """SELECT pa.id, pa.title_en, pa.title_zh, pa.journal, pa.folder_id, pa.doi,
+                                  pa.created_at, f.name AS folder_name, pr.name AS project_name,
+                                  pr.id AS project_id
+                           FROM paper pa
+                           JOIN folder f ON f.id = pa.folder_id
+                           JOIN project pr ON pr.id = f.project_id
+                           WHERE pr.user_id = ?""", (uid,)
+                    ).fetchall():
+                        h = dict(r)
+                        if not _alive(h):
+                            continue
+                        for col in ("title_en", "title_zh"):
+                            other = norm_title(h.get(col))
+                            if len(other) >= FUZZY_TITLE_PREFIX and other.startswith(prefix):
+                                fuzzy.append(h)
+                                break
+                    if fuzzy:
+                        json_response(self, {"duplicates": _attach(fuzzy, "fuzzy")})
+                        return
+                json_response(self, {"duplicates": []})
             elif path == "/api/notes":
                 uid = require_user(self)
                 if not uid:
@@ -2048,9 +2557,34 @@ class Handler(BaseHTTPRequestHandler):
                 paper_id = int(body.get("paper_id"))
                 content = body.get("content", "")
                 conn = get_db()
+                # 来源文献必须存在且属于本人（观点视图里建条目也强制绑定，保证条条可追溯）
+                pr = conn.execute(
+                    """SELECT pa.id FROM paper pa
+                       JOIN folder f ON f.id = pa.folder_id
+                       JOIN project pj ON pj.id = f.project_id
+                       WHERE pa.id = ? AND pj.user_id = ?""", (paper_id, uid)
+                ).fetchone()
+                if not pr:
+                    self._error(404, "来源论文不存在")
+                    return
+                topic_file_id = body.get("topic_file_id")
+                if topic_file_id:
+                    t = conn.execute(
+                        "SELECT id, kind FROM topic_node WHERE id = ? AND user_id = ?",
+                        (int(topic_file_id), uid),
+                    ).fetchone()
+                    if not t:
+                        self._error(404, "观点文件不存在")
+                        return
+                    if t["kind"] != "file":
+                        self._error(400, "只能归属到观点下的「文件」节点")
+                        return
+                    topic_file_id = int(topic_file_id)
+                else:
+                    topic_file_id = None
                 cur = conn.execute(
-                    "INSERT INTO note (paper_id, content, created_at) VALUES (?,?,?)",
-                    (paper_id, content, now_iso()),
+                    "INSERT INTO note (paper_id, content, created_at, topic_file_id) VALUES (?,?,?,?)",
+                    (paper_id, content, now_iso(), topic_file_id),
                 )
                 new_note_id = cur.lastrowid
                 # 新增思考也记入历史版本（event_type=create）
@@ -2166,6 +2700,27 @@ class Handler(BaseHTTPRequestHandler):
         parsed = urlparse(self.path)
         path = parsed.path
         try:
+            if path == "/api/topic_nodes":
+                # 重命名观点树节点
+                uid = require_user(self)
+                if not uid:
+                    self._error(401, "未登录")
+                    return
+                body = _read_json_body(self)
+                nid = int(body.get("id"))
+                name = (body.get("name") or "").strip()
+                if not name:
+                    self._error(400, "名称不能为空")
+                    return
+                conn = get_db()
+                cur = conn.execute(
+                    "UPDATE topic_node SET name = ? WHERE id = ? AND user_id = ?", (name, nid, uid)
+                )
+                conn.commit()
+                if cur.rowcount == 0:
+                    self._error(404, "节点不存在")
+                    return
+                json_response(self, {"ok": True})
             if path == "/api/papers":
                 uid = require_user(self)
                 if not uid:
@@ -2365,6 +2920,50 @@ class Handler(BaseHTTPRequestHandler):
                     return
                 deleted_count = delete_notes_to_history(uid, ids)
                 json_response(self, {"ok": True, "deleted": deleted_count, "message": f"已删除 {deleted_count} 条思考（可在历史版本中恢复）"})
+                return
+            if path == "/api/topic_nodes":
+                nid = int((qs.get("id") or [None])[0])
+                conn = get_db()
+                node = conn.execute("SELECT id FROM topic_node WHERE id = ? AND user_id = ?", (nid, uid)).fetchone()
+                if not node:
+                    self._error(404, "节点不存在")
+                    return
+                # 先收集全部子孙节点，把它们名下的条目统一降级为「游民」，再删节点
+                ids_to_clear = [nid]
+                frontier = [nid]
+                guard = 0
+                while frontier and guard < 100:
+                    guard += 1
+                    ph = ",".join("?" for _ in frontier)
+                    kids = conn.execute(
+                        f"SELECT id FROM topic_node WHERE parent_id IN ({ph}) AND user_id = ?",
+                        (*frontier, uid),
+                    ).fetchall()
+                    frontier = [k["id"] for k in kids]
+                    ids_to_clear.extend(frontier)
+                ph = ",".join("?" for _ in ids_to_clear)
+                conn.execute(f"UPDATE note SET topic_file_id = NULL WHERE topic_file_id IN ({ph})", ids_to_clear)
+                conn.execute("DELETE FROM topic_node WHERE id = ?", (nid,))
+                conn.commit()
+                json_response(self, {"ok": True, "message": "已删除该观点节点，其下条目已变为「未归属」游民"})
+                return
+            if path == "/api/papers/unshare":
+                paper_id = int((qs.get("paper_id") or [None])[0])
+                folder_id = int((qs.get("folder_id") or [None])[0])
+                conn = get_db()
+                pl = conn.execute(
+                    "SELECT id, is_primary FROM paper_placement WHERE paper_id = ? AND folder_id = ?",
+                    (paper_id, folder_id),
+                ).fetchone()
+                if not pl:
+                    self._error(404, "该共享位置不存在")
+                    return
+                if pl["is_primary"]:
+                    self._error(400, "主位置不能单独移除，如需彻底移除请删除该论文")
+                    return
+                conn.execute("DELETE FROM paper_placement WHERE id = ?", (pl["id"],))
+                conn.commit()
+                json_response(self, {"ok": True, "message": "已取消该共享"})
                 return
             if path == "/api/notes/images":
                 iid = int((qs.get("id") or [None])[0])

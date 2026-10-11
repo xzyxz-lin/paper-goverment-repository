@@ -42,6 +42,40 @@ function toast(msg, isErr) {
   t._t = setTimeout(() => t.classList.remove("is-show"), 2600);
 }
 
+/* 带「撤销」按钮的提示条：点了撤销立即执行 fn，默认 8 秒后自动消失 */
+function toastAction(msg, actionLabel, fn, ms) {
+  const t = $("#toast");
+  t.textContent = msg;
+  t.classList.remove("is-error");
+  const btn = document.createElement("button");
+  btn.type = "button";
+  btn.className = "toast-action";
+  btn.textContent = actionLabel || "撤销";
+  btn.addEventListener("click", (e) => {
+    e.stopPropagation();
+    clearTimeout(t._t);
+    t.classList.remove("is-show");
+    fn();
+  });
+  t.appendChild(btn);
+  t.classList.add("is-show");
+  clearTimeout(t._t);
+  t._t = setTimeout(() => t.classList.remove("is-show"), ms || 8000);
+}
+
+/* 撤销删除思考：把刚删的条目从删除索引里恢复（后端 /api/note_versions/restore） */
+async function undoDeleteNotes(ids, refresh) {
+  try {
+    for (const id of ids) {
+      await req("POST", "/api/note_versions/restore", { note_id: id });
+    }
+    toast(ids.length > 1 ? `已撤销，${ids.length} 条思考已恢复` : "已撤销，思考已恢复");
+    if (refresh) await refresh();
+  } catch (e) {
+    toast("撤销失败：" + (e.message || "未知错误"), true);
+  }
+}
+
 function esc(s) {
   return String(s == null ? "" : s).replace(/[&<>"']/g, c => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c]));
 }
@@ -192,6 +226,7 @@ async function enterApp() {
     $("#service-addr").textContent = location.host;
     await loadProjects();
     await loadRecycle(false);
+    loadDupCount();
     renderNav();
     showView("projects");
   } catch (e) {
@@ -260,12 +295,16 @@ function showView(view) {
     const p = state._viewPaper;
     $("#page-title").textContent = p ? (p.title_en || p.title_zh || "论文思考") : "论文思考";
     $("#page-eyebrow").textContent = "PAPER / VIEW";
+  } else if (view === "topics") {
+    $("#page-title").textContent = "观点库";
+    $("#page-eyebrow").textContent = "TOPIC LIBRARY";
+    loadTopicTree();
   }
 
   // 在 VIEW 全屏浏览页隐藏 topbar 的「回收站」「新建项目」，避免干扰阅读
   const hideTopActions = view === "paper-view";
   $("#recycle-open-btn").hidden = hideTopActions;
-  $("#new-project-btn").hidden = hideTopActions;
+  $("#new-project-btn").hidden = hideTopActions || view === "topics";
   document.body.classList.toggle("view-paper-view", hideTopActions);
 }
 
@@ -1429,19 +1468,19 @@ async function refreshPaper(pid) {
 }
 
 async function deleteNote(nid, paperId) {
-  if (!confirm("删除这条思考？删除后可在回收站保留 7 天。")) return;
+  if (!confirm("删除这条思考？删除后可在历史版本保留 7 天，提示条里点「撤销」可立即找回。")) return;
   await req("DELETE", "/api/notes?id=" + nid);
-  toast("已删除");
+  toastAction("已删除 1 条思考", "撤销", () => undoDeleteNotes([nid], () => refreshPaper(paperId)));
   await refreshPaper(paperId);
 }
 
 async function deleteSelectedNotes(paperId) {
   const ids = Array.from(state.selNotes);
   if (!ids.length) return;
-  if (!confirm(`确定删除选中的 ${ids.length} 条思考？删除后可在回收站保留 7 天。`)) return;
+  if (!confirm(`确定删除选中的 ${ids.length} 条思考？删除后可在历史版本保留 7 天，提示条里点「撤销」可立即找回。`)) return;
   await req("DELETE", "/api/notes?ids=" + ids.join(","));
   state.selNotes.clear();
-  toast(`已删除 ${ids.length} 条思考`);
+  toastAction(`已删除 ${ids.length} 条思考`, "撤销", () => undoDeleteNotes(ids, () => refreshPaper(paperId)));
   await refreshPaper(paperId);
 }
 
@@ -1653,9 +1692,9 @@ function layoutViewImages(root) {
 }
 
 async function deleteViewNote(note, paperId) {
-  if (!confirm("删除这条思考？删除后可在历史版本中保留 7 天。")) return;
+  if (!confirm("删除这条思考？删除后可在历史版本中保留 7 天，提示条里点「撤销」可立即找回。")) return;
   await req("DELETE", "/api/notes?id=" + note.id);
-  toast("已删除");
+  toastAction("已删除 1 条思考", "撤销", () => undoDeleteNotes([note.id], () => openPaperView(paperId)));
   await openPaperView(paperId);
 }
 
@@ -1887,10 +1926,10 @@ async function applyArrangeAndSave(card) {
 async function deleteSelectedViewNotes(paperId) {
   const ids = Array.from(state.selViewNotes);
   if (!ids.length) return;
-  if (!confirm(`确定删除选中的 ${ids.length} 条思考？删除后可在历史版本中保留 7 天。`)) return;
+  if (!confirm(`确定删除选中的 ${ids.length} 条思考？删除后可在历史版本保留 7 天，提示条里点「撤销」可立即找回。`)) return;
   await req("DELETE", "/api/notes?ids=" + ids.join(","));
   state.selViewNotes.clear();
-  toast(`已删除 ${ids.length} 条思考`);
+  toastAction(`已删除 ${ids.length} 条思考`, "撤销", () => undoDeleteNotes(ids, () => openPaperView(paperId)));
   await openPaperView(paperId);
 }
 
@@ -2110,7 +2149,7 @@ function buildSectionsFromNote(note) {
 }
 
 function openNoteComposeEditor(opts) {
-  const { paperId, note } = opts || {};
+  const { paperId, note, topicFileId } = opts || {};
   const isEdit = !!note;
   let sections;
   let composeImgSeq = 0;
@@ -2412,7 +2451,10 @@ function openNoteComposeEditor(opts) {
     const layout = { blocks: flat };
     try {
       if (!isEdit) {
-        const nd = await req("POST", "/api/notes", { paper_id: paperId, content });
+        const nd = await req("POST", "/api/notes", {
+          paper_id: paperId, content,
+          topic_file_id: topicFileId || null,
+        });
         const nid = nd.id;
         for (const img of newImages) {
           await req("POST", "/api/notes/images", { note_id: nid, data: img.data, ext: img.ext });
@@ -2428,6 +2470,7 @@ function openNoteComposeEditor(opts) {
       if (state._viewPaper) await openPaperView(state._viewPaper.id);
       if (paperId && state._currentPaper && state._currentPaper.id === paperId) await refreshPaper(paperId);
       else if (isEdit && state._currentPaper && state._currentPaper.id === note.paper_id) await refreshPaper(note.paper_id);
+      if (topicFileId && TOPIC_CURRENT_FILE && TOPIC_CURRENT_FILE.id === topicFileId) await openTopicFile(TOPIC_CURRENT_FILE);
     } catch (e) { toast(e.message, true); }
   }
 
@@ -2629,7 +2672,8 @@ function openPaperModal(existing) {
       <p><b>拖入 PDF 文件</b> 或点击选择</p>
       <p class="dz-sub" id="dz-sub">上传后自动解析论文信息</p>
       <input type="file" id="pdf-file" accept=".pdf,application/pdf" hidden>
-    </div>`}
+    </div>
+    <div id="dup-warn-box"></div>`}
     <div class="form-row"><label>英文标题</label><input id="m-title_en" value="${esc(existing?.title_en || "")}"></div>
     <div class="form-row"><label>中文标题</label><input id="m-title_zh" value="${esc(existing?.title_zh || "")}"></div>
     <div class="form-grid2">
@@ -2671,22 +2715,28 @@ function openPaperModal(existing) {
         await openPaperDrawer(existing.id);
         await loadPapers();
       } else {
-        const fid = targetFolderId();
+        let fid = targetFolderId();
         if (!fid) {
-          // 根目录：需要一个临时文件夹？后端要求 folder_id。这里确保有根文件夹
+          // 根目录：后端要求 folder_id，这里确保有至少一个文件夹并选中它
           await ensureRootFolder();
-          await req("POST", "/api/papers", { folder_id: state.currentFolderId, ...payload });
-        } else {
-          await req("POST", "/api/papers", { folder_id: fid, ...payload });
+          fid = state.currentFolderId;
         }
+        // 导入查重：DOI 优先，其次标题。命中且用户没确认过「仍然导入」就先弹选择框
+        if (!DUP_FORCE_IMPORT) {
+          const hits = await checkPaperDuplicate(payload.doi, payload.title_en || payload.title_zh);
+          if (hits.length) { openDupChoiceModal(hits, payload, fid); return; }
+        }
+        await req("POST", "/api/papers", { folder_id: fid, ...payload });
         toast("论文已保存");
         closeModal();
         await loadTree();
         await loadPapers();
         await loadProjects();
+        await loadDupCount();
       }
     } catch (e) { toast(e.message, true); }
   };
+  DUP_FORCE_IMPORT = false;
 
   if (!isEdit) {
     const dz = $("#drop-zone");
@@ -2772,6 +2822,7 @@ async function handlePdfFile(file) {
     if (!meta.title_en && file.name.toLowerCase().endsWith(".pdf")) {
       $("#m-title_en").value = file.name.replace(/\.pdf$/i, "");
     }
+    await renderImportDupWarn();
     toast("解析完成，请核对信息");
   } catch (e) {
     sub.textContent = "解析失败，请手动填写";
@@ -2781,6 +2832,224 @@ async function handlePdfFile(file) {
     toast(e.message, true);
   } finally {
     dz.classList.remove("is-drag");
+  }
+}
+
+/* ============ 重复论文：导入查重 + 批量清理 ============ */
+let DUP_FORCE_IMPORT = false;   // 用户在查重弹窗里点了「仍然导入」时为 true
+
+/* 查重：DOI 优先，其次标题。返回命中的已有论文列表 */
+async function checkPaperDuplicate(doi, title) {
+  try {
+    const d = await req("POST", "/api/papers/check_duplicate", { doi: doi || "", title: title || "" });
+    return d.duplicates || [];
+  } catch (e) {
+    return [];
+  }
+}
+
+/* 导入弹窗里的即时提示（不打断填写，只在保存时强制选择） */
+async function renderImportDupWarn() {
+  const box = $("#dup-warn-box");
+  if (!box) return;
+  const hits = await checkPaperDuplicate($("#m-doi").value.trim(), $("#m-title_en").value.trim() || $("#m-title_zh").value.trim());
+  if (!hits.length) { box.innerHTML = ""; return; }
+  const fuzzy = hits.some(h => h.match === "fuzzy");
+  box.innerHTML = `
+    <div class="dup-warn">
+      <b>${fuzzy ? "库里可能已经有这篇论文（标题前段一致），保存时会让你确认" : "库里已经有这篇论文，保存时会让你选择怎么处理"}</b>
+      <p>${hits.slice(0, 3).map(h => `· ${esc(h.title_zh || h.title_en)}（${esc(h.project_name)} / ${esc(h.folder_name)}，${h.note_count} 条思考）`).join("<br>")}</p>
+    </div>`;
+}
+
+/* 命中重复时的三选一：引用已有 / 打开已有 / 仍然导入 */
+function openDupChoiceModal(hits, payload, folderId) {
+  const pick = hits[0];
+  const fuzzy = hits.some(h => h.match === "fuzzy");
+  openModal(`
+    <button class="icon-button" id="m-close" type="button" aria-label="关闭"><svg><use href="#i-close"/></svg></button>
+    <p class="eyebrow">DUPLICATE CHECK</p>
+    <h3>${fuzzy ? "库里可能已经有这篇论文" : "库里已经有这篇论文"}</h3>
+    <p class="modal-hint">${fuzzy
+      ? `没找到完全一致的 DOI 或标题，但有 ${hits.length} 条记录的标题前段与它一致，很可能是同一篇。同一篇论文应该只有一条记录，条目挂在一条上才不会散开。`
+      : `导入前查重命中 ${hits.length} 条已有记录。同一篇论文应该只有一条记录，条目挂在一条上才不会散开。`}</p>
+    <div class="picker-list">
+      ${hits.map((h) => `
+        <div class="picker-row" data-id="${h.id}">
+          <b>${esc(h.title_zh || h.title_en || "(无标题)")}</b>
+          <small>${esc(h.project_name)} / ${esc(h.folder_name)} · ${h.note_count} 条思考${h.doi ? " · DOI " + esc(h.doi) : ""}${h.match === "fuzzy" ? " · 疑似重复" : ""}</small>
+        </div>`).join("")}
+    </div>
+    <div class="dup-choice">
+      <button class="scan-button" id="dup-share" type="button"><span>引用已有论文到当前文件夹</span></button>
+      <button class="scan-button scan-button--ghost" id="dup-open" type="button"><span>打开已有论文</span></button>
+      <button class="scan-button scan-button--ghost" id="dup-force" type="button"><span>仍然导入为新论文</span></button>
+    </div>`);
+  $("#m-close").onclick = closeModal;
+
+  let chosen = pick.id;
+  $$(".picker-row").forEach(row => {
+    row.onclick = () => {
+      chosen = Number(row.dataset.id);
+      $$(".picker-row").forEach(r => r.style.background = (r === row ? "rgba(31,91,87,.11)" : ""));
+    };
+  });
+  // 默认高亮第一条
+  const first = $(".picker-row");
+  if (first) first.style.background = "rgba(31,91,87,.11)";
+
+  $("#dup-share").onclick = async () => {
+    try {
+      await req("POST", "/api/papers/share", { paper_id: chosen, folder_id: folderId });
+      closeModal();
+      toast("已引用库内已有论文，没有产生重复记录");
+      await loadTree();
+      await loadPapers();
+      await loadProjects();
+      await openPaperDrawer(chosen);
+    } catch (e) { toast(e.message, true); }
+  };
+  $("#dup-open").onclick = async () => {
+    closeModal();
+    await openPaperDrawer(chosen);
+  };
+  $("#dup-force").onclick = async () => {
+    try {
+      await req("POST", "/api/papers", { folder_id: folderId, ...payload });
+      DUP_FORCE_IMPORT = false;
+      closeModal();
+      toast("已导入为新论文（之后可在「重复清理」里合并）");
+      await loadTree();
+      await loadPapers();
+      await loadProjects();
+      await loadDupCount();
+    } catch (e) { toast(e.message, true); }
+  };
+}
+
+/* 侧栏「重复清理」：扫描全库重复论文并合并 */
+async function loadDupCount() {
+  const btn = $("#dup-btn");
+  if (!btn) return;
+  try {
+    const d = await req("GET", "/api/papers/duplicates");
+    const n = (d.groups || []).length;
+    const badge = $("#dup-side-count");
+    if (badge) { badge.textContent = String(n); badge.hidden = n === 0; }
+    btn.title = n ? `库里有 ${n} 组重复论文，点击合并（每组保留一条，其余进回收站 7 天可恢复）` : "暂无重复论文";
+  } catch (e) { /* 静默失败，不影响主流程 */ }
+}
+
+function dupKeepRecommendation(items) {
+  // 推荐保留：条目最多的那条；并列时取最早导入的（id 最小）
+  return items.slice().sort((a, b) => (b.note_count - a.note_count) || (a.id - b.id))[0].id;
+}
+
+function renderDupGroups(groups) {
+  const body = groups.length ? groups.map((g, gi) => `
+    <div class="dup-group" data-gi="${gi}">
+      <header>
+        <b>${esc(g.title)}</b>
+        <small>${g.doi ? "DOI " + esc(g.doi) : "（无 DOI，按标题判定重复）"} · 共 ${g.total_notes} 条思考</small>
+      </header>
+      <div class="dup-rows">
+        ${g.papers.map(p => `
+          <label class="dup-row${p.id === dupKeepRecommendation(g.papers) ? " is-keep" : ""}" data-gi="${gi}" data-id="${p.id}">
+            <input type="radio" name="dup-g${gi}" value="${p.id}" ${p.id === dupKeepRecommendation(g.papers) ? "checked" : ""}>
+            <div class="dup-row__main">
+              <span>${esc(p.title_zh || p.title_en || "(无标题)")}</span>
+              <small>#${p.id} · ${esc(p.project_name)} / ${esc(p.folder_name)} · ${esc((p.created_at || "").slice(0, 10))}</small>
+            </div>
+            <span class="dup-row__badge${p.note_count ? " is-note" : ""}">${p.note_count} 条思考</span>
+          </label>`).join("")}
+      </div>
+      <div class="dup-actions">
+        <button class="scan-button scan-button--ghost" data-merge="${gi}" type="button"><span>合并这组</span></button>
+      </div>
+    </div>`).join("") : `<p class="dup-empty">没有发现重复论文。<br>同一篇论文在不同项目里重复导入时，这里会列出来供你合并。</p>`;
+
+  openModal(`
+    <button class="icon-button" id="m-close" type="button" aria-label="关闭"><svg><use href="#i-close"/></svg></button>
+    <p class="eyebrow">DUPLICATE CLEANUP</p>
+    <h3>重复论文清理</h3>
+    <p class="dup-hint">按 DOI（无 DOI 时按标题）找出库里重复导入的同一篇论文。每组选一条<strong>保留</strong>，其余的条目会全部归拢到保留的那条上，被合并的记录进回收站（7 天内可恢复）。</p>
+    <div id="dup-list">${body}</div>
+    ${groups.length > 1 ? `<div class="dup-actions"><button class="scan-button" id="dup-merge-all" type="button"><span>一键合并全部 ${groups.length} 组</span></button></div>` : ""}`);
+  $("#m-close").onclick = closeModal;
+
+  const syncKeep = () => {
+    $$(".dup-row").forEach(row => {
+      const input = row.querySelector("input[type=radio]");
+      row.classList.toggle("is-keep", !!input && input.checked);
+    });
+  };
+  $$(".dup-row").forEach(row => {
+    row.addEventListener("click", () => { const i = row.querySelector("input[type=radio]"); if (i) { i.checked = true; syncKeep(); } });
+  });
+
+  const mergeOne = async (gi) => {
+    const g = groups[gi];
+    if (!g) return;
+    const checked = $(`.dup-row[data-gi="${gi}"] input[type=radio]:checked`);
+    const keepId = checked ? Number(checked.value) : dupKeepRecommendation(g.papers);
+    const mergeIds = g.papers.map(p => p.id).filter(id => id !== keepId);
+    if (!mergeIds.length) return;
+    const moved = g.papers.filter(p => p.id !== keepId).reduce((s, p) => s + p.note_count, 0);
+    if (!confirm(`保留「${keepId}」这条，合并其余 ${mergeIds.length} 条${moved ? `（${moved} 条思考会归拢过来）` : ""}？\n\n被合并的记录会进入回收站，7 天内可恢复。`)) return;
+    try {
+      const r = await req("POST", "/api/papers/merge", { keep_id: keepId, merge_ids: mergeIds });
+      toast(`已合并：${r.merged} 条记录并入 #${keepId}，${r.moved_notes} 条思考已归拢`);
+      await afterDupChange();
+    } catch (e) { toast(e.message, true); }
+  };
+  $$("[data-merge]").forEach(b => { b.onclick = () => mergeOne(Number(b.dataset.merge)); });
+
+  const all = $("#dup-merge-all");
+  if (all) {
+    all.onclick = async () => {
+      if (!confirm(`将按推荐方案（每组保留条目最多的一条）合并全部 ${groups.length} 组，被合并的记录进回收站，7 天内可恢复。继续？`)) return;
+      let merged = 0;
+      for (const g of groups) {
+        const keepId = dupKeepRecommendation(g.papers);
+        const mergeIds = g.papers.map(p => p.id).filter(id => id !== keepId);
+        if (!mergeIds.length) continue;
+        try {
+          await req("POST", "/api/papers/merge", { keep_id: keepId, merge_ids: mergeIds });
+          merged += mergeIds.length;
+        } catch (e) { /* 单组失败不打断其他组 */ }
+      }
+      toast(`已合并 ${merged} 条重复记录`);
+      await afterDupChange();
+    };
+  }
+}
+
+async function afterDupChange() {
+  await loadTree();
+  await loadPapers();
+  await loadProjects();
+  await loadRecycle(false);
+  closeModal();
+  await openDuplicateModal();
+  await loadDupCount();
+}
+
+async function openDuplicateModal() {
+  openModal(`
+    <button class="icon-button" id="m-close" type="button" aria-label="关闭"><svg><use href="#i-close"/></svg></button>
+    <p class="eyebrow">DUPLICATE CLEANUP</p>
+    <h3>重复论文清理</h3>
+    <p class="dup-hint">正在扫描…</p>`);
+  $("#m-close").onclick = closeModal;
+  try {
+    const d = await req("GET", "/api/papers/duplicates");
+    renderDupGroups(d.groups || []);
+  } catch (e) {
+    openModal(`
+      <button class="icon-button" id="m-close" type="button" aria-label="关闭"><svg><use href="#i-close"/></svg></button>
+      <h3>扫描失败</h3>
+      <p class="dup-hint">${esc(e.message || "未知错误")}</p>`);
+    $("#m-close").onclick = closeModal;
   }
 }
 
@@ -2814,6 +3083,8 @@ function bindGlobal() {
   if (recycleTopBtn) recycleTopBtn.addEventListener("click", openRecycle);
   const historyBtn = $("#history-btn");
   if (historyBtn) historyBtn.addEventListener("click", openHistory);
+  const dupBtn = $("#dup-btn");
+  if (dupBtn) dupBtn.addEventListener("click", openDuplicateModal);
   $("#recycle-restore-btn").addEventListener("click", restoreSelectedRecycle);
   $("#recycle-purge-btn").addEventListener("click", purgeSelectedRecycle);
   $("#recycle-clear-sel").addEventListener("click", clearSelection);
@@ -2823,6 +3094,7 @@ function bindGlobal() {
 
 function init() {
   bindGlobal();
+  bindTopics();
   updateAuthUI();
   if (API.token) {
     enterApp();
@@ -2839,3 +3111,235 @@ function init() {
 }
 
 document.addEventListener("DOMContentLoaded", init);
+
+/* ============ 观点库（全局一套，不隶属于项目） ============ */
+let TOPIC_TREE = [];
+let TOPIC_CURRENT_FILE = null;   // 当前打开的叶子「文件」节点
+let TOPIC_CURRENT_PARENT = null; // 当前选中的观点/文件夹（作为新建的父节点）
+
+function bindTopics() {
+  const sw = $("#view-switch");
+  if (!sw) return;
+  $$(".view-switch__btn", sw).forEach(btn => {
+    btn.addEventListener("click", () => setViewMode(btn.dataset.viewmode));
+  });
+  const addTopic = $("#add-topic-btn");
+  if (addTopic) addTopic.addEventListener("click", () => createTopicNode("topic", null));
+  const addFolder = $("#add-topic-folder-btn");
+  if (addFolder) addFolder.addEventListener("click", () => {
+    const p = currentTopicParentId();
+    if (p) createTopicNode("folder", p);
+  });
+  const addFile = $("#add-topic-file-btn");
+  if (addFile) addFile.addEventListener("click", () => {
+    const p = currentTopicParentId();
+    if (p) createTopicNode("file", p);
+  });
+  const addNote = $("#topic-add-note-btn");
+  if (addNote) addNote.addEventListener("click", () => {
+    if (TOPIC_CURRENT_FILE) openTopicNoteComposer(TOPIC_CURRENT_FILE.id);
+  });
+}
+
+function setViewMode(mode) {
+  state.viewMode = mode;
+  $$(".view-switch__btn").forEach(b => {
+    const on = b.dataset.viewmode === mode;
+    b.classList.toggle("is-active", on);
+    b.setAttribute("aria-selected", on ? "true" : "false");
+  });
+  if (mode === "topics") {
+    showView("topics");
+  } else {
+    showView("projects");
+  }
+}
+
+function currentTopicParentId() {
+  if (TOPIC_CURRENT_PARENT) return TOPIC_CURRENT_PARENT.id;
+  return null;
+}
+
+async function loadTopicTree() {
+  try {
+    const d = await req("GET", "/api/topics/tree");
+    TOPIC_TREE = d.topics || [];
+  } catch (e) {
+    TOPIC_TREE = [];
+  }
+  renderTopicTree();
+}
+
+function renderTopicTree() {
+  const host = $("#topic-tree");
+  if (!host) return;
+  host.innerHTML = "";
+  if (!TOPIC_TREE.length) {
+    host.innerHTML = '<p class="tree-empty">还没有观点。点右上角「新建观点」开始。</p>';
+    return;
+  }
+  appendTopicRows(host, TOPIC_TREE, 0);
+}
+
+function appendTopicRows(host, nodes, depth) {
+  nodes.forEach(n => {
+    host.appendChild(topicNodeRow(n, depth));
+    if (n.children && n.children.length) appendTopicRows(host, n.children, depth + 1);
+  });
+}
+
+function topicNodeRow(n, depth) {
+  const row = document.createElement("div");
+  const activeId = TOPIC_CURRENT_FILE ? TOPIC_CURRENT_FILE.id
+    : (TOPIC_CURRENT_PARENT ? TOPIC_CURRENT_PARENT.id : null);
+  row.className = "tree-row" + (activeId === n.id ? " is-active" : "");
+  row.style.paddingLeft = (10 + depth * 14) + "px";
+  row.dataset.tid = n.id;
+  row.dataset.kind = n.kind;
+  const icon = n.kind === "file" ? "#i-doc" : (n.kind === "topic" ? "#i-flag" : "#i-folder");
+  row.innerHTML = '<svg class="folder-ico"><use href="' + icon + '"/></svg>'
+    + '<span class="tree-name">' + esc(n.name) + '</span>'
+    + (n.entry_count ? '<span class="tree-count">' + n.entry_count + '</span>' : "");
+  row.addEventListener("click", () => onTopicNodeClick(n));
+  return row;
+}
+
+function onTopicNodeClick(n) {
+  if (n.kind === "file") {
+    openTopicFile(n);
+    return;
+  }
+  TOPIC_CURRENT_PARENT = n;
+  TOPIC_CURRENT_FILE = null;
+  renderTopicTree();
+  const label = n.kind === "topic" ? "观点" : "文件夹";
+  $("#topic-crumbs").textContent = n.name;
+  $("#topic-file-title").textContent = n.name;
+  $("#topic-hint").hidden = false;
+  $("#topic-hint").textContent = "这是" + label + "，可在其中新建子文件夹或「文件」。只有「文件」才能装条目。";
+  $("#topic-notes").innerHTML = "";
+  $("#topic-add-note-btn").disabled = true;
+  $("#add-topic-folder-btn").disabled = false;
+  $("#add-topic-file-btn").disabled = false;
+}
+
+async function openTopicFile(n) {
+  try {
+    const d = await req("GET", "/api/topics/file?id=" + n.id);
+    const f = d.file;
+    TOPIC_CURRENT_FILE = f;
+    TOPIC_CURRENT_PARENT = null;
+    renderTopicTree();
+    $("#topic-crumbs").textContent = f.path_name || f.name;
+    $("#topic-file-title").textContent = f.name;
+    $("#topic-hint").hidden = true;
+    $("#topic-add-note-btn").disabled = false;
+    $("#add-topic-folder-btn").disabled = true;
+    $("#add-topic-file-btn").disabled = true;
+    renderTopicNotes(f);
+  } catch (e) {
+    toast("加载观点文件失败", true);
+  }
+}
+
+function renderTopicNotes(f) {
+  const host = $("#topic-notes");
+  if (!host) return;
+  host.innerHTML = "";
+  if (!f.notes || !f.notes.length) {
+    host.innerHTML = '<p class="tree-empty">这个文件下还没有条目。点右上角「新增条目」开始记录。</p>';
+    return;
+  }
+  f.notes.forEach((n, i) => {
+    let card;
+    try {
+      card = renderViewNoteCard(n, i);
+    } catch (e) {
+      card = document.createElement("div");
+      card.className = "note-card";
+      card.textContent = n.content || "";
+    }
+    if (n.paper) {
+      const tag = document.createElement("div");
+      tag.className = "topic-source";
+      tag.innerHTML = "<span>来源文献：</span><b>"
+        + esc(n.paper.title_zh || n.paper.title_en || "未命名") + "</b>";
+      card.insertBefore(tag, card.firstChild);
+    }
+    host.appendChild(card);
+  });
+}
+
+async function createTopicNode(kind, parentId) {
+  const label = kind === "topic" ? "观点" : (kind === "folder" ? "文件夹" : "文件");
+  const name = prompt("新建" + label + "，请输入名称：");
+  if (!name || !name.trim()) return;
+  try {
+    await req("POST", "/api/topic_nodes", { kind: kind, name: name.trim(), parent_id: parentId });
+    toast("已创建" + label);
+    loadTopicTree();
+  } catch (e) {
+    toast("创建失败：" + ((e && e.error) || "未知错误"), true);
+  }
+}
+
+/* 观点视图新增条目：第一步强制先选来源文献，选完才进入编辑器 */
+async function openTopicNoteComposer(topicFileId) {
+  let papers = [];
+  try {
+    const d = await req("GET", "/api/papers/search?q=");
+    papers = d.papers || [];
+  } catch (e) {
+    toast("加载论文列表失败", true);
+    return;
+  }
+  if (!papers.length) {
+    toast("库里还没有论文，请先切到论文视图导入", true);
+    return;
+  }
+
+  openModal(
+    '<div class="modal-head"><h3>选择来源文献</h3>'
+    + '<p>观点条目必须绑定到库内已有论文，保证写文章时条条可追溯、可跳转。</p></div>'
+    + '<div class="picker-search"><svg><use href="#i-search"/></svg>'
+    + '<input type="search" id="topic-paper-q" placeholder="搜索标题 / 期刊 / 作者"></div>'
+    + '<div class="picker-list" id="topic-paper-list"></div>'
+    + '<div class="modal-actions">'
+    + '<button class="scan-button scan-button--ghost" id="topic-picker-cancel" type="button">取消</button>'
+    + '</div>'
+  );
+
+  const list = $("#topic-paper-list");
+  const renderList = (rows) => {
+    list.innerHTML = "";
+    if (!rows.length) {
+      list.innerHTML = '<p class="tree-empty">没有匹配的论文</p>';
+      return;
+    }
+    rows.forEach(p => {
+      const row = document.createElement("div");
+      row.className = "picker-row";
+      row.innerHTML = "<b>" + esc(p.title_zh || p.title_en || "未命名") + "</b>"
+        + "<small>" + esc([p.project_name, p.folder_name].filter(Boolean).join(" / ")) + "</small>";
+      row.addEventListener("click", () => {
+        closeModal();
+        openNoteComposeEditor({ paperId: p.id, topicFileId: topicFileId });
+      });
+      list.appendChild(row);
+    });
+  };
+  renderList(papers);
+
+  const q = $("#topic-paper-q");
+  let timer = null;
+  q.addEventListener("input", () => {
+    clearTimeout(timer);
+    timer = setTimeout(async () => {
+      try {
+        const d = await req("GET", "/api/papers/search?q=" + encodeURIComponent(q.value.trim()));
+        renderList(d.papers || []);
+      } catch (e) { /* 忽略搜索失败 */ }
+    }, 220);
+  });
+  $("#topic-picker-cancel").addEventListener("click", closeModal);
+}
