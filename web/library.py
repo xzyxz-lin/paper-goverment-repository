@@ -2016,10 +2016,12 @@ class Handler(BaseHTTPRequestHandler):
                     d["notes"].append(nd)
                 # 本篇论文被哪些观点引用（论文视图顶部展示「被 N 个观点引用」）
                 refs = []
+                # 必须和条目列表用同一套删除过滤，否则回收站里的条目会被算进「被 N 个观点引用」
                 for t in conn.execute(
-                    """SELECT n.topic_file_id AS file_id, COUNT(*) AS c
-                       FROM note n WHERE n.paper_id = ? AND n.topic_file_id IS NOT NULL
-                       GROUP BY n.topic_file_id ORDER BY n.topic_file_id""", (pid,)
+                    f"""SELECT n.topic_file_id AS file_id, COUNT(*) AS c
+                        FROM note n WHERE n.paper_id = ? AND n.topic_file_id IS NOT NULL{note_filter}
+                        GROUP BY n.topic_file_id ORDER BY n.topic_file_id""",
+                    (pid, *note_params),
                 ).fetchall():
                     td = dict(t)
                     td["path"] = topic_path_name(conn, td["file_id"])
