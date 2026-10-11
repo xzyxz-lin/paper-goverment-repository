@@ -1709,3 +1709,30 @@ body.view-paper-view header.topbar > .topbar-actions { display: none !important;
 .dup-warn ul { margin: 6px 0 0; padding-left: 18px; color: var(--ink-800); font-size: .74rem; line-height: 1.6; }
 .dup-choice { display: grid; gap: 8px; margin-top: 14px; }
 .dup-choice .scan-button { width: 100%; justify-content: center; margin-top: 0; }
+
+/* ============ 论文视图：按观点分组 / 被引用抬头 / 归属菜单 ============ */
+.topic-refs-bar { display: flex; flex-wrap: wrap; align-items: center; gap: 8px; margin: 0 0 16px; padding: 11px 14px; border: 1px solid var(--paper-300); background: rgba(255,255,255,.42); }
+.topic-refs-bar__label { color: var(--oxide-700); font: 650 .68rem var(--font-data); letter-spacing: .06em; white-space: nowrap; }
+.topic-ref-chip { display: inline-flex; align-items: center; gap: 5px; max-width: 260px; padding: 4px 10px; border: 1px solid var(--paper-300); background: var(--white); color: var(--ink-800); font-size: .74rem; cursor: pointer; transition: background .15s ease, border-color .15s ease; }
+.topic-ref-chip svg { width: 12px; height: 12px; flex: none; color: var(--copper-600); }
+.topic-ref-chip span { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.topic-ref-chip b { color: var(--copper-700); font: 650 .68rem var(--font-data); }
+.topic-ref-chip:hover { border-color: var(--oxide-700); background: rgba(31,91,87,.08); }
+
+.note-group { margin-bottom: 20px; border: 1px solid var(--paper-300); background: rgba(255,255,255,.34); }
+.note-group__head { display: flex; align-items: center; gap: 8px; padding: 9px 13px; border-bottom: 1px solid var(--paper-300); background: rgba(223,227,220,.55); }
+.note-group__head svg { width: 14px; height: 14px; flex: none; color: var(--oxide-700); }
+.note-group__path { flex: 1; min-width: 0; overflow: hidden; color: var(--ink-900); font: 600 .78rem var(--font-data); text-overflow: ellipsis; white-space: nowrap; }
+.note-group__head > b { color: var(--ink-700); font: 600 .68rem var(--font-data); white-space: nowrap; }
+.note-group__jump { flex: none; padding: 2px 9px; border: 1px solid var(--paper-300); background: var(--white); color: var(--ink-700); font: 600 .66rem var(--font-data); cursor: pointer; transition: background .15s ease; }
+.note-group__jump:hover { border-color: var(--oxide-700); color: var(--oxide-700); }
+.note-group--nomad .note-group__head { background: rgba(200,127,58,.12); }
+.note-group--nomad .note-group__head svg { color: var(--copper-600); }
+.note-group .note-card { border: 0; border-bottom: 1px solid var(--paper-100); background: transparent; }
+.note-group .note-card:last-child { border-bottom: 0; }
+
+.note-card__assign { display: inline-flex; align-items: center; gap: 4px; padding: 3px 8px; border: 1px solid var(--paper-300); background: var(--white); color: var(--ink-700); font-size: .7rem; cursor: pointer; transition: background .15s ease, color .15s ease; }
+.note-card__assign:hover { border-color: var(--oxide-700); color: var(--oxide-700); }
+.note-card__assign.is-set { border-color: var(--copper-600); color: var(--copper-700); }
+
+.picker-row.is-chosen { background: rgba(31,91,87,.11); box-shadow: inset 3px 0 0 var(--oxide-700); }

@@ -27,6 +27,7 @@ import sqlite3
 import subprocess
 import sys
 import threading
+import time
 import uuid
 from datetime import datetime, timedelta, timezone
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -1832,9 +1833,13 @@ class Handler(BaseHTTPRequestHandler):
                 if dproj:
                     conds.append("pr.id NOT IN ({})".format(",".join("?" for _ in dproj)))
                     params += dproj
+                # 注意：note_count 在 Python 里补，不要写进 SELECT 子查询——
+                # sqlite3 是按「?」在 SQL 文本中出现的顺序绑参数的，SELECT 在 WHERE 之前，
+                # 子查询的占位符会抢走 WHERE 的参数，导致 pr.user_id=? 绑错值。
                 rows = conn.execute(
-                    f"""SELECT pa.id, pa.title_en, pa.title_zh, pa.journal, pa.folder_id,
-                               f.name AS folder_name, pr.id AS project_id, pr.name AS project_name
+                    f"""SELECT pa.id, pa.title_en, pa.title_zh, pa.journal, pa.authors, pa.doi,
+                               pa.folder_id, f.name AS folder_name,
+                               pr.id AS project_id, pr.name AS project_name
                         FROM paper pa
                         JOIN folder f ON f.id = pa.folder_id
                         JOIN project pr ON pr.id = f.project_id
@@ -1842,7 +1847,16 @@ class Handler(BaseHTTPRequestHandler):
                         ORDER BY pr.name, pa.id DESC LIMIT 300""",
                     params,
                 ).fetchall()
-                json_response(self, {"papers": [dict(r) for r in rows]})
+                nfilter, nparams = _deleted_filter_clause("notes", "n")
+                out = []
+                for r in rows:
+                    d = dict(r)
+                    d["note_count"] = conn.execute(
+                        "SELECT COUNT(*) c FROM note n WHERE n.paper_id = ?" + nfilter,
+                        [d["id"]] + nparams,
+                    ).fetchone()["c"]
+                    out.append(d)
+                json_response(self, {"papers": out})
             elif path == "/api/papers/duplicates":
                 # 找出库内重复论文：优先按 DOI 分组，无 DOI 则按标题分组
                 uid = require_user(self)
@@ -2988,6 +3002,39 @@ class Handler(BaseHTTPRequestHandler):
             self._error(500, str(e))
 
 
+# ===== WAL 定期落盘 =====
+# WAL 模式下「已提交」的数据可能长时间只存在于 library.db-wal 里，主库文件还是旧的。
+# 一旦进程被强杀、或 WAL 被外部程序（网盘同步、杀软扫描）动过，这部分数据就会丢
+# ——之前就出现过「主库 48 条、WAL 里还躺着 4 条」的情况。
+# 所以：启动时先做一次 TRUNCATE 兜底合并，之后每 60 秒做一次 PASSIVE 合并
+# （PASSIVE 只合并不阻塞读写的部分，不影响正常使用）。
+CHECKPOINT_INTERVAL_SEC = 60
+
+
+def wal_checkpoint(mode: str = "PASSIVE") -> tuple | None:
+    """对 WAL 做一次 checkpoint。成功返回 (busy, log, checkpointed)，失败返回 None。"""
+    try:
+        conn = sqlite3.connect(str(DB_PATH), timeout=5)
+        conn.execute("PRAGMA busy_timeout = 5000")
+        row = conn.execute(f"PRAGMA wal_checkpoint({mode})").fetchone()
+        conn.close()
+        return tuple(row) if row else None
+    except Exception:
+        return None
+
+
+def _wal_checkpoint_worker() -> None:
+    while True:
+        time.sleep(CHECKPOINT_INTERVAL_SEC)
+        # 先把数据并进主库（安全目标），再尝试把 WAL 文件截短（省空间）
+        wal_checkpoint("PASSIVE")
+        wal_checkpoint("TRUNCATE")
+
+
+def start_wal_checkpoint_daemon() -> None:
+    threading.Thread(target=_wal_checkpoint_worker, daemon=True, name="wal-checkpoint").start()
+
+
 def main():
     parser = argparse.ArgumentParser(description="私人文献库")
     parser.add_argument("--host", default="0.0.0.0")
@@ -3004,9 +3051,12 @@ def main():
         sys.exit(0)
 
     init_db()
+    # 启动时先把上一次残留的 WAL 合并进主库（上次若是被强杀，未落盘的数据在这里救回来）
+    wal_checkpoint("TRUNCATE")
     migrate_legacy_deleted_index()
     purge_expired_recycle_items()
     purge_expired_note_versions()
+    start_wal_checkpoint_daemon()
     server = ThreadingHTTPServer((args.host, args.port), Handler)
     print(f"Private Library running at http://127.0.0.1:{args.port} (host={args.host})")
     print(f"DB: {DB_PATH}")

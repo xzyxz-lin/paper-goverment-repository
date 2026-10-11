@@ -1276,9 +1276,10 @@ function renderPaperDrawer(p) {
     ${openBtns}
 
     <div class="drawer-section-title"><span>我的思考</span></div>
+    ${renderTopicRefsBar(p)}
 
     <div id="notes-list">
-      ${notes.map(n => renderNoteCard(n)).join("")}
+      ${renderNotesGrouped(notes)}
     </div>
 
     <div class="drawer-footer">
@@ -1307,13 +1308,22 @@ function renderPaperDrawer(p) {
   $("#compose-view-btn").onclick = () => { closeDrawer(); openPaperView(p.id); };
   $("#add-note-btn").onclick = () => openNoteComposeEditor({ paperId: p.id });
 
-  // 已有笔记的编辑 / 删除
+  // 已有笔记的编辑 / 删除 / 归属
   $$("#notes-list .note-card__edit").forEach(btn => btn.addEventListener("click", () => {
     const nid = parseInt(btn.dataset.note);
     const note = (p.notes || []).find(n => n.id === nid);
     if (note) openNoteComposeEditor({ note });
   }));
   $$("#notes-list .note-card__del").forEach(btn => btn.addEventListener("click", () => deleteNote(parseInt(btn.dataset.note), p.id)));
+  $$("#notes-list .note-card__assign").forEach(btn => btn.addEventListener("click", () => {
+    const nid = parseInt(btn.dataset.note);
+    const note = (p.notes || []).find(n => n.id === nid);
+    if (note) openNoteAssignModal(note, () => openPaperDrawer(p.id));
+  }));
+  // 「被 N 个观点引用」的胶囊：点了直接跳到观点视图打开那个文件
+  $$("#topic-refs-bar .topic-ref-chip").forEach(chip => {
+    chip.addEventListener("click", () => jumpToTopicFile(parseInt(chip.dataset.file)));
+  });
 
   // 思考多选删除
   $$("#notes-list .note-card__check input").forEach(cb => {
@@ -1351,6 +1361,7 @@ function renderNoteCard(n) {
           <span>${esc((n.created_at || "").replace("T", " ").slice(0, 16))}</span>
         </label>
         <div class="note-card__actions">
+          <button class="note-card__assign${n.topic_file_id ? " is-set" : ""}" data-note="${n.id}" type="button" title="${n.topic_file_id ? "改归属 / 移到别的观点 / 清除归属" : "归属到某个观点"}"><svg style="width:12px;height:12px;"><use href="#i-flag"/></svg>归属</button>
           <button class="note-card__edit" data-note="${n.id}" type="button"><svg style="width:12px;height:12px;"><use href="#i-edit"/></svg>编辑</button>
           <button class="note-card__del" data-note="${n.id}" type="button"><svg style="width:12px;height:12px;"><use href="#i-trash"/></svg>删除</button>
         </div>
@@ -1654,6 +1665,13 @@ function renderPaperView(p) {
       if (!note) return;
       if (state.arrange && state.arrange.noteId === nid) exitArrangeMode();
       else enterArrangeMode(card, note);
+    };
+  });
+  $$(".pv-card__action[data-action='assign']").forEach(btn => {
+    btn.onclick = () => {
+      const nid = parseInt(btn.closest(".pv-card").dataset.noteId);
+      const note = (state._viewPaper?.notes || []).find(n => n.id === nid);
+      if (note) openNoteAssignModal(note, () => openPaperView(p.id));
     };
   });
 
@@ -2039,6 +2057,7 @@ function renderViewNoteCard(n, idx) {
           <button class="pv-card__action" data-action="add" type="button" title="新增思考"><svg><use href="#i-plus"/></svg><span>新增</span></button>
           <button class="pv-card__action pv-card__action--danger" data-action="delete" type="button" title="删除思考"><svg><use href="#i-trash"/></svg><span>删除</span></button>
           <button class="pv-card__action" data-action="edit" type="button" title="编辑思考"><svg><use href="#i-edit"/></svg><span>编辑</span></button>
+          <button class="pv-card__action" data-action="assign" type="button" title="加入 / 移动到某个观点，或清除归属变游民"><svg><use href="#i-flag"/></svg><span>归属</span></button>
           <button class="pv-card__action" data-action="arrange" type="button" title="拖拽排版：按住块拖到另一块上对换位置"><svg><use href="#i-layout"/></svg><span>排版</span></button>
           <button class="pv-card__action" data-action="fullscreen" type="button" title="全屏查看"><svg><use href="#i-image"/></svg><span>全屏</span></button>
           <span class="pv-card__index">#${idx}</span>
@@ -3061,6 +3080,7 @@ function bindGlobal() {
   $("#new-project-btn").addEventListener("click", openProjectModal);
   $("#add-folder-btn").addEventListener("click", () => openFolderModal(state.currentFolderId));
   $("#add-paper-btn").addEventListener("click", () => openPaperModal(null));
+  $("#share-paper-btn").addEventListener("click", () => openSharePaperModal());
   $("#root-folder-btn").addEventListener("click", () => openFolderModal(null));
   $("#logout-btn").addEventListener("click", () => doLogout());
   $("#paper-search").addEventListener("input", (e) => { state.searchTerm = e.target.value; renderPapers(); });
@@ -3266,6 +3286,17 @@ function renderTopicNotes(f) {
         + esc(n.paper.title_zh || n.paper.title_en || "未命名") + "</b>";
       card.insertBefore(tag, card.firstChild);
     }
+    // 归属菜单：在这篇文章里可以把条目移到别的观点，或清除归属变游民
+    const head = card.querySelector(".pv-card__actions");
+    if (head) {
+      const btn = document.createElement("button");
+      btn.className = "pv-card__action";
+      btn.type = "button";
+      btn.title = "移到别的观点，或清除归属变游民";
+      btn.innerHTML = '<svg><use href="#i-flag"/></svg><span>归属</span>';
+      btn.onclick = () => openNoteAssignModal(n, () => openTopicFile(TOPIC_CURRENT_FILE));
+      head.insertBefore(btn, head.firstChild);
+    }
     host.appendChild(card);
   });
 }
@@ -3343,3 +3374,259 @@ async function openTopicNoteComposer(topicFileId) {
   });
   $("#topic-picker-cancel").addEventListener("click", closeModal);
 }
+
+/* ============================================================
+   论文视图：思考按观点分组 + 「被 N 个观点引用」抬头 + 归属菜单
+   ============================================================ */
+
+/* 顶部胶囊条：这篇论文被哪些观点引用了，点了直接跳过去 */
+function renderTopicRefsBar(p) {
+  const refs = p.topic_refs || [];
+  if (!refs.length) return "";
+  return `
+    <div class="topic-refs-bar" id="topic-refs-bar">
+      <span class="topic-refs-bar__label">被 ${refs.length} 个观点引用</span>
+      ${refs.map(r => `
+        <button class="topic-ref-chip" data-file="${r.file_id}" type="button" title="跳到观点视图打开「${esc(r.path || "")}」">
+          <svg><use href="#i-flag"/></svg><span>${esc(r.path || "（观点）")}</span><b>${r.c}</b>
+        </button>`).join("")}
+    </div>`;
+}
+
+/* 思考列表按所属观点文件分组；未归属的单列一区「游民」 */
+function renderNotesGrouped(notes) {
+  if (!notes.length) return "";
+  const groups = [];
+  const byFile = new Map();
+  const nomads = [];
+  notes.forEach(n => {
+    if (n.topic_file_id) {
+      if (!byFile.has(n.topic_file_id)) {
+        byFile.set(n.topic_file_id, {
+          fileId: n.topic_file_id,
+          path: n.topic_path || n.topic_name || "（观点）",
+          items: [],
+        });
+      }
+      byFile.get(n.topic_file_id).items.push(n);
+    } else {
+      nomads.push(n);
+    }
+  });
+  // 后端已按「观点文件创建时间」排好序，Map 的插入顺序即分组顺序
+  byFile.forEach(g => groups.push(g));
+  return groups.map(g => `
+    <div class="note-group" data-file="${g.fileId}">
+      <div class="note-group__head">
+        <svg><use href="#i-flag"/></svg>
+        <span class="note-group__path" title="${esc(g.path)}">${esc(g.path)}</span>
+        <b>${g.items.length} 条</b>
+        <button class="note-group__jump" data-file="${g.fileId}" type="button" title="跳到观点视图">跳转</button>
+      </div>
+      ${g.items.map(n => renderNoteCard(n)).join("")}
+    </div>`).join("") + (nomads.length ? `
+    <div class="note-group note-group--nomad">
+      <div class="note-group__head">
+        <svg><use href="#i-doc"/></svg>
+        <span class="note-group__path">未归属观点 · 游民</span>
+        <b>${nomads.length} 条</b>
+      </div>
+      ${nomads.map(n => renderNoteCard(n)).join("")}
+    </div>` : "");
+}
+
+/* 从论文抽屉 / 分组头跳到观点视图并打开指定文件 */
+async function jumpToTopicFile(fileId) {
+  closeDrawer();
+  setViewMode("topics");
+  await loadTopicTree();
+  const node = findTopicNode(TOPIC_TREE, fileId);
+  if (node) await openTopicFile(node);
+  else toast("找不到该观点文件", true);
+}
+
+function findTopicNode(nodes, id) {
+  for (const n of nodes || []) {
+    if (n.id === id) return n;
+    const hit = findTopicNode(n.children || [], id);
+    if (hit) return hit;
+  }
+  return null;
+}
+
+/* ---- 归属操作菜单 ---- */
+
+/* 把观点树展平成「文件」列表（带完整路径），供归属选择器使用 */
+function flattenTopicFiles(nodes, prefix) {
+  let out = [];
+  for (const n of nodes || []) {
+    const path = prefix ? prefix + " / " + n.name : n.name;
+    if (n.kind === "file") out.push({ id: n.id, name: n.name, path: path, entry_count: n.entry_count || 0 });
+    if (n.children && n.children.length) out = out.concat(flattenTopicFiles(n.children, path));
+  }
+  return out;
+}
+
+async function loadTopicFilesFlat() {
+  try {
+    const d = await req("GET", "/api/topics/tree");
+    TOPIC_TREE = d.topics || [];
+    return flattenTopicFiles(TOPIC_TREE, "");
+  } catch (e) {
+    return [];
+  }
+}
+
+/* 逐条思考的归属菜单：加入观点 / 移到别的观点 / 清除归属变游民 */
+async function openNoteAssignModal(note, onDone) {
+  const files = await loadTopicFilesFlat();
+  const current = note.topic_path || (note.topic_file_id ? "（观点）" : "");
+  openModal(`
+    <button class="icon-button" id="m-close" type="button" aria-label="关闭"><svg><use href="#i-close"/></svg></button>
+    <div class="modal-head">
+      <h3>这条思考归属到哪个观点</h3>
+      <p>当前：${current ? `<b>${esc(current)}</b>` : '<b style="color:var(--copper-700);">未归属 · 游民</b>'}。一条思考最多归属一个观点文件。</p>
+    </div>
+    ${files.length ? `
+      <div class="picker-search"><svg><use href="#i-search"/></svg>
+        <input type="search" id="assign-q" placeholder="搜索观点文件">
+      </div>
+      <div class="picker-list" id="assign-list"></div>
+      <div class="modal-actions">
+        <button class="scan-button scan-button--ghost" id="assign-clear" type="button" ${note.topic_file_id ? "" : "disabled"}>清除归属</button>
+        <button class="scan-button" id="assign-save" type="button" disabled>设为归属</button>
+      </div>`
+    : `<p class="dup-hint">还没有观点「文件」。请先切到观点视图：新建一个观点 → 在其中新建「文件」，再回来归属。</p>
+       <div class="modal-actions"><button class="scan-button scan-button--ghost" id="m-close2" type="button">知道了</button></div>`}
+  `);
+
+  $("#m-close").onclick = closeModal;
+  const close2 = $("#m-close2");
+  if (close2) close2.onclick = closeModal;
+  if (!files.length) return;
+
+  let chosen = note.topic_file_id || null;
+  const list = $("#assign-list");
+  const saveBtn = $("#assign-save");
+
+  const paint = (kw) => {
+    const k = (kw || "").trim().toLowerCase();
+    const hits = files.filter(f => !k || f.path.toLowerCase().includes(k));
+    list.innerHTML = hits.length ? hits.map(f => `
+      <div class="picker-row${f.id === chosen ? " is-chosen" : ""}" data-id="${f.id}">
+        <b>${esc(f.path)}</b>
+        <small>${f.entry_count} 条条目${f.id === note.topic_file_id ? " · 当前归属" : ""}</small>
+      </div>`).join("") : `<p class="tree-empty">没有匹配的观点文件</p>`;
+    $$(".picker-row", list).forEach(row => {
+      row.onclick = () => {
+        chosen = Number(row.dataset.id);
+        saveBtn.disabled = chosen === note.topic_file_id;
+        paint($("#assign-q").value);
+      };
+    });
+  };
+  paint("");
+  $("#assign-q").addEventListener("input", (e) => paint(e.target.value));
+
+  saveBtn.onclick = async () => {
+    if (!chosen) { toast("请先选一个观点文件"); return; }
+    try {
+      await req("POST", "/api/notes/assign", { note_id: note.id, topic_file_id: chosen });
+      closeModal();
+      toast("已归属到观点");
+      if (onDone) await onDone();
+    } catch (e) { toast(e.message, true); }
+  };
+  const clearBtn = $("#assign-clear");
+  if (clearBtn && note.topic_file_id) {
+    clearBtn.onclick = async () => {
+      try {
+        await req("POST", "/api/notes/assign", { note_id: note.id, topic_file_id: null });
+        closeModal();
+        toast("已清除归属，这条变成游民（思考本身没删）");
+        if (onDone) await onDone();
+      } catch (e) { toast(e.message, true); }
+    };
+  }
+}
+
+/* ============================================================
+   共享入口：把库里已有的论文引到当前文件夹（不重复导入）
+   ============================================================ */
+async function openSharePaperModal() {
+  let papers = [];
+  try {
+    const d = await req("GET", "/api/papers/search?q=");
+    papers = d.papers || [];
+  } catch (e) {
+    toast("加载论文列表失败", true);
+    return;
+  }
+  if (!papers.length) {
+    toast("库里还没有论文，先导入一篇吧", true);
+    return;
+  }
+  let fid = state.currentFolderId;
+  if (!fid) {
+    await ensureRootFolder();
+    fid = state.currentFolderId;
+  }
+  const folderName = (state.currentFolderPath || []).map(x => x.name).join(" / ") || "当前文件夹";
+
+  openModal(`
+    <button class="icon-button" id="m-close" type="button" aria-label="关闭"><svg><use href="#i-close"/></svg></button>
+    <div class="modal-head">
+      <h3>导入已有论文</h3>
+      <p>从库里选一篇已经存在的论文，引用到「${esc(folderName)}」。不会产生第二条记录，条目和观点归属都跟着走。</p>
+    </div>
+    <div class="picker-search"><svg><use href="#i-search"/></svg>
+      <input type="search" id="share-q" placeholder="搜索标题 / 期刊 / 作者">
+    </div>
+    <div class="picker-list" id="share-list"></div>
+    <div class="modal-actions">
+      <button class="scan-button" id="share-save" type="button" disabled>引用到当前文件夹</button>
+    </div>`);
+
+  $("#m-close").onclick = closeModal;
+  let chosen = null;
+  const list = $("#share-list");
+  const saveBtn = $("#share-save");
+
+  const paint = (kw) => {
+    const k = (kw || "").trim().toLowerCase();
+    const hits = papers.filter(p =>
+      !k || [p.title_en, p.title_zh, p.journal, p.authors].some(v => (v || "").toLowerCase().includes(k)));
+    list.innerHTML = hits.length ? hits.map(p => `
+      <div class="picker-row${p.id === chosen ? " is-chosen" : ""}" data-id="${p.id}">
+        <b>${esc(p.title_zh || p.title_en || "（无标题）")}</b>
+        <small>${esc(p.project_name || "")}${p.folder_name ? " / " + esc(p.folder_name) : ""} · ${p.note_count || 0} 条思考${p.doi ? " · " + esc(p.doi) : ""}</small>
+      </div>`).join("") : `<p class="tree-empty">没有匹配的论文</p>`;
+    $$(".picker-row", list).forEach(row => {
+      row.onclick = () => {
+        chosen = Number(row.dataset.id);
+        saveBtn.disabled = false;
+        paint($("#share-q").value);
+      };
+    });
+  };
+  paint("");
+  $("#share-q").addEventListener("input", (e) => paint(e.target.value));
+
+  saveBtn.onclick = async () => {
+    if (!chosen) return;
+    try {
+      await req("POST", "/api/papers/share", { paper_id: chosen, folder_id: fid });
+      closeModal();
+      toast("已引用库内已有论文");
+      await loadTree();
+      await loadPapers();
+      await loadProjects();
+    } catch (e) { toast(e.message, true); }
+  };
+}
+
+/* 分组头上的「跳转」按钮 */
+document.addEventListener("click", (e) => {
+  const jump = e.target.closest(".note-group__jump");
+  if (jump) jumpToTopicFile(parseInt(jump.dataset.file));
+});
