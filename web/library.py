@@ -932,6 +932,7 @@ def init_db() -> None:
     _migrate_note_flagged(conn)
     _migrate_note_layout(conn)
     _migrate_note_topic_file(conn)
+    _migrate_topic_kinds(conn)
     _migrate_paper_placement_backfill(conn)
     # 注意：Python sqlite3 只对 INSERT/UPDATE/DELETE 开启隐式事务，DDL(ALTER TABLE) 走自动提交。
     # 因此像「回填放置位置」这类 INSERT 必须显式提交，否则进程退出即回滚。
@@ -970,6 +971,24 @@ def _migrate_note_topic_file(conn: sqlite3.Connection) -> None:
     cols = {r[1] for r in conn.execute("PRAGMA table_info(note)")}
     if "topic_file_id" not in cols:
         conn.execute("ALTER TABLE note ADD COLUMN topic_file_id INTEGER REFERENCES topic_node(id) ON DELETE SET NULL")
+
+
+def _migrate_topic_kinds(conn: sqlite3.Connection) -> None:
+    """观点树结构收敛（一次性迁移）：
+
+    旧结构：观点(topic) → 文件夹(folder) → 文件(file)，只有最深层 file 才能挂条目。
+    新结构：文件夹(folder，可多层嵌套) → 观点(topic，叶子，直接挂文献条目)。
+    观点是最小单位、由多篇文献索引组成，对一批观点做分类，而不是在观点内部分类。
+
+    迁移规则：旧 kind=topic → folder（它们承担的是分组职能）；
+              旧 kind=file  → topic（原来装条目的"文件"就是现在的观点）。
+    note.topic_file_id 指向的节点 id 不变，条目归属关系零丢失。
+    只在库里还存在旧 kind='file' 时执行一次，幂等。
+    """
+    row = conn.execute("SELECT COUNT(*) c FROM topic_node WHERE kind='file'").fetchone()
+    if row and row["c"]:
+        conn.execute("UPDATE topic_node SET kind='folder' WHERE kind='topic'")
+        conn.execute("UPDATE topic_node SET kind='topic' WHERE kind='file'")
 
 
 def _migrate_paper_placement_backfill(conn: sqlite3.Connection) -> None:
@@ -1634,7 +1653,7 @@ def build_topic_tree(uid: int) -> list:
             roots.append(d)
     own_counts = {}
     for d in nodes.values():
-        if d["kind"] == "file":
+        if d["kind"] == "topic":
             own_counts[d["id"]] = conn.execute(
                 "SELECT COUNT(*) c FROM note WHERE topic_file_id = ?", (d["id"],)
             ).fetchone()["c"]
@@ -1783,7 +1802,7 @@ class Handler(BaseHTTPRequestHandler):
                 if not node:
                     self._error(404, "观点文件不存在")
                     return
-                if node["kind"] != "file":
+                if node["kind"] != "topic":
                     self._error(400, "该节点不是观点「文件」")
                     return
                 d = dict(node)
@@ -2342,7 +2361,7 @@ class Handler(BaseHTTPRequestHandler):
                 paths = find_local_pdf(filename)
                 json_response(self, {"ok": True, "paths": paths})
             elif path == "/api/topic_nodes":
-                # 新建观点树节点：topic=顶层观点 / folder=文件夹 / file=叶子文件
+                # 新建观点树节点：folder=文件夹（可多层嵌套）/ topic=观点（叶子，直接挂条目）
                 uid = require_user(self)
                 if not uid:
                     self._error(401, "未登录")
@@ -2351,7 +2370,7 @@ class Handler(BaseHTTPRequestHandler):
                 kind = body.get("kind", "folder")
                 name = (body.get("name") or "").strip()
                 parent_id = body.get("parent_id")
-                if kind not in ("topic", "folder", "file"):
+                if kind not in ("topic", "folder"):
                     self._error(400, "节点类型不合法")
                     return
                 if not name:
@@ -2402,7 +2421,7 @@ class Handler(BaseHTTPRequestHandler):
                     if not t:
                         self._error(404, "观点文件不存在")
                         return
-                    if t["kind"] != "file":
+                    if t["kind"] != "topic":
                         self._error(400, "只能归属到观点下的「文件」节点")
                         return
                     conn.execute("UPDATE note SET topic_file_id = ? WHERE id = ?", (int(topic_file_id), note_id))
@@ -2592,7 +2611,7 @@ class Handler(BaseHTTPRequestHandler):
                     if not t:
                         self._error(404, "观点文件不存在")
                         return
-                    if t["kind"] != "file":
+                    if t["kind"] != "topic":
                         self._error(400, "只能归属到观点下的「文件」节点")
                         return
                     topic_file_id = int(topic_file_id)

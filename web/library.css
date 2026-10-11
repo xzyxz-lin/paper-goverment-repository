@@ -1367,6 +1367,8 @@ body.view-paper-view header.topbar > .topbar-actions { display: none !important;
   box-shadow: 0 4px 18px rgba(20,28,29,.05);
 }
 .pv-card.is-flagged { border-left-color: var(--danger-600); }
+/* 观点视图：不同文献的条目卡片之间拉开距离，避免连成一片分不清归属 */
+#topic-notes .pv-card { margin-bottom: 26px; }
 .pv-card__head {
   display: flex;
   align-items: center;

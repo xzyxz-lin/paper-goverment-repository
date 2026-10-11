@@ -3185,18 +3185,11 @@ function bindTopics() {
   $$(".view-switch__btn", sw).forEach(btn => {
     btn.addEventListener("click", () => setViewMode(btn.dataset.viewmode));
   });
+  // 新建观点 / 新建文件夹：建在当前选中的文件夹里；没选中就建在顶层
   const addTopic = $("#add-topic-btn");
-  if (addTopic) addTopic.addEventListener("click", () => createTopicNode("topic", null));
+  if (addTopic) addTopic.addEventListener("click", () => createTopicNode("topic", currentTopicParentId()));
   const addFolder = $("#add-topic-folder-btn");
-  if (addFolder) addFolder.addEventListener("click", () => {
-    const p = currentTopicParentId();
-    if (p) createTopicNode("folder", p);
-  });
-  const addFile = $("#add-topic-file-btn");
-  if (addFile) addFile.addEventListener("click", () => {
-    const p = currentTopicParentId();
-    if (p) createTopicNode("file", p);
-  });
+  if (addFolder) addFolder.addEventListener("click", () => createTopicNode("folder", currentTopicParentId()));
   const addNote = $("#topic-add-note-btn");
   if (addNote) addNote.addEventListener("click", () => {
     if (TOPIC_CURRENT_FILE) openTopicNoteComposer(TOPIC_CURRENT_FILE.id);
@@ -3244,19 +3237,19 @@ function renderTopicTree() {
     const activeId = TOPIC_CURRENT_FILE ? TOPIC_CURRENT_FILE.id
       : (TOPIC_CURRENT_PARENT ? TOPIC_CURRENT_PARENT.id : null);
     const isActive = activeId === node.id;
-    const icon = node.kind === "file" ? "#i-doc" : (node.kind === "topic" ? "#i-flag" : "#i-folder");
-    const isFile = node.kind === "file";
+    const icon = node.kind === "topic" ? "#i-flag" : "#i-folder";
+    const isTopic = node.kind === "topic";
     return `
       <div class="tree-folder" data-tid="${node.id}">
         <div class="tree-row ${isActive ? "is-active" : ""} ${isOpen && hasChildren ? "is-open" : ""}" data-tid="${node.id}" data-kind="${node.kind}">
           <svg class="tree-chevron ${hasChildren ? "" : "is-leaf"}"><use href="#i-chevron"/></svg>
           <svg class="folder-ico"><use href="${icon}"/></svg>
           <span class="tree-name">${esc(node.name)}</span>
-          <span class="tree-count">${node.entry_count || 0}</span>
+          <span class="tree-count" title="${isTopic ? "该观点共 " + (node.entry_count || 0) + " 条条目" : "含子级观点共 " + (node.entry_count || 0) + " 条条目"}">${node.entry_count || 0}</span>
           <span class="tree-actions">
-            ${isFile ? "" : `
+            ${isTopic ? "" : `
             <button data-act="addf" title="新建子文件夹"><svg><use href="#i-folder"/></svg></button>
-            <button data-act="addd" title="新建文件（文件才能装条目）"><svg><use href="#i-doc"/></svg></button>`}
+            <button data-act="addt" title="新建观点（观点直接装条目）"><svg><use href="#i-flag"/></svg></button>`}
             <button data-act="del" title="删除（其下条目会变回游民，思考不会丢）"><svg><use href="#i-trash"/></svg></button>
           </span>
         </div>
@@ -3275,21 +3268,21 @@ function renderTopicTree() {
       if (act) {
         e.stopPropagation();
         if (act.dataset.act === "addf") createTopicNode("folder", tid);
-        else if (act.dataset.act === "addd") createTopicNode("file", tid);
+        else if (act.dataset.act === "addt") createTopicNode("topic", tid);
         else if (act.dataset.act === "del") deleteTopicNode(node);
         return;
       }
       if (node.children && node.children.length) {
         TOPIC_OPEN[tid] = !(TOPIC_OPEN[tid] !== false);
       }
-      if (node.kind === "file") openTopicFile(node);
+      if (node.kind === "topic") openTopicFile(node);
       else onTopicNodeClick(node);
     });
   });
 }
 
 async function deleteTopicNode(node) {
-  const label = node.kind === "topic" ? "观点" : (node.kind === "folder" ? "文件夹" : "文件");
+  const label = node.kind === "topic" ? "观点" : "文件夹";
   const extra = node.children && node.children.length ? "（含其所有子级）" : "";
   if (!confirm(`删除${label}「${node.name}」${extra}？\n它下面的条目会变回「未归属 · 游民」（思考本身还在论文里），观点层级结构删除后不可恢复。`)) return;
   try {
@@ -3310,22 +3303,20 @@ async function deleteTopicNode(node) {
 }
 
 function onTopicNodeClick(n) {
-  if (n.kind === "file") {
+  if (n.kind === "topic") {
     openTopicFile(n);
     return;
   }
   TOPIC_CURRENT_PARENT = n;
   TOPIC_CURRENT_FILE = null;
   renderTopicTree();
-  const label = n.kind === "topic" ? "观点" : "文件夹";
   $("#topic-crumbs").textContent = n.name;
   $("#topic-file-title").textContent = n.name;
   $("#topic-hint").hidden = false;
-  $("#topic-hint").textContent = "这是" + label + "，可在其中新建子文件夹或「文件」。只有「文件」才能装条目。";
+  $("#topic-hint").textContent = "这是文件夹，可在其中新建子文件夹或观点；点左侧某个观点即可查看它引用的文献条目。";
   $("#topic-notes").innerHTML = "";
   $("#topic-add-note-btn").disabled = true;
   $("#add-topic-folder-btn").disabled = false;
-  $("#add-topic-file-btn").disabled = false;
 }
 
 async function openTopicFile(n) {
@@ -3340,7 +3331,6 @@ async function openTopicFile(n) {
     $("#topic-hint").hidden = true;
     $("#topic-add-note-btn").disabled = false;
     $("#add-topic-folder-btn").disabled = true;
-    $("#add-topic-file-btn").disabled = true;
     renderTopicNotes(f);
   } catch (e) {
     toast("加载观点文件失败", true);
@@ -3352,7 +3342,7 @@ function renderTopicNotes(f) {
   if (!host) return;
   host.innerHTML = "";
   if (!f.notes || !f.notes.length) {
-    host.innerHTML = '<p class="tree-empty">这个文件下还没有条目。点右上角「新增条目」开始记录。</p>';
+    host.innerHTML = '<p class="tree-empty">这个观点下还没有条目。点右上角「新增条目」开始记录。</p>';
     return;
   }
   const refresh = () => { if (TOPIC_CURRENT_FILE) return openTopicFile(TOPIC_CURRENT_FILE); };
@@ -3670,7 +3660,7 @@ function flattenTopicFiles(nodes, prefix) {
   let out = [];
   for (const n of nodes || []) {
     const path = prefix ? prefix + " / " + n.name : n.name;
-    if (n.kind === "file") out.push({ id: n.id, name: n.name, path: path, entry_count: n.entry_count || 0 });
+    if (n.kind === "topic") out.push({ id: n.id, name: n.name, path: path, entry_count: n.entry_count || 0 });
     if (n.children && n.children.length) out = out.concat(flattenTopicFiles(n.children, path));
   }
   return out;
