@@ -1736,3 +1736,16 @@ body.view-paper-view header.topbar > .topbar-actions { display: none !important;
 .note-card__assign.is-set { border-color: var(--copper-600); color: var(--copper-700); }
 
 .picker-row.is-chosen { background: rgba(31,91,87,.11); box-shadow: inset 3px 0 0 var(--oxide-700); }
+
+/* ============ 宽弹窗 + 来源文献选择器两栏布局 ============ */
+.modal.modal--wide { width: min(860px, calc(100vw - 40px)); }
+.picker-layout { display: grid; grid-template-columns: 230px 1fr; gap: 16px; margin-top: 14px; }
+.picker-tree { max-height: 380px; overflow-y: auto; border: 1px solid var(--paper-200); border-radius: 3px; padding: 8px 6px; background: rgba(255,255,255,.42); }
+.picker-tree .tree-row { min-height: 32px; font-size: .82rem; padding: 0 8px; }
+.picker-tree .tree-row .tree-count { font-size: .62rem; }
+.picker-layout .picker-list { max-height: 380px; }
+@media (max-width: 720px) {
+  .modal.modal--wide { width: calc(100vw - 20px); }
+  .picker-layout { grid-template-columns: 1fr; }
+  .picker-tree { max-height: 200px; }
+}

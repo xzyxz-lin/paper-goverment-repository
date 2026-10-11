@@ -1733,7 +1733,7 @@ function enterArrangeMode(card, note) {
     order: i,
   }));
   if (blocks.length < 2) { toast("这条思考只有 1 个块，无需排版"); return; }
-  state.arrange = { noteId: note.id, blocks, dirty: false, selectedKey: null };
+  state.arrange = { noteId: note.id, note, blocks, dirty: false, selectedKey: null };
   card.classList.add("is-arranging");
   const btn = card.querySelector(".pv-card__action[data-action='arrange'] span");
   if (btn) btn.textContent = "完成";
@@ -1926,7 +1926,8 @@ async function swapArrangeBlocks(keyA, keyB, card) {
 async function applyArrangeAndSave(card) {
   const a = state.arrange;
   if (!a) return;
-  const note = (state._viewPaper?.notes || []).find(n => n.id === a.noteId);
+  // 优先用进入排版模式时存下的 note 引用（观点视图里 state._viewPaper 是别的论文，不能靠它找）
+  const note = a.note || (state._viewPaper?.notes || []).find(n => n.id === a.noteId);
   if (!note) return;
   const layout = arrangeLayout();
   const body = card.querySelector(".pv-card__body");
@@ -2013,15 +2014,17 @@ function applyFullscreenScale() {
   FULLSCREEN_SCALE_CLASSES.forEach((c, i) => content.classList.toggle(c, i === fullscreenScaleIndex));
 }
 
-function openNoteFullscreen(n) {
+function openNoteFullscreen(n, idx) {
   const overlay = $("#note-fullscreen");
   const content = $("#note-fullscreen-content");
   fullscreenScaleIndex = 1; // 默认标准大小
+  // idx：显式传序号（观点视图里 state._viewPaper 是别的论文，不能用 indexOf 算）
+  const seq = idx != null ? idx : (state._viewPaper?.notes?.indexOf(n) + 1 || "");
   content.innerHTML = `
     ${flagBadge(n)}
     <div class="pv-card__head" style="border-color:rgba(255,255,255,.12);">
       <span class="pv-card__time" style="color:rgba(255,255,255,.7);">${esc((n.created_at || "").replace("T", " ").slice(0, 16))}</span>
-      <span class="pv-card__index" style="color:rgba(255,255,255,.55);">#${esc(String(state._viewPaper?.notes?.indexOf(n) + 1 || ""))}</span>
+      <span class="pv-card__index" style="color:rgba(255,255,255,.55);">#${esc(String(seq))}</span>
     </div>
     <div class="note-fullscreen__body">${renderViewNoteBlocks(n)}</div>`;
   applyFullscreenScale();
@@ -2168,7 +2171,9 @@ function buildSectionsFromNote(note) {
 }
 
 function openNoteComposeEditor(opts) {
-  const { paperId, note, topicFileId } = opts || {};
+  const { paperId, note } = opts || {};
+  // 编辑已有条目时，默认沿用它现在的观点归属——保存后才能正确刷新观点文件
+  const topicFileId = opts.topicFileId || (note && note.topic_file_id) || null;
   const isEdit = !!note;
   let sections;
   let composeImgSeq = 0;
@@ -2601,13 +2606,17 @@ function openNoteEditor(note) {
 }
 
 /* ============ 弹窗 ============ */
-function openModal(html) {
-  $("#modal").innerHTML = html;
+function openModal(html, cls) {
+  const m = $("#modal");
+  m.className = "modal" + (cls ? " " + cls : "");
+  m.innerHTML = html;
   $("#modal-backdrop").hidden = false;
 }
 function closeModal() {
+  const m = $("#modal");
+  m.className = "modal";
+  m.innerHTML = "";
   $("#modal-backdrop").hidden = true;
-  $("#modal").innerHTML = "";
 }
 // 注意：不再给遮罩绑定“点击空白处关闭”。数据录入弹框（导入/编辑论文、新建项目/文件夹）
 // 必须显式通过右上角叉叉或保存按钮关闭，避免误点空白处丢失已填内容。
@@ -2677,8 +2686,8 @@ async function deleteFolder(fid) {
   updateSelectionUI();
 }
 
-/* 导入论文（弹窗：拖拽 PDF / 选文件） */
-function openPaperModal(existing) {
+/* 导入论文（弹窗：拖拽 PDF / 选文件）；onSaved(newPaperId) —— 保存成功后回调（供来源文献选择器等场景接续） */
+function openPaperModal(existing, onSaved) {
   const isEdit = !!existing;
   openModal(`
     <button class="icon-button" id="m-close" type="button" aria-label="关闭"><svg><use href="#i-close"/></svg></button>
@@ -2731,6 +2740,7 @@ function openPaperModal(existing) {
         await req("PUT", "/api/papers", { id: existing.id, ...payload });
         toast("已保存修改");
         closeModal();
+        if (onSaved) onSaved(existing.id);
         await openPaperDrawer(existing.id);
         await loadPapers();
       } else {
@@ -2745,9 +2755,10 @@ function openPaperModal(existing) {
           const hits = await checkPaperDuplicate(payload.doi, payload.title_en || payload.title_zh);
           if (hits.length) { openDupChoiceModal(hits, payload, fid); return; }
         }
-        await req("POST", "/api/papers", { folder_id: fid, ...payload });
+        const r = await req("POST", "/api/papers", { folder_id: fid, ...payload });
         toast("论文已保存");
         closeModal();
+        if (onSaved) onSaved(r && r.id);
         await loadTree();
         await loadPapers();
         await loadProjects();
@@ -3190,38 +3201,81 @@ async function loadTopicTree() {
   renderTopicTree();
 }
 
+/* 观点树：与论文视图的文件夹树同一套结构 —— 可折叠箭头、行内新建/删除、计数、缩进连线 */
+let TOPIC_OPEN = {}; // 折叠状态（undefined = 默认展开）
+
 function renderTopicTree() {
   const host = $("#topic-tree");
   if (!host) return;
-  host.innerHTML = "";
-  if (!TOPIC_TREE.length) {
-    host.innerHTML = '<p class="tree-empty">还没有观点。点右上角「新建观点」开始。</p>';
-    return;
-  }
-  appendTopicRows(host, TOPIC_TREE, 0);
-}
+  const renderNode = (node) => {
+    const isOpen = TOPIC_OPEN[node.id] !== false;
+    const hasChildren = node.children && node.children.length > 0;
+    const activeId = TOPIC_CURRENT_FILE ? TOPIC_CURRENT_FILE.id
+      : (TOPIC_CURRENT_PARENT ? TOPIC_CURRENT_PARENT.id : null);
+    const isActive = activeId === node.id;
+    const icon = node.kind === "file" ? "#i-doc" : (node.kind === "topic" ? "#i-flag" : "#i-folder");
+    const isFile = node.kind === "file";
+    return `
+      <div class="tree-folder" data-tid="${node.id}">
+        <div class="tree-row ${isActive ? "is-active" : ""} ${isOpen && hasChildren ? "is-open" : ""}" data-tid="${node.id}" data-kind="${node.kind}">
+          <svg class="tree-chevron ${hasChildren ? "" : "is-leaf"}"><use href="#i-chevron"/></svg>
+          <svg class="folder-ico"><use href="${icon}"/></svg>
+          <span class="tree-name">${esc(node.name)}</span>
+          <span class="tree-count">${node.entry_count || 0}</span>
+          <span class="tree-actions">
+            ${isFile ? "" : `
+            <button data-act="addf" title="新建子文件夹"><svg><use href="#i-folder"/></svg></button>
+            <button data-act="addd" title="新建文件（文件才能装条目）"><svg><use href="#i-doc"/></svg></button>`}
+            <button data-act="del" title="删除（其下条目会变回游民，思考不会丢）"><svg><use href="#i-trash"/></svg></button>
+          </span>
+        </div>
+        ${hasChildren && isOpen ? `<div class="tree-children">${node.children.map(renderNode).join("")}</div>` : ""}
+      </div>`;
+  };
+  host.innerHTML = TOPIC_TREE.length ? TOPIC_TREE.map(n => renderNode(n)).join("")
+    : '<p class="tree-empty">还没有观点。点右上角「新建观点」开始。</p>';
 
-function appendTopicRows(host, nodes, depth) {
-  nodes.forEach(n => {
-    host.appendChild(topicNodeRow(n, depth));
-    if (n.children && n.children.length) appendTopicRows(host, n.children, depth + 1);
+  $$(".tree-row", host).forEach(row => {
+    row.addEventListener("click", (e) => {
+      const tid = parseInt(row.dataset.tid);
+      const node = findTopicNode(TOPIC_TREE, tid);
+      if (!node) return;
+      const act = e.target.closest("[data-act]");
+      if (act) {
+        e.stopPropagation();
+        if (act.dataset.act === "addf") createTopicNode("folder", tid);
+        else if (act.dataset.act === "addd") createTopicNode("file", tid);
+        else if (act.dataset.act === "del") deleteTopicNode(node);
+        return;
+      }
+      if (node.children && node.children.length) {
+        TOPIC_OPEN[tid] = !(TOPIC_OPEN[tid] !== false);
+      }
+      if (node.kind === "file") openTopicFile(node);
+      else onTopicNodeClick(node);
+    });
   });
 }
 
-function topicNodeRow(n, depth) {
-  const row = document.createElement("div");
-  const activeId = TOPIC_CURRENT_FILE ? TOPIC_CURRENT_FILE.id
-    : (TOPIC_CURRENT_PARENT ? TOPIC_CURRENT_PARENT.id : null);
-  row.className = "tree-row" + (activeId === n.id ? " is-active" : "");
-  row.style.paddingLeft = (10 + depth * 14) + "px";
-  row.dataset.tid = n.id;
-  row.dataset.kind = n.kind;
-  const icon = n.kind === "file" ? "#i-doc" : (n.kind === "topic" ? "#i-flag" : "#i-folder");
-  row.innerHTML = '<svg class="folder-ico"><use href="' + icon + '"/></svg>'
-    + '<span class="tree-name">' + esc(n.name) + '</span>'
-    + (n.entry_count ? '<span class="tree-count">' + n.entry_count + '</span>' : "");
-  row.addEventListener("click", () => onTopicNodeClick(n));
-  return row;
+async function deleteTopicNode(node) {
+  const label = node.kind === "topic" ? "观点" : (node.kind === "folder" ? "文件夹" : "文件");
+  const extra = node.children && node.children.length ? "（含其所有子级）" : "";
+  if (!confirm(`删除${label}「${node.name}」${extra}？\n它下面的条目会变回「未归属 · 游民」（思考本身还在论文里），观点层级结构删除后不可恢复。`)) return;
+  try {
+    const r = await req("DELETE", "/api/topic_nodes?id=" + node.id);
+    toast(r.message || "已删除");
+    // 当前打开/选中的节点被删掉就清空右侧
+    const stillThere = (n) => n && findTopicNode(TOPIC_TREE, n.id);
+    if (TOPIC_CURRENT_FILE && !stillThere(TOPIC_CURRENT_FILE)) {
+      TOPIC_CURRENT_FILE = null;
+      $("#topic-notes").innerHTML = "";
+      $("#topic-file-title").textContent = "未选择文件";
+      $("#topic-add-note-btn").disabled = true;
+      $("#topic-crumbs").textContent = "";
+    }
+    if (TOPIC_CURRENT_PARENT && !stillThere(TOPIC_CURRENT_PARENT)) TOPIC_CURRENT_PARENT = null;
+    await loadTopicTree();
+  } catch (e) { toast(e.message, true); }
 }
 
 function onTopicNodeClick(n) {
@@ -3270,13 +3324,14 @@ function renderTopicNotes(f) {
     host.innerHTML = '<p class="tree-empty">这个文件下还没有条目。点右上角「新增条目」开始记录。</p>';
     return;
   }
+  const refresh = () => { if (TOPIC_CURRENT_FILE) return openTopicFile(TOPIC_CURRENT_FILE); };
   f.notes.forEach((n, i) => {
     let card;
     try {
       // 注意：renderViewNoteCard 返回的是 HTML 字符串（renderPaperView 里拼 innerHTML 用的），
-      // 这里要插来源标签 / 归属按钮，必须先转成真正的 DOM 元素，否则 insertBefore 直接 TypeError
+      // 这里要插来源标签 / 绑定按钮，必须先转成真正的 DOM 元素，否则 insertBefore 直接 TypeError
       const t = document.createElement("template");
-      t.innerHTML = renderViewNoteCard(n, i).trim();
+      t.innerHTML = renderViewNoteCard(n, i + 1).trim();
       card = t.content.firstElementChild;
       if (!card) throw new Error("empty card");
     } catch (e) {
@@ -3291,17 +3346,38 @@ function renderTopicNotes(f) {
         + esc(n.paper.title_zh || n.paper.title_en || "未命名") + "</b>";
       card.insertBefore(tag, card.firstChild);
     }
-    // 归属菜单：在这篇文章里可以把条目移到别的观点，或清除归属变游民
-    const head = card.querySelector(".pv-card__actions");
-    if (head) {
-      const btn = document.createElement("button");
-      btn.className = "pv-card__action";
-      btn.type = "button";
-      btn.title = "移到别的观点，或清除归属变游民";
-      btn.innerHTML = '<svg><use href="#i-flag"/></svg><span>归属</span>';
-      btn.onclick = () => openNoteAssignModal(n, () => openTopicFile(TOPIC_CURRENT_FILE));
-      head.insertBefore(btn, head.firstChild);
-    }
+    // 绑定卡片上的全部操作按钮 —— 与论文 View 页同一套行为，缺一个就是点不动
+    const paperId = n.paper_id || (n.paper && n.paper.id);
+    $$(".pv-card__action[data-action]", card).forEach(btn => {
+      const act = btn.dataset.action;
+      if (act === "add") {
+        // 在当前观点文件里续写一条，来源沿用这条思考的论文
+        btn.onclick = () => openNoteComposeEditor({
+          paperId,
+          topicFileId: TOPIC_CURRENT_FILE ? TOPIC_CURRENT_FILE.id : null,
+        });
+      } else if (act === "delete") {
+        btn.onclick = async () => {
+          if (!confirm("删除这条思考？提示条里点「撤销」可立即找回。")) return;
+          try {
+            await req("DELETE", "/api/notes?id=" + n.id);
+            toastAction("已删除 1 条思考", "撤销", () => undoDeleteNotes([n.id], refresh));
+            await refresh();
+          } catch (e) { toast(e.message, true); }
+        };
+      } else if (act === "edit") {
+        btn.onclick = () => openNoteComposeEditor({ note: n });
+      } else if (act === "assign") {
+        btn.onclick = () => openNoteAssignModal(n, refresh);
+      } else if (act === "arrange") {
+        btn.onclick = () => {
+          if (state.arrange && state.arrange.noteId === n.id) exitArrangeMode();
+          else enterArrangeMode(card, n);
+        };
+      } else if (act === "fullscreen") {
+        btn.onclick = () => openNoteFullscreen(n, i + 1);
+      }
+    });
     host.appendChild(card);
   });
 }
@@ -3313,71 +3389,149 @@ async function createTopicNode(kind, parentId) {
   try {
     await req("POST", "/api/topic_nodes", { kind: kind, name: name.trim(), parent_id: parentId });
     toast("已创建" + label);
+    if (parentId) TOPIC_OPEN[parentId] = true; // 新建的子级要能立刻看到
     loadTopicTree();
   } catch (e) {
     toast("创建失败：" + ((e && e.error) || "未知错误"), true);
   }
 }
 
-/* 观点视图新增条目：第一步强制先选来源文献，选完才进入编辑器 */
+/* 观点视图新增条目：第一步强制先选来源文献，选完才进入编辑器。
+   布局：左侧 项目→文件夹 树形导航（论文是按项目组织的，选文献也该这样，不能一上来平铺几千篇），
+   右侧论文列表。论文同时给英文和中文标题 —— 平时读的是英文，只给中文反而认不出是哪篇。
+   还可以就地导入一篇新论文（拖 PDF / 手填），导入完回到本选择器。 */
 async function openTopicNoteComposer(topicFileId) {
+  const load = async (q) => {
+    const d = await req("GET", "/api/papers/search?q=" + encodeURIComponent(q || ""));
+    return d.papers || [];
+  };
   let papers = [];
   try {
-    const d = await req("GET", "/api/papers/search?q=");
-    papers = d.papers || [];
+    papers = await load("");
   } catch (e) {
     toast("加载论文列表失败", true);
     return;
   }
-  if (!papers.length) {
-    toast("库里还没有论文，请先切到论文视图导入", true);
-    return;
-  }
 
-  openModal(
-    '<div class="modal-head"><h3>选择来源文献</h3>'
-    + '<p>观点条目必须绑定到库内已有论文，保证写文章时条条可追溯、可跳转。</p></div>'
-    + '<div class="picker-search"><svg><use href="#i-search"/></svg>'
-    + '<input type="search" id="topic-paper-q" placeholder="搜索标题 / 期刊 / 作者"></div>'
-    + '<div class="picker-list" id="topic-paper-list"></div>'
-    + '<div class="modal-actions">'
-    + '<button class="scan-button scan-button--ghost" id="topic-picker-cancel" type="button">取消</button>'
-    + '</div>'
-  );
+  openModal(`
+    <button class="icon-button" id="m-close" type="button" aria-label="关闭"><svg><use href="#i-close"/></svg></button>
+    <p class="eyebrow">SOURCE PAPER</p>
+    <h3>选择来源文献</h3>
+    <p class="modal-hint">观点条目必须绑定到库内已有论文，保证条条可追溯、可跳转。左侧按项目 / 文件夹定位，也可以直接搜索，或导入一篇新论文。</p>
+    <div class="picker-search"><svg><use href="#i-search"/></svg>
+      <input type="search" id="topic-paper-q" placeholder="搜索标题（中英均可）/ 期刊 / 作者">
+    </div>
+    <div class="picker-layout">
+      <div class="picker-tree" id="topic-paper-tree"></div>
+      <div class="picker-list" id="topic-paper-list"></div>
+    </div>
+    <div class="modal-actions">
+      <button class="scan-button scan-button--ghost" id="topic-import" type="button"><svg style="width:14px;height:14px;"><use href="#i-upload"/></svg><span>导入新论文</span></button>
+      <button class="scan-button scan-button--ghost" id="topic-picker-cancel" type="button">取消</button>
+    </div>`, "modal--wide");
+  $("#m-close").onclick = closeModal;
 
+  let current = { projectId: null, folderId: null }; // null = 全部
   const list = $("#topic-paper-list");
-  const renderList = (rows) => {
-    list.innerHTML = "";
-    if (!rows.length) {
-      list.innerHTML = '<p class="tree-empty">没有匹配的论文</p>';
-      return;
-    }
-    rows.forEach(p => {
-      const row = document.createElement("div");
-      row.className = "picker-row";
-      row.innerHTML = "<b>" + esc(p.title_zh || p.title_en || "未命名") + "</b>"
-        + "<small>" + esc([p.project_name, p.folder_name].filter(Boolean).join(" / ")) + "</small>";
-      row.addEventListener("click", () => {
-        closeModal();
-        openNoteComposeEditor({ paperId: p.id, topicFileId: topicFileId });
-      });
-      list.appendChild(row);
+  const treeHost = $("#topic-paper-tree");
+  const q = $("#topic-paper-q");
+
+  /* 左侧树：从论文数据聚合出 项目 → 文件夹（没有论文的空文件夹不出现） */
+  const buildNav = () => {
+    const byProject = new Map();
+    papers.forEach(p => {
+      if (!byProject.has(p.project_id)) byProject.set(p.project_id, { id: p.project_id, name: p.project_name || "（未命名项目）", folders: new Map() });
+      const proj = byProject.get(p.project_id);
+      const fid = p.folder_id;
+      if (!proj.folders.has(fid)) proj.folders.set(fid, { id: fid, name: p.folder_name || "（未命名文件夹）", count: 0 });
+      proj.folders.get(fid).count++;
+    });
+    const row = (icon, label, count, active, onclick, indent) => {
+      const el = document.createElement("div");
+      el.className = "tree-row" + (active ? " is-active" : "");
+      if (indent) el.style.paddingLeft = indent + "px";
+      el.innerHTML = `<svg class="folder-ico"><use href="${icon}"/></svg>`
+        + `<span class="tree-name">${esc(label)}</span>`
+        + `<span class="tree-count">${count}</span>`;
+      el.addEventListener("click", onclick);
+      return el;
+    };
+    treeHost.innerHTML = "";
+    treeHost.appendChild(row("#i-grid", "全部论文", papers.length,
+      current.projectId === null, () => { current = { projectId: null, folderId: null }; buildNav(); paintList(); }));
+    Array.from(byProject.values()).sort((a, b) => a.name.localeCompare(b.name, "zh")).forEach(proj => {
+      const total = Array.from(proj.folders.values()).reduce((s, f) => s + f.count, 0);
+      treeHost.appendChild(row("#i-folder", proj.name, total,
+        current.projectId === proj.id && current.folderId === null,
+        () => { current = { projectId: proj.id, folderId: null }; buildNav(); paintList(); }));
+      Array.from(proj.folders.values())
+        .sort((a, b) => a.name.localeCompare(b.name, "zh"))
+        .forEach(f => {
+          treeHost.appendChild(row("#i-folder", f.name, f.count,
+            current.folderId === f.id,
+            () => { current = { projectId: proj.id, folderId: f.id }; buildNav(); paintList(); }, 26));
+        });
     });
   };
-  renderList(papers);
 
-  const q = $("#topic-paper-q");
+  /* 右侧列表：英文标题为主行，中文标题（若有）放副行 —— 平时读的是英文，只给中文认不出是哪篇 */
+  const paperRow = (p) => {
+    const en = (p.title_en || "").trim();
+    const zh = (p.title_zh || "").trim();
+    const main = en || zh || "（无标题）";
+    const sub = (en && zh ? zh : "") + (en && zh ? " · " : "")
+      + [p.project_name, p.folder_name].filter(Boolean).join(" / ")
+      + (p.journal ? " · " + p.journal : "");
+    const row = document.createElement("div");
+    row.className = "picker-row";
+    row.innerHTML = `<b title="${esc(main)}">${esc(main)}</b><small>${esc(sub)}</small>`;
+    row.addEventListener("click", () => {
+      closeModal();
+      openNoteComposeEditor({ paperId: p.id, topicFileId });
+    });
+    return row;
+  };
+  const paintList = () => {
+    const kw = q.value.trim().toLowerCase();
+    let rows = papers;
+    if (kw) {
+      rows = papers.filter(p => [p.title_en, p.title_zh, p.journal, p.authors]
+        .some(v => (v || "").toLowerCase().includes(kw)));
+    } else {
+      if (current.folderId != null) rows = papers.filter(p => p.folder_id === current.folderId);
+      else if (current.projectId != null) rows = papers.filter(p => p.project_id === current.projectId);
+    }
+    rows = rows.slice().sort((a, b) => (a.title_en || a.title_zh || "").localeCompare(b.title_en || b.title_zh || ""));
+    list.innerHTML = "";
+    if (!rows.length) {
+      list.innerHTML = '<p class="tree-empty">'
+        + (kw ? "没有匹配的论文，换个关键词，或点左下角「导入新论文」"
+              : "这个位置还没有论文。换左侧其它文件夹，或点「导入新论文」")
+        + "</p>";
+      return;
+    }
+    rows.forEach(p => list.appendChild(paperRow(p)));
+  };
+
+  buildNav();
+  paintList();
+
   let timer = null;
   q.addEventListener("input", () => {
     clearTimeout(timer);
-    timer = setTimeout(async () => {
-      try {
-        const d = await req("GET", "/api/papers/search?q=" + encodeURIComponent(q.value.trim()));
-        renderList(d.papers || []);
-      } catch (e) { /* 忽略搜索失败 */ }
-    }, 220);
+    timer = setTimeout(() => paintList(), 180);
   });
   $("#topic-picker-cancel").addEventListener("click", closeModal);
+  // 就地导入新论文：保存成功后重新打开本选择器（论文会出现在列表里）
+  $("#topic-import").addEventListener("click", () => {
+    openPaperModal(null, async () => {
+      try {
+        const d = await req("GET", "/api/papers/search?q=");
+        papers = d.papers || [];
+      } catch (e) { /* 下次打开会重新加载 */ }
+      openTopicNoteComposer(topicFileId);
+    });
+  });
 }
 
 /* ============================================================
