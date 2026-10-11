@@ -1417,7 +1417,9 @@ function serializeCompose(editor) {
         if (oidx in idxMap) content += `[[img:${idxMap[oidx]}]]`;
       }
       else if (ch.nodeName === "BR") { content += "\n"; }
-      else if (ch.nodeName === "DIV" || ch.nodeName === "P") { walk(ch); content += "\n"; }
+      // Chrome 的 contenteditable 按 Enter 会产生 <div>，裸文本节点后紧跟 <div>/<p> 时
+      // 必须先补一个换行，否则第一行和第二行会被 walk 挤到一起（换行丢失的根因）
+      else if (ch.nodeName === "DIV" || ch.nodeName === "P") { if (content && !content.endsWith("\n")) content += "\n"; walk(ch); content += "\n"; }
       else { walk(ch); }
     });
   };
@@ -1972,7 +1974,9 @@ function serializeAddNoteEditor(editor) {
         if (oidx in idxMap) content += `[[img:${idxMap[oidx]}]]`;
       }
       else if (ch.nodeName === "BR") { content += "\n"; }
-      else if (ch.nodeName === "DIV" || ch.nodeName === "P") { walk(ch); content += "\n"; }
+      // Chrome 的 contenteditable 按 Enter 会产生 <div>，裸文本节点后紧跟 <div>/<p> 时
+      // 必须先补一个换行，否则第一行和第二行会被 walk 挤到一起（换行丢失的根因）
+      else if (ch.nodeName === "DIV" || ch.nodeName === "P") { if (content && !content.endsWith("\n")) content += "\n"; walk(ch); content += "\n"; }
       else { walk(ch); }
     });
   };
@@ -2063,7 +2067,7 @@ function renderViewNoteCard(n, idx) {
           <button class="pv-card__action" data-action="assign" type="button" title="加入 / 移动到某个观点，或清除归属变游民"><svg><use href="#i-flag"/></svg><span>归属</span></button>
           <button class="pv-card__action" data-action="arrange" type="button" title="拖拽排版：按住块拖到另一块上对换位置"><svg><use href="#i-layout"/></svg><span>排版</span></button>
           <button class="pv-card__action" data-action="fullscreen" type="button" title="全屏查看"><svg><use href="#i-image"/></svg><span>全屏</span></button>
-          <span class="pv-card__index">#${idx}</span>
+          <span class="pv-card__index">${idx != null ? "#" + idx : ""}</span>
         </div>
       </div>
       <div class="pv-card__body">
@@ -2170,11 +2174,21 @@ function buildSectionsFromNote(note) {
   return { sections, nextId: counter };
 }
 
-function openNoteComposeEditor(opts) {
+async function openNoteComposeEditor(opts) {
   const { paperId, note } = opts || {};
   // 编辑已有条目时，默认沿用它现在的观点归属——保存后才能正确刷新观点文件
   const topicFileId = opts.topicFileId || (note && note.topic_file_id) || null;
   const isEdit = !!note;
+  // 来源文献：编辑时从 note.paper / note.paper_id 取，新增时从 paperId 取
+  // 编辑器顶部一直显示，方便确认「我正在给哪篇论文写思考」
+  let sourcePaper = (note && note.paper) || null;
+  const sourceId = paperId || (note && note.paper_id) || null;
+  if (!sourcePaper && sourceId) {
+    try {
+      const d = await req("GET", "/api/paper?id=" + sourceId);
+      sourcePaper = (d && (d.paper || d)) || null;
+    } catch (e) { /* 渲染时兜底显示「未指定」 */ }
+  }
   let sections;
   let composeImgSeq = 0;
   let flagged = isEdit ? !!note.flagged : false;
@@ -2208,6 +2222,14 @@ function openNoteComposeEditor(opts) {
       <button class="icon-button" id="m-close" type="button" aria-label="关闭"><svg><use href="#i-close"/></svg></button>
       <p class="eyebrow">${isEdit ? "EDIT NOTE" : "NEW NOTE"}</p>
       <h3>${isEdit ? "编辑思考" : "新增思考"}</h3>
+      <div class="compose-source">
+        <svg><use href="#i-book"/></svg>
+        <div class="compose-source__text">
+          <span>来源文献</span>
+          <b>${esc((sourcePaper && (sourcePaper.title_en || sourcePaper.title_zh)) || "未指定")}</b>
+          ${(sourcePaper && sourcePaper.title_en && sourcePaper.title_zh) ? "<small>" + esc(sourcePaper.title_zh) + "</small>" : ""}
+        </div>
+      </div>
       <div class="layout-sections" id="layout-sections">
         ${secHtml}
         <button class="layout-section__add" id="m-layout-add" type="button">＋ 新增一栏</button>
@@ -2568,7 +2590,9 @@ function serializeNoteEditor(editor) {
         }
       }
       else if (ch.nodeName === "BR") { content += "\n"; }
-      else if (ch.nodeName === "DIV" || ch.nodeName === "P") { walk(ch); content += "\n"; }
+      // Chrome 的 contenteditable 按 Enter 会产生 <div>，裸文本节点后紧跟 <div>/<p> 时
+      // 必须先补一个换行，否则第一行和第二行会被 walk 挤到一起（换行丢失的根因）
+      else if (ch.nodeName === "DIV" || ch.nodeName === "P") { if (content && !content.endsWith("\n")) content += "\n"; walk(ch); content += "\n"; }
       else { walk(ch); }
     });
   };
@@ -3330,8 +3354,9 @@ function renderTopicNotes(f) {
     try {
       // 注意：renderViewNoteCard 返回的是 HTML 字符串（renderPaperView 里拼 innerHTML 用的），
       // 这里要插来源标签 / 绑定按钮，必须先转成真正的 DOM 元素，否则 insertBefore 直接 TypeError
+      // 观点视图不显示卡片序号（#N），避免「这个 2 是什么」的困惑；fullscreen 仍用 i+1
       const t = document.createElement("template");
-      t.innerHTML = renderViewNoteCard(n, i + 1).trim();
+      t.innerHTML = renderViewNoteCard(n, null).trim();
       card = t.content.firstElementChild;
       if (!card) throw new Error("empty card");
     } catch (e) {
@@ -3340,10 +3365,15 @@ function renderTopicNotes(f) {
       card.textContent = n.content || ("（条目 #" + n.id + " 渲染失败）");
     }
     if (n.paper) {
+      // 来源标签：英文为主行（平时读英文，认得出是哪篇），中文作副行 / title
+      const en = (n.paper.title_en || "").trim();
+      const zh = (n.paper.title_zh || "").trim();
+      const main = en || zh || "未命名";
+      const sub = (en && zh) ? zh : "";
       const tag = document.createElement("div");
       tag.className = "topic-source";
-      tag.innerHTML = "<span>来源文献：</span><b>"
-        + esc(n.paper.title_zh || n.paper.title_en || "未命名") + "</b>";
+      tag.innerHTML = "<span>来源文献</span><b" + (sub ? ' title="' + esc(sub) + '"' : "") + ">"
+        + esc(main) + "</b>" + (sub ? "<small>" + esc(sub) + "</small>" : "");
       card.insertBefore(tag, card.firstChild);
     }
     // 绑定卡片上的全部操作按钮 —— 与论文 View 页同一套行为，缺一个就是点不动
@@ -3428,13 +3458,16 @@ async function openTopicNoteComposer(topicFileId) {
     <div class="modal-actions">
       <button class="scan-button scan-button--ghost" id="topic-import" type="button"><svg style="width:14px;height:14px;"><use href="#i-upload"/></svg><span>导入新论文</span></button>
       <button class="scan-button scan-button--ghost" id="topic-picker-cancel" type="button">取消</button>
+      <button class="scan-button" id="topic-picker-ok" type="button" disabled><svg style="width:14px;height:14px;"><use href="#i-check"/></svg><span>确定</span></button>
     </div>`, "modal--wide");
   $("#m-close").onclick = closeModal;
 
   let current = { projectId: null, folderId: null }; // null = 全部
+  let chosenPaper = null; // 高亮选中的论文，点「确定」才真正进入编辑器
   const list = $("#topic-paper-list");
   const treeHost = $("#topic-paper-tree");
   const q = $("#topic-paper-q");
+  const okBtn = $("#topic-picker-ok");
 
   /* 左侧树：从论文数据聚合出 项目 → 文件夹（没有论文的空文件夹不出现） */
   const buildNav = () => {
@@ -3486,8 +3519,12 @@ async function openTopicNoteComposer(topicFileId) {
     row.className = "picker-row";
     row.innerHTML = `<b title="${esc(main)}">${esc(main)}</b><small>${esc(sub)}</small>`;
     row.addEventListener("click", () => {
-      closeModal();
-      openNoteComposeEditor({ paperId: p.id, topicFileId });
+      // 点击不立即进编辑器，先高亮选中；点底部「确定」才进
+      list.querySelectorAll(".picker-row.is-chosen").forEach(el => el.classList.remove("is-chosen"));
+      row.classList.add("is-chosen");
+      chosenPaper = p;
+      okBtn.disabled = false;
+      okBtn.querySelector("span").textContent = "确定 · " + (en || zh || "").slice(0, 22);
     });
     return row;
   };
@@ -3522,6 +3559,12 @@ async function openTopicNoteComposer(topicFileId) {
     timer = setTimeout(() => paintList(), 180);
   });
   $("#topic-picker-cancel").addEventListener("click", closeModal);
+  okBtn.addEventListener("click", () => {
+    if (!chosenPaper) { toast("先在右侧选一篇来源文献"); return; }
+    const p = chosenPaper;
+    closeModal();
+    openNoteComposeEditor({ paperId: p.id, topicFileId });
+  });
   // 就地导入新论文：保存成功后重新打开本选择器（论文会出现在列表里）
   $("#topic-import").addEventListener("click", () => {
     openPaperModal(null, async () => {
