@@ -73,6 +73,17 @@ powershell -ExecutionPolicy Bypass -File start_web.ps1
 
 浏览器自动打开 `http://127.0.0.1:8040`，首次使用先「注册一个」账号。
 
+### 服务到底在不在跑？
+
+后台任务报「已结束 / failed」**不等于服务挂了**——被回收的往往只是任务外壳，Python 进程脱离父进程后仍会继续监听端口。先探测再决定要不要重启，否则可能把正在正常服务的实例杀掉：
+
+```bash
+bash web/check_service.sh            # 只检查
+bash web/check_service.sh --verbose  # 附带静态资源与 WAL 落盘状态
+```
+
+服务是单实例（`data/library.lock`），重复启动会自动退出，不会出现两个实例抢同一端口。
+
 ## 使用流程
 
 1. **注册登录** → 创建自己的账号
