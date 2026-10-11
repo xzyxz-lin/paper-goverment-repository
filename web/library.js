@@ -1374,7 +1374,7 @@ function renderNoteCard(n) {
 function renderNoteContent(n) {
   const content = n.content || "";
   const images = n.images || [];
-  const re = /\[\[img:(\d+)\]\]/g;
+  const re = /\[\[(?:img:(\d+)|blk)\]\]/g;
   let html = "";
   let last = 0;
   let m;
@@ -1384,11 +1384,14 @@ function renderNoteContent(n) {
   };
   while ((m = re.exec(content)) !== null) {
     flushText(content.slice(last, m.index));
-    const idx = parseInt(m[1]);
-    const img = images[idx];
-    if (img) {
-      html += `<div class="note-img-inline"><img src="/assets/${encodeURI(img.rel_path)}" alt="截图" loading="lazy"></div>`;
-      used.add(idx);
+    // [[blk]] 是纯文本块边界：前后文本各自成段；[[img:N]] 渲染内联图
+    if (m[1] !== undefined) {
+      const idx = parseInt(m[1]);
+      const img = images[idx];
+      if (img) {
+        html += `<div class="note-img-inline"><img src="/assets/${encodeURI(img.rel_path)}" alt="截图" loading="lazy"></div>`;
+        used.add(idx);
+      }
     }
     last = m.index + m[0].length;
   }
@@ -2080,7 +2083,7 @@ function renderViewNoteCard(n, idx) {
 function buildNoteBlocks(n) {
   const content = n.content || "";
   const images = n.images || [];
-  const re = /\[\[img:(\d+)\]\]/g;
+  const re = /\[\[(?:img:(\d+)|blk)\]\]/g;
   const blocks = [];
   let last = 0, m;
   const used = new Set();
@@ -2093,11 +2096,15 @@ function buildNoteBlocks(n) {
 
   while ((m = re.exec(content)) !== null) {
     pushText(content.slice(last, m.index));
-    const idx = parseInt(m[1]);
-    const img = images[idx];
-    if (img) {
-      blocks.push({ type: "image", key: `img_${img.id}`, image: img, image_id: img.id });
-      used.add(idx);
+    // [[blk]]：排版编辑器存的纯文本块边界——没有它，多个文本块会被合并成一个块，
+    // layout 的 col/order 全部对不上（三个栏挤成一个窄竖条的根因）
+    if (m[1] !== undefined) {
+      const idx = parseInt(m[1]);
+      const img = images[idx];
+      if (img) {
+        blocks.push({ type: "image", key: `img_${img.id}`, image: img, image_id: img.id });
+        used.add(idx);
+      }
     }
     last = m.index + m[0].length;
   }
@@ -2475,7 +2482,7 @@ async function openNoteComposeEditor(opts) {
         if (b.type === "text") {
           const t = b.text || "";
           if (!t.trim()) return;
-          content += (content ? "\n" : "") + t;
+          content += (content ? "\n[[blk]]\n" : "") + t;
           flat.push({ col: sec.col, order: order++ });
         } else {
           if (b.image_id) {
@@ -2547,7 +2554,7 @@ async function openNoteComposeEditor(opts) {
 function renderNoteEditorContent(n) {
   const content = n.content || "";
   const images = n.images || [];
-  const re = /\[\[img:(\d+)\]\]/g;
+  const re = /\[\[(?:img:(\d+)|blk)\]\]/g;
   let html = "";
   let last = 0;
   let m;
