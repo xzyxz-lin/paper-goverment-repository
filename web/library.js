@@ -3273,11 +3273,16 @@ function renderTopicNotes(f) {
   f.notes.forEach((n, i) => {
     let card;
     try {
-      card = renderViewNoteCard(n, i);
+      // 注意：renderViewNoteCard 返回的是 HTML 字符串（renderPaperView 里拼 innerHTML 用的），
+      // 这里要插来源标签 / 归属按钮，必须先转成真正的 DOM 元素，否则 insertBefore 直接 TypeError
+      const t = document.createElement("template");
+      t.innerHTML = renderViewNoteCard(n, i).trim();
+      card = t.content.firstElementChild;
+      if (!card) throw new Error("empty card");
     } catch (e) {
       card = document.createElement("div");
       card.className = "note-card";
-      card.textContent = n.content || "";
+      card.textContent = n.content || ("（条目 #" + n.id + " 渲染失败）");
     }
     if (n.paper) {
       const tag = document.createElement("div");
