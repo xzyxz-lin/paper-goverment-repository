@@ -825,11 +825,17 @@ body.view-paper-view header.topbar > .topbar-actions { display: none !important;
 .papers-pane__head { display: flex; align-items: center; justify-content: space-between; margin-bottom: 16px; }
 /* 观点库：标题 + 三个按钮（新建文件夹/新建观点/新增条目）整行冻结，下滑常驻 */
 section[data-view="topics"] .papers-pane__head {
-  position: sticky; top: calc(var(--topbar) + 8px); z-index: 11;
+  position: sticky; top: var(--topbar); z-index: 11;
   background: var(--paper-50);
-  padding: 10px 0 12px;
+  padding: 6px 0 10px;
   border-bottom: 1px solid var(--paper-200);
 }
+/* 吸顶后与顶栏之间不允许漏出滚动内容：顶栏底直接接标题行，缝里的内容一律盖住 */
+section[data-view="topics"] .papers-pane__head::before {
+  content: ""; position: absolute; left: 0; right: 0; top: -14px; height: 14px;
+  background: var(--paper-50);
+}
+section[data-view="topics"] .crumbs { margin-bottom: 8px; }
 .papers-pane__head h4 { margin: 0; font: 520 1.2rem var(--font-display); }
 .papers-pane__toolbar { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
 .papers-pane__toolbar .scan-button { min-height: 38px; padding: 0 14px; font-size: .82rem; }
