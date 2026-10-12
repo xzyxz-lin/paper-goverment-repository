@@ -3112,7 +3112,9 @@ function openPaperModal(existing, onSaved) {
         pushUndo("导入论文",
           async () => { await req("DELETE", "/api/papers?id=" + r.id); },
           async () => { await restoreRecycleByEntities("paper", [r.id]); });
-        toast("论文已保存");
+        // 告知落点：从观点库等无上下文处导入时是自动选的第一个项目/文件夹
+        const loc = (state.currentFolderPath || []).map(x => x.name).join(" / ");
+        toast(loc ? `论文已保存到「${loc}」` : "论文已保存");
         closeModal();
         if (onSaved) onSaved(r && r.id);
         await loadTree();
@@ -3141,7 +3143,23 @@ function openPaperModal(existing, onSaved) {
 }
 
 async function ensureRootFolder() {
-  // 根目录没有 folder 时，自动建一个"默认"文件夹
+  // 从观点库等「没有项目上下文」的地方导入论文时，必须先确定落点项目，
+  // 否则 loadTree()（/api/projects/tree?id=空）会 500、建文件夹也过不了——导入必然报错。
+  // 规则：有项目 → 落到第一个项目；一个项目都没有 → 自动建「默认项目」。
+  if (!state.currentProjectId) {
+    if (!state.projects.length) {
+      try { await loadProjects(); } catch (e) { /* 下面兜底处理 */ }
+    }
+    if (state.projects.length) {
+      state.currentProjectId = state.projects[0].id;
+    } else {
+      const pr = await req("POST", "/api/projects", { name: "默认项目", note: "" });
+      state.projects = [{ id: pr.id, name: "默认项目", note: "" }];
+      state.currentProjectId = pr.id;
+      renderNav();
+      toast("还没有项目，已自动创建「默认项目」，论文会导入到这里");
+    }
+  }
   await loadTree();
   if (!state.folderTree.length) {
     const r = await req("POST", "/api/folders", { project_id: state.currentProjectId, parent_id: null, name: "默认" });
