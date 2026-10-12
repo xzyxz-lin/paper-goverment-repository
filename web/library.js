@@ -1509,11 +1509,11 @@ function renderNoteCard(n) {
     </div>`;
 }
 
-// 把带 [[img:idx]] 占位符的文本渲染成 图文混排 HTML
+// 把带 [[img:idx]] / [[existing-img:ID]] 占位符的文本渲染成 图文混排 HTML
 function renderNoteContent(n) {
   const content = n.content || "";
   const images = n.images || [];
-  const re = /\[\[(?:img:(\d+)|blk)\]\]/g;
+  const re = /\[\[(?:img:(\d+)|existing-img:(\d+)|blk)\]\]/g;
   let html = "";
   let last = 0;
   let m;
@@ -1523,14 +1523,19 @@ function renderNoteContent(n) {
   };
   while ((m = re.exec(content)) !== null) {
     flushText(content.slice(last, m.index));
-    // [[blk]] 是纯文本块边界：前后文本各自成段；[[img:N]] 渲染内联图
+    // [[blk]] 是纯文本块边界：前后文本各自成段；[[img:N]] / [[existing-img:ID]] 渲染内联图
+    let img = null;
     if (m[1] !== undefined) {
       const idx = parseInt(m[1]);
-      const img = images[idx];
-      if (img) {
-        html += `<div class="note-img-inline"><img src="/assets/${encodeURI(img.rel_path)}" alt="截图" loading="lazy"></div>`;
-        used.add(idx);
-      }
+      img = images[idx] || null;
+      if (img) used.add(idx);
+    } else if (m[2] !== undefined) {
+      const iid = parseInt(m[2]);
+      const idx = images.findIndex(im => im.id === iid);
+      if (idx >= 0) { img = images[idx]; used.add(idx); }
+    }
+    if (img) {
+      html += `<div class="note-img-inline"><img src="/assets/${encodeURI(img.rel_path)}" alt="截图" loading="lazy"></div>`;
     }
     last = m.index + m[0].length;
   }
@@ -1886,13 +1891,14 @@ async function deleteViewNote(note, paperId) {
   await openPaperView(paperId);
 }
 
-/* ============ 大屏直接拖拽排版（插入 + 对换） ============ */
+/* ============ 大屏直接拖拽排版（插入 + 对换 + 列编辑） ============ */
 // 进入排版模式：把当前卡片的块按 DOM 顺序与已生效的列（含宽高比自动判定的列）固化下来。
-// 两种操作：
-//  ① 拖拽插入：拖到目标块的上半部/下半部，插入到它前面/后面（列属性跟着块走），
-//     适合把全宽块插到两行中间这类「插缝」需求；
-//  ② 点选对换：点击选中一块（铜橙框），滚动到任意位置后按住 Ctrl 点另一块，两块对换槽位
-//    （列属性留在槽位上，内容互换），适合跨长距离交换。
+// 三种操作：
+//  ① 拖拽插入：拖到目标块上半部/下半部 → 插到它所在视觉行的前/后；
+//     拖到目标块左/右 1/3 区域 → 落下时顺便把拖拽块设为左列/右列（移动即改版式）；
+//  ② 列编辑：每块右上角 左 / 右 / 全宽 三个按钮，直接改这一块的版式；
+//  ③ 点选对换：点击选中一块（铜橙框），滚动到任意位置后按住 Ctrl 点另一块，两块对换槽位
+//     （列属性留在槽位上，内容互换），适合跨长距离交换。
 // 每次操作都立即保存 layout。拖拽接近视口边缘时页面自动滚动。
 function enterArrangeMode(card, note) {
   if (state.arrange) exitArrangeMode(false);
@@ -1903,10 +1909,17 @@ function enterArrangeMode(card, note) {
     order: i,
   }));
   if (blocks.length < 2) { toast("这条思考只有 1 个块，无需排版"); return; }
+  // 固化当前生效列（含 layoutViewImages 按宽高比自动判定的结果）：
+  // 不固化的话，一重渲染就跳回默认列——正是「版式自动跳」的观感来源
+  const layout = { blocks: blocks.map(b => ({ key: b.key, col: b.col, order: b.order })) };
   state.arrange = { noteId: note.id, note, blocks, dirty: false, selectedKey: null };
+  note.layout = layout; // 同步内存：退出/重渲染都按这份排版来，不再跳回默认
   card.classList.add("is-arranging");
   const btn = card.querySelector(".pv-card__action[data-action='arrange'] span");
   if (btn) btn.textContent = "完成";
+  // 立即重渲染注入列编辑工具（之后每次操作也会重渲染，工具随之更新）
+  body.innerHTML = renderViewNoteBlocks({ ...note, layout }, { arrange: true });
+  layoutViewImages(body);
   bindArrangeDrag(card);
   // 拖拽接近视口边缘时自动滚动（dragover 只间歇触发，用定时器做平滑滚动）
   state._arrangeDragY = null;
@@ -1919,7 +1932,7 @@ function enterArrangeMode(card, note) {
   }, 50);
   state._arrangeDragoverFn = (e) => { state._arrangeDragY = e.clientY; };
   document.addEventListener("dragover", state._arrangeDragoverFn);
-  toast("排版模式：拖到某块上/下半部即插入到它前/后；点选一块后 Ctrl+点另一块可对换。点「完成」退出");
+  toast("排版模式：拖块上下换位；拖到目标块左/右边缘可改版式；每块右上角可直设 左/右/全宽；Ctrl+点另一块对换。点「完成」退出");
 }
 
 function exitArrangeMode(notify = true) {
@@ -1929,16 +1942,23 @@ function exitArrangeMode(notify = true) {
   if (state._arrangeScrollTimer) { clearInterval(state._arrangeScrollTimer); state._arrangeScrollTimer = null; }
   if (state._arrangeDragoverFn) { document.removeEventListener("dragover", state._arrangeDragoverFn); state._arrangeDragoverFn = null; }
   state._arrangeDragY = null;
+  // 退出后按内存最新排版整块重渲染，清掉列编辑工具（否则工具栏会残留在卡片上）
+  const note = (state._viewPaper && state._viewPaper.notes || []).find(n => n.id === a.noteId) || a.note;
   // 同一条思考可能在观点视图和论文 View 各渲染一份（隐藏视图的 DOM 仍在），
   // 必须把所有同 id 卡片都复位，否则只复位了文档顺序靠前的那张（排版按钮卡在「完成」的根因）
   $$(`.pv-card[data-note-id="${a.noteId}"]`).forEach(card => {
     card.classList.remove("is-arranging");
     $$(".pv-block", card).forEach(el => {
       el.draggable = false;
-      el.classList.remove("is-dragging", "is-insert-before", "is-insert-after", "is-selected");
+      el.classList.remove("is-dragging", "is-insert-before", "is-insert-after", "is-drop-col-1", "is-drop-col-2", "is-selected");
     });
     const btn = card.querySelector(".pv-card__action[data-action='arrange'] span");
     if (btn) btn.textContent = "排版";
+    const body = card.querySelector(".pv-card__body");
+    if (body && note) {
+      body.innerHTML = renderViewNoteBlocks(note);
+      layoutViewImages(body);
+    }
   });
   if (notify && a.dirty) toast("排版已保存");
 }
@@ -1960,30 +1980,65 @@ function bindArrangeDrag(card) {
     el.addEventListener("dragend", () => {
       el.classList.remove("is-dragging");
       state._arrangeDragY = null;
-      $$(".pv-block", card).forEach(x => x.classList.remove("is-insert-before", "is-insert-after"));
+      $$(".pv-block", card).forEach(x => {
+        x.classList.remove("is-insert-before", "is-insert-after", "is-drop-col-1", "is-drop-col-2");
+        delete x.dataset.dropCol;
+      });
     });
     el.addEventListener("dragover", (e) => {
       const dragging = card.querySelector(".pv-block.is-dragging");
       if (!dragging || dragging === el) return;
       e.preventDefault();
       e.dataTransfer.dropEffect = "move";
-      // 上半部 = 插到它前面，下半部 = 插到它后面
       const rect = el.getBoundingClientRect();
+      // 上半部 = 插到它所在视觉行前面，下半部 = 插到后面
       const before = (e.clientY - rect.top) < rect.height / 2;
-      $$(".pv-block", card).forEach(x => x.classList.remove("is-insert-before", "is-insert-after"));
+      // 左/右 1/3 区域 = 落下时把拖拽块设为左列/右列（移动即改版式）；
+      // 中间 1/3 = 保持拖拽块当前列不变
+      let dropCol = null;
+      const xr = (e.clientX - rect.left) / (rect.width || 1);
+      if (xr < 0.34) dropCol = "1";
+      else if (xr > 0.66) dropCol = "2";
+      $$(".pv-block", card).forEach(x => {
+        x.classList.remove("is-insert-before", "is-insert-after", "is-drop-col-1", "is-drop-col-2");
+        if (x !== el) delete x.dataset.dropCol;
+      });
       el.classList.add(before ? "is-insert-before" : "is-insert-after");
+      if (dropCol) {
+        el.classList.add(dropCol === "1" ? "is-drop-col-1" : "is-drop-col-2");
+        el.dataset.dropCol = dropCol;
+      } else {
+        delete el.dataset.dropCol;
+      }
     });
-    el.addEventListener("dragleave", () => el.classList.remove("is-insert-before", "is-insert-after"));
+    el.addEventListener("dragleave", () => {
+      el.classList.remove("is-insert-before", "is-insert-after", "is-drop-col-1", "is-drop-col-2");
+      delete el.dataset.dropCol;
+    });
     el.addEventListener("drop", (e) => {
       e.preventDefault();
       const before = el.classList.contains("is-insert-before");
-      el.classList.remove("is-insert-before", "is-insert-after");
+      const dropCol = el.dataset.dropCol || null;
+      el.classList.remove("is-insert-before", "is-insert-after", "is-drop-col-1", "is-drop-col-2");
+      delete el.dataset.dropCol;
       const key = e.dataTransfer.getData("text/plain");
       if (!key || key === el.dataset.key || !state.arrange) return;
-      insertArrangeBlock(key, el.dataset.key, before, card);
+      insertArrangeBlock(key, el.dataset.key, before, card, dropCol);
     });
-    // 点选 / Ctrl+点选对换
+    // 列编辑工具：左 / 右 / 全宽 直选（mousedown 阻止默认行为，避免按住按钮触发整块拖拽）
+    const tools = el.querySelector(".pv-arrange-tools");
+    if (tools) {
+      tools.addEventListener("mousedown", (e) => e.preventDefault());
+      tools.querySelectorAll("button").forEach(btn => {
+        btn.addEventListener("click", (e) => {
+          e.stopPropagation();
+          setArrangeCol(el.dataset.key, btn.dataset.col, card);
+        });
+      });
+    }
+    // 点选 / Ctrl+点选对换（点在列编辑工具上时不触发选中）
     el.addEventListener("click", (e) => {
+      if (e.target.closest && e.target.closest(".pv-arrange-tools")) return;
       const a = state.arrange;
       if (!a) return;
       if ((e.ctrlKey || e.metaKey) && a.selectedKey && a.selectedKey !== el.dataset.key) {
@@ -2007,74 +2062,44 @@ function bindArrangeDrag(card) {
   });
 }
 
-// 模拟 CSS grid（2 列 + dense 回填）的实际放置，返回视觉行数组 [{c1, c2}]。
-// 注意：视觉行序 ≠ 数据顺序（dense 会让后序列的块回填到前面的空位），
-// 插入锚点必须按视觉行计算，否则会出现「拖到右上角下沿没反应」的错觉。
-function computeVisualRows(blocks) {
-  const rows = [];
-  const newRow = () => ({ c1: null, c2: null });
-  blocks.forEach(b => {
-    if (b.col === "full") {
-      let row = rows.find(r => !r.c1 && !r.c2); // full 需要整行空
-      if (!row) { row = newRow(); rows.push(row); }
-      row.c1 = row.c2 = b;
-    } else if (b.col === 1) {
-      let row = rows.find(r => !r.c1);
-      if (!row) { row = newRow(); rows.push(row); }
-      row.c1 = b;
-    } else {
-      let row = rows.find(r => !r.c2);
-      if (!row) { row = newRow(); rows.push(row); }
-      row.c2 = b;
-    }
-  });
-  return rows;
-}
-
-// 一行内按数据顺序最早的成员（插入锚点用）
-function visualRowAnchor(row) {
-  const members = [];
-  if (row.c1) members.push(row.c1);
-  if (row.c2 && row.c2 !== row.c1) members.push(row.c2);
-  members.sort((x, y) => x.order - y.order);
-  return members[0] || null;
-}
-
-// 拖拽插入：把 dragKey 块移到 targetKey 块所在「视觉行」的前/后，列属性跟着块走
-async function insertArrangeBlock(dragKey, targetKey, before, card) {
+// 列编辑：直接把一块设为 左(1) / 右(2) / 全宽(full)，立即保存（可撤销）
+async function setArrangeCol(key, col, card) {
   const a = state.arrange;
   if (!a) return;
-  const blocks = a.blocks;
-  const from = blocks.findIndex(b => b.key === dragKey);
+  const b = a.blocks.find(x => x.key === key);
+  if (!b) return;
+  const next = col === "full" ? "full" : Number(col);
+  if (String(b.col) === String(next)) return;
+  b.col = next;
+  a.dirty = true;
+  await applyArrangeAndSave(card);
+}
+
+// 拖拽插入：把 dragKey 块移到 targetKey 块所在「视觉行」的前/后，列可由落点指定。
+// 显式行模型下，视觉行就是数据顺序里的连续分组（visualRows），
+// 因此锚点非常确定：before → 目标行第一个成员的位置；after → 目标行最后一个成员之后。
+// dropCol：拖拽落点判定的列（"1"/"2" 左/右半区；null = 保持拖拽块当前列）。
+async function insertArrangeBlock(dragKey, targetKey, before, card, dropCol) {
+  const a = state.arrange;
+  if (!a) return;
+  const sorted = a.blocks.slice().sort((x, y) => x.order - y.order);
+  const from = sorted.findIndex(b => b.key === dragKey);
   if (from < 0) return;
-  // 1. 模拟当前视觉行，找目标块在第几行
-  const rows = computeVisualRows(blocks);
-  let targetRowIdx = -1;
-  rows.forEach((r, i) => {
-    if ((r.c1 && r.c1.key === targetKey) || (r.c2 && r.c2.key === targetKey)) targetRowIdx = i;
-  });
-  if (targetRowIdx < 0) return;
-  // 2. 锚点：before → 目标行最早成员；after → 下一行最早成员（无则末尾）
-  let anchorKey = null;
-  if (before) {
-    const anchor = visualRowAnchor(rows[targetRowIdx]);
-    anchorKey = anchor ? anchor.key : null;
-  } else {
-    const next = rows[targetRowIdx + 1];
-    if (next) {
-      const anchor = visualRowAnchor(next);
-      anchorKey = anchor ? anchor.key : null;
-    }
-  }
-  // 3. 重排
-  const [moved] = blocks.splice(from, 1);
-  if (anchorKey == null) blocks.push(moved);
+  const [moved] = sorted.splice(from, 1);
+  if (dropCol != null) moved.col = dropCol === "full" ? "full" : Number(dropCol);
+  // 移除拖拽块后重新分行（它自己那行可能因此解散/合并），再定位目标行
+  const rows = visualRows(sorted);
+  const rowIdx = rows.findIndex(r => r.some(b => b.key === targetKey));
+  let anchor;
+  if (rowIdx < 0) anchor = sorted.length; // 目标行不存在（理论不会）→ 末尾
   else {
-    const idx = blocks.findIndex(b => b.key === anchorKey);
-    if (idx < 0) blocks.push(moved);
-    else blocks.splice(idx, 0, moved);
+    const row = rows[rowIdx];
+    const firstIdx = sorted.indexOf(row[0]);
+    anchor = before ? firstIdx : firstIdx + row.length;
   }
-  blocks.forEach((b, i) => { b.order = i; });
+  sorted.splice(anchor, 0, moved);
+  sorted.forEach((b, i) => { b.order = i; });
+  a.blocks.sort((x, y) => x.order - y.order);
   a.dirty = true;
   await applyArrangeAndSave(card);
 }
@@ -2102,7 +2127,7 @@ async function applyArrangeAndSave(card) {
   if (!note) return;
   const layout = arrangeLayout();
   const body = card.querySelector(".pv-card__body");
-  body.innerHTML = renderViewNoteBlocks({ ...note, layout });
+  body.innerHTML = renderViewNoteBlocks({ ...note, layout }, { arrange: true });
   layoutViewImages(body);
   bindArrangeDrag(card);
   try {
@@ -2257,10 +2282,16 @@ function renderViewNoteCard(n, idx) {
 function buildNoteBlocks(n) {
   const content = n.content || "";
   const images = n.images || [];
-  const re = /\[\[(?:img:(\d+)|blk)\]\]/g;
+  // 必须同时认识三种占位符：
+  //   [[img:N]]          新图（编辑器里新贴的，N 是 images 数组下标）
+  //   [[existing-img:ID]] 复用已有图（编辑器保存时按数据库 id 引用——不认它，
+  //                       这些图会被踢到末尾「兼容旧数据」分支，排版全乱）
+  //   [[blk]]            纯文本块边界
+  const re = /\[\[(?:img:(\d+)|existing-img:(\d+)|blk)\]\]/g;
   const blocks = [];
   let last = 0, m;
   const used = new Set();
+  const seenImg = new Set();
   let textIndex = 0;
 
   const pushText = (txt) => {
@@ -2275,9 +2306,18 @@ function buildNoteBlocks(n) {
     if (m[1] !== undefined) {
       const idx = parseInt(m[1]);
       const img = images[idx];
-      if (img) {
+      if (img && !seenImg.has(img.id)) {
+        seenImg.add(img.id);
         blocks.push({ type: "image", key: `img_${img.id}`, image: img, image_id: img.id });
         used.add(idx);
+      }
+    } else if (m[2] !== undefined) {
+      // [[existing-img:ID]]：按图片 id 找到对应块（同一张图被引用多次只算一块）
+      const iid = parseInt(m[2]);
+      const img = images.find(im => im.id === iid);
+      if (img && !seenImg.has(img.id)) {
+        seenImg.add(img.id);
+        blocks.push({ type: "image", key: `img_${img.id}`, image: img, image_id: img.id });
       }
     }
     last = m.index + m[0].length;
@@ -2286,7 +2326,10 @@ function buildNoteBlocks(n) {
 
   // 兼容旧数据：未被占位符引用的图片追加在最后
   images.forEach((img, idx) => {
-    if (!used.has(idx)) blocks.push({ type: "image", key: `img_${img.id}`, image: img, image_id: img.id });
+    if (!used.has(idx) && !seenImg.has(img.id)) {
+      seenImg.add(img.id);
+      blocks.push({ type: "image", key: `img_${img.id}`, image: img, image_id: img.id });
+    }
   });
 
   return blocks;
@@ -2320,22 +2363,54 @@ function applyLayout(blocks, layout) {
   });
 }
 
-// 把一条思考按内容顺序拆成「文字块 / 图片块」，在 2 列网格里依次排列，
-// 保留原文中「先文字 → 再图片 → 再文字」的逻辑关系。
-// 如果用户保存过 layout，按 layout 中指定的列(1左/2右/full全宽)与顺序渲染。
-function renderViewNoteBlocks(n) {
+// 显式行分组：把「按 order 排好的块」分成视觉行。
+// 规则（完全由数据顺序决定，不再依赖 CSS dense 回填——那正是「译文定死在上面/
+// 版式自动跳」的根因）：
+//   - col=full            → 独占一行
+//   - 相邻两块列不同(1/2)  → 配对成一行（左列放 col1 块，右列放 col2 块）
+//   - 相邻两块列相同       → 各占一行
+// 返回二维数组（每行是块数组，行内按 order 升序）。
+function visualRows(blocks) {
+  const rows = [];
+  let pending = null;
+  const flush = () => { if (pending) { rows.push(pending); pending = null; } };
+  blocks.forEach(b => {
+    if (String(b.col) === "full") { flush(); rows.push([b]); return; }
+    if (!pending) { pending = [b]; return; }
+    if (String(pending[0].col) !== String(b.col)) { pending.push(b); flush(); return; }
+    flush();
+    pending = [b];
+  });
+  flush();
+  return rows;
+}
+
+// 把一条思考按内容顺序拆成「文字块 / 图片块」，按显式行渲染。
+// 行内：col1 → 左半，col2 → 右半，full → 整行。
+// opts.arrange = true 时给每块注入 左/右/全宽 列编辑工具（仅排版模式可见）。
+function renderViewNoteBlocks(n, opts) {
+  const arrange = !!(opts && opts.arrange);
   const blocks = applyLayout(buildNoteBlocks(n), n.layout || {});
   if (!blocks.length) return `<div class="pv-block pv-block--text" style="color:var(--ink-500);">（空）</div>`;
 
-  return blocks.map(b => {
+  const blockHtml = (b) => {
     const col = b.col == null ? defaultBlockCol(b) : b.col;
-    const colClass = col === 1 ? "pv-block--col-1" : (col === 2 ? "pv-block--col-2" : "pv-block--col-full");
+    const colStr = String(col);
+    const colClass = colStr === "1" ? "pv-block--col-1" : (colStr === "2" ? "pv-block--col-2" : "pv-block--col-full");
     const autoAttr = b.col == null ? ' data-auto="1"' : "";
+    // 列编辑工具：排版模式下每块右上角 左 / 右 / 全宽 三个直选按钮
+    const tools = arrange ? `<span class="pv-arrange-tools" draggable="false">` +
+      `<button type="button" data-col="1" class="${colStr === "1" ? "is-active" : ""}" title="左对齐：占左半">左</button>` +
+      `<button type="button" data-col="2" class="${colStr === "2" ? "is-active" : ""}" title="右对齐：占右半">右</button>` +
+      `<button type="button" data-col="full" class="${colStr === "full" ? "is-active" : ""}" title="全宽：独占一整行">全宽</button>` +
+      `</span>` : "";
     if (b.type === "text") {
-      return `<div class="pv-block pv-block--text ${colClass}" data-key="${b.key}"${autoAttr}><span class="pv-block__label">文字</span><div class="pv-block__content">${esc(b.text).replace(/\n/g, "<br>")}</div></div>`;
+      return `<div class="pv-block pv-block--text ${colClass}" data-key="${b.key}"${autoAttr}>${tools}<span class="pv-block__label">文字</span><div class="pv-block__content">${esc(b.text).replace(/\n/g, "<br>")}</div></div>`;
     }
-    return `<div class="pv-block pv-block--media ${colClass}" data-key="${b.key}"${autoAttr}><span class="pv-block__label">截图</span><img src="/assets/${encodeURI(b.image.rel_path)}" alt="截图" loading="lazy"></div>`;
-  }).join("");
+    return `<div class="pv-block pv-block--media ${colClass}" data-key="${b.key}"${autoAttr}>${tools}<span class="pv-block__label">截图</span><img src="/assets/${encodeURI(b.image.rel_path)}" alt="截图" loading="lazy"></div>`;
+  };
+
+  return visualRows(blocks).map(row => `<div class="pv-row">${row.map(blockHtml).join("")}</div>`).join("");
 }
 
 /* ============ 排版编辑器：可排序的功能栏（左/右/全宽） ============ */
@@ -2439,13 +2514,14 @@ async function openNoteComposeEditor(opts) {
         if (existing) { existing.remove(); return; }
         const topicName = TOPIC_CURRENT_FILE ? TOPIC_CURRENT_FILE.name : "";
         const panel = await buildPaperNotesPanel(sourceId, topicFileId, topicName, async () => {
-          // 归属变化后同步编辑器顶部的计数
+          // 归属变化后同步编辑器顶部的计数 + 观点树计数
           try {
             const d = await req("GET", "/api/paper?id=" + sourceId);
             sourcePaper = (d && (d.paper || d)) || sourcePaper;
             const btn = $("#m-src-notes");
             if (btn) btn.textContent = "查看已有 " + ((sourcePaper && sourcePaper.notes ? sourcePaper.notes.length : 0)) + " 条";
           } catch (e) { /* 忽略 */ }
+          try { await loadTopicTree(); } catch (e) { /* 忽略 */ }
         });
         slot.appendChild(panel);
       };
@@ -2774,14 +2850,18 @@ async function openNoteComposeEditor(opts) {
 function renderNoteEditorContent(n) {
   const content = n.content || "";
   const images = n.images || [];
-  const re = /\[\[(?:img:(\d+)|blk)\]\]/g;
+  const re = /\[\[(?:img:(\d+)|existing-img:(\d+)|blk)\]\]/g;
   let html = "";
   let last = 0;
   let m;
   while ((m = re.exec(content)) !== null) {
     html += esc(content.slice(last, m.index));
-    const idx = parseInt(m[1]);
-    const img = images[idx];
+    let img = null;
+    if (m[1] !== undefined) img = images[parseInt(m[1])];
+    else if (m[2] !== undefined) {
+      const iid = parseInt(m[2]);
+      img = images.find(im => im.id === iid) || null;
+    }
     if (img) {
       html += `<img src="/assets/${encodeURI(img.rel_path)}" data-existing-id="${img.id}" class="compose-img" alt="截图">`;
     }
@@ -3612,7 +3692,12 @@ function renderTopicNotes(f) {
     host.innerHTML = '<p class="tree-empty">这个观点下还没有条目。点右上角「新增条目」开始记录。</p>';
     return;
   }
-  const refresh = () => { if (TOPIC_CURRENT_FILE) return openTopicFile(TOPIC_CURRENT_FILE); };
+  // 归属变化后必须重载观点树：树上的条目计数来自 /api/topics/tree 的快照，
+  // 不重载就会出现「改归走后计数只加不减」的陈旧数字
+  const refresh = async () => {
+    await loadTopicTree();
+    if (TOPIC_CURRENT_FILE) await openTopicFile(TOPIC_CURRENT_FILE);
+  };
   f.notes.forEach((n, i) => {
     let card;
     try {
@@ -3884,7 +3969,8 @@ async function buildPaperNotesPanel(paperId, topicFileId, currentTopicName, onCh
     });
   };
 
-  const confirmJumpSameTopic = (sameCount) => {
+  // sameCount：当前观点下这篇文献已有的条目数；note：触发跳转的那一条
+  const confirmJumpSameTopic = (sameCount, note) => {
     openConfirmDialog({
       eyebrow: "ALREADY HERE",
       title: "点错了，还是要接着写？",
@@ -3894,7 +3980,10 @@ async function buildPaperNotesPanel(paperId, topicFileId, currentTopicName, onCh
       cancelText: "点错了，取消",
       okText: "跳到该观点继续写",
       onOk: async () => {
+        // 不要只跳转：先关掉面板所在的弹窗，跳到该观点，并直接弹出这条条目的编辑页，接着写
+        closeModal();
         await jumpToTopicFile(topicFileId);
+        if (note) openNoteComposeEditor({ note });
       },
     });
   };
@@ -3953,7 +4042,7 @@ async function buildPaperNotesPanel(paperId, topicFileId, currentTopicName, onCh
         else if (n.topic_file_id === topicFileId) {
           const b = document.createElement("button");
           b.type = "button"; b.className = "scan-button scan-button--sm scan-button--ghost"; b.textContent = "跳到该观点";
-          b.onclick = () => confirmJumpSameTopic(same.length);
+          b.onclick = () => confirmJumpSameTopic(same.length, n);
           acts.appendChild(b);
         } else {
           const b = document.createElement("button");
@@ -4087,8 +4176,9 @@ async function openTopicNoteComposer(topicFileId) {
       expandedId = p.id;
       const topicName = TOPIC_CURRENT_FILE ? TOPIC_CURRENT_FILE.name : "";
       const panel = await buildPaperNotesPanel(p.id, topicFileId, topicName, async () => {
-        // 归属处理完后同步刷新选择器数据（条目数会变）
+        // 归属处理完后同步刷新选择器数据（条目数会变）与观点树计数
         try { papers = await load(""); } catch (e) { /* 忽略 */ }
+        try { await loadTopicTree(); } catch (e) { /* 忽略 */ }
       });
       row.after(panel);
       panel.scrollIntoView({ block: "nearest" });
@@ -4121,6 +4211,7 @@ async function openTopicNoteComposer(topicFileId) {
       if (expandedId === p.id) {
         buildPaperNotesPanel(p.id, topicFileId, TOPIC_CURRENT_FILE ? TOPIC_CURRENT_FILE.name : "", async () => {
           try { papers = await load(""); } catch (e) { /* 忽略 */ }
+          try { await loadTopicTree(); } catch (e) { /* 忽略 */ }
         }).then(panel => row.after(panel));
       }
     });

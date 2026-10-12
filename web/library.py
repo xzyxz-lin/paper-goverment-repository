@@ -1669,10 +1669,14 @@ def build_topic_tree(uid: int) -> list:
         else:
             roots.append(d)
     own_counts = {}
+    # 必须过滤软删（回收站里还能找回的）条目：否则删掉的条目仍被数进观点计数，
+    # 出现「条目删了/改归走了，树上计数只加不减」的陈旧数字
+    note_filter, note_params = _deleted_filter_clause("notes", "n")
     for d in nodes.values():
         if d["kind"] == "topic":
             own_counts[d["id"]] = conn.execute(
-                "SELECT COUNT(*) c FROM note WHERE topic_file_id = ?", (d["id"],)
+                f"SELECT COUNT(*) c FROM note n WHERE n.topic_file_id = ?{note_filter}",
+                (d["id"], *note_params),
             ).fetchone()["c"]
 
     def rollup(n):

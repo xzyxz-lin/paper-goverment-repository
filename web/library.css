@@ -92,6 +92,7 @@ svg { width: 1.25rem; height: 1.25rem; fill: none; stroke: currentColor; stroke-
 .assign-chip {
   display: inline-flex; align-items: center; gap: 8px;
   margin: 0 0 13px; padding: 9px 19px;
+  max-width: 100%; min-width: 0;
   background: rgba(31,91,87,.09);
   border: 1.5px solid var(--oxide-700);
   border-radius: 999px;
@@ -102,7 +103,7 @@ svg { width: 1.25rem; height: 1.25rem; fill: none; stroke: currentColor; stroke-
 }
 .assign-chip:hover { background: rgba(31,91,87,.2); }
 .assign-chip svg { width: 15px; height: 15px; flex: none; }
-.assign-chip span { max-width: 640px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.assign-chip span { max-width: 640px; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .assign-chip.is-none { color: var(--ink-500); border-color: var(--paper-300); background: var(--paper-50); cursor: default; }
 .assign-chip.is-none:hover { background: var(--paper-50); }
 .assign-chip--source { background: rgba(183,94,29,.07); border-color: var(--copper-600); color: var(--copper-600); }
@@ -117,7 +118,11 @@ svg { width: 1.25rem; height: 1.25rem; fill: none; stroke: currentColor; stroke-
 .compose-source__text span { display: block; margin-bottom: 2px; font: 600 .62rem var(--font-data); letter-spacing: .06em; text-transform: uppercase; color: var(--ink-500); }
 .compose-source__text b { display: block; color: var(--ink-900); font: 600 .86rem var(--font-display); word-break: break-word; }
 .compose-source__text small { display: block; margin-top: 3px; color: var(--ink-700); font: 400 .74rem var(--font-data); word-break: break-word; }
-.compose-source #m-src-notes { flex: none; margin-left: auto; align-self: center; }
+.compose-source #m-src-notes { flex: none; width: auto; margin-left: auto; align-self: center; }
+/* 模态内的面板/来源区按钮：不能被 .modal .scan-button{width:100%} 撑满——
+   撑满会把来源文献文字区挤成 0 宽（标题逐字竖排），面板行也会被顶破 */
+.modal .compose-source .scan-button,
+.modal .paper-notes-panel .scan-button { width: auto; }
 #src-notes-slot .paper-notes-panel { margin: 0 0 14px; }
 .picker-search { display: flex; align-items: center; gap: 8px; padding: 0 12px; border: 1px solid var(--paper-300); border-radius: 3px; }
 .picker-search svg { width: 16px; height: 16px; flex: none; color: var(--ink-700); }
@@ -153,7 +158,7 @@ svg { width: 1.25rem; height: 1.25rem; fill: none; stroke: currentColor; stroke-
 .dot--other { background: var(--copper-600); }
 .pnp-head .scan-button { margin-left: auto; }
 .pnp-empty { margin: 0; color: var(--ink-700); font-size: .76rem; }
-.pnp-list { display: grid; gap: 6px; max-height: 260px; overflow-y: auto; }
+.pnp-list { display: grid; grid-template-columns: minmax(0, 1fr); gap: 6px; max-height: 260px; overflow-y: auto; }
 .pnp-item {
   display: flex; align-items: center; gap: 9px;
   padding: 7px 9px; background: var(--paper-50); border: 1px solid var(--paper-200); border-radius: 3px;
@@ -1445,7 +1450,7 @@ section[data-view="topics"] .crumbs { margin-bottom: 8px; }
   color: var(--ink-700);
 }
 .pv-stats strong { margin-left: 6px; color: var(--oxide-700); font-size: 1.05rem; }
-.pv-list { display: grid; gap: 32px; }
+.pv-list { display: grid; grid-template-columns: minmax(0, 1fr); gap: 32px; }
 .pv-card {
   position: relative;
   padding: 28px;
@@ -1469,11 +1474,22 @@ section[data-view="topics"] .crumbs { margin-bottom: 8px; }
 .pv-card__time { color: var(--ink-700); font: 500 .72rem var(--font-data); }
 .pv-card__index { color: var(--copper-600); font: 600 .68rem var(--font-data); letter-spacing: .08em; }
 .pv-card__body {
+  /* 显式行模型：body 只是纵向流，每行 .pv-row 自己是双列网格。
+     早先 body 直接做 2 列 + dense 回填，视觉位置与数据顺序脱钩，
+     正是「译文定死在上面 / 版式自动跳」的根因——现在行与列全由 layout 决定 */
+  display: flex;
+  flex-direction: column;
+  gap: 24px;
+  align-items: stretch;
+  min-width: 0;
+}
+.pv-row {
   display: grid;
-  grid-template-columns: 1fr 1fr;
-  grid-auto-flow: dense;
+  /* minmax(0,1fr)：宽图 intrinsic 宽度再大也撑不破轨道，杜绝横向溢出/滑移 */
+  grid-template-columns: minmax(0, 1fr) minmax(0, 1fr);
   gap: 24px;
   align-items: start;
+  min-width: 0;
 }
 .pv-block {
   position: relative;
@@ -1482,7 +1498,6 @@ section[data-view="topics"] .crumbs { margin-bottom: 8px; }
   background: var(--paper-50);
   border: 1px solid var(--paper-300);
   border-radius: 4px;
-  grid-column: 1 / -1;
 }
 .pv-block--col-1 { grid-column: 1; }
 .pv-block--col-2 { grid-column: 2; }
@@ -1552,6 +1567,31 @@ section[data-view="topics"] .crumbs { margin-bottom: 8px; }
   color: var(--copper-600);
   border-color: var(--copper-500);
 }
+/* 排版模式：每块右上角的列编辑工具（左 / 右 / 全宽）——直选改版式 */
+.pv-arrange-tools { display: none; }
+.pv-card.is-arranging .pv-arrange-tools {
+  display: inline-flex; gap: 4px;
+  position: absolute; top: 5px; right: 6px; z-index: 3;
+}
+.pv-arrange-tools button {
+  font: 600 .64rem var(--font-data); line-height: 1.5;
+  padding: 2px 8px; border: 1px solid var(--paper-300); border-radius: 3px;
+  background: var(--white); color: var(--ink-700); cursor: pointer;
+}
+.pv-arrange-tools button:hover { border-color: var(--oxide-600); color: var(--oxide-700); }
+.pv-arrange-tools button.is-active {
+  background: var(--oxide-700); border-color: var(--oxide-700); color: var(--white);
+}
+/* 拖拽落点：左/右 1/3 区域高亮 = 落下时拖拽块改为左列/右列 */
+.pv-card.is-arranging .pv-block.is-drop-col-1::after,
+.pv-card.is-arranging .pv-block.is-drop-col-2::after {
+  content: ""; position: absolute; top: 0; bottom: 0; width: 34%;
+  background: rgba(42,109,103,.13);
+  border: 2px dashed var(--oxide-500); border-radius: 2px;
+  pointer-events: none; z-index: 2;
+}
+.pv-card.is-arranging .pv-block.is-drop-col-1::after { left: 0; }
+.pv-card.is-arranging .pv-block.is-drop-col-2::after { right: 0; }
 .pv-empty {
   display: grid;
   justify-items: center;
@@ -1588,7 +1628,7 @@ section[data-view="topics"] .crumbs { margin-bottom: 8px; }
 .pv-bulk-bar > div { display: flex; align-items: center; gap: 8px; }
 .pv-bulk-bar .scan-button { min-height: 34px; padding: 0 12px; font-size: .76rem; }
 
-.pv-card__actions { display: flex; align-items: center; gap: 12px; }
+.pv-card__actions { display: flex; align-items: center; flex-wrap: wrap; gap: 12px; }
 .pv-card__action {
   display: inline-flex; align-items: center; gap: 5px;
   padding: 5px 10px; color: var(--oxide-700); background: rgba(31,91,87,.08);
@@ -1660,7 +1700,8 @@ section[data-view="topics"] .crumbs { margin-bottom: 8px; }
 
 @media (max-width: 900px) {
   .pv-hero { flex-direction: column; }
-  .pv-card__body { grid-template-columns: 1fr; gap: 20px; }
+  .pv-card__body { gap: 16px; }
+  .pv-row { grid-template-columns: 1fr; gap: 16px; }
   .pv-card__head { margin-bottom: 14px; }
   .note-fullscreen__body .pv-block--media img { max-height: 72vh; }
 }
