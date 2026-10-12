@@ -1615,7 +1615,14 @@ function renderPaperView(p) {
         <p>点击上方「新增思考」写下第一条，或回到抽屉添加。</p>
       </div>`;
   } else {
-    list.innerHTML = notes.map((n, idx) => renderViewNoteCard(n, idx + 1)).join("");
+    // 每张卡片左上角直接标明归属观点（右上角的「归属」按钮保持原有交互不动）
+    list.innerHTML = notes.map((n, idx) => {
+      const tp = (n.topic_path || "").trim();
+      const tag = `<div class="topic-source topic-source--assign"><span>归属观点</span>`
+        + (tp ? `<b title="${esc(tp)}">${esc(tp)}</b>` : `<b class="is-none">未归属</b>`)
+        + `</div>`;
+      return renderViewNoteCard(n, idx + 1).replace('<div class="pv-card__head">', tag + '<div class="pv-card__head">');
+    }).join("");
   }
 
   // VIEW 页批量操作条

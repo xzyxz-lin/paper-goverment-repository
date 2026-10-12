@@ -91,6 +91,8 @@ svg { width: 1.25rem; height: 1.25rem; fill: none; stroke: currentColor; stroke-
 .topic-source span { flex: none; color: var(--ink-500); font: 600 .62rem var(--font-data); letter-spacing: .06em; text-transform: uppercase; }
 .topic-source b { color: var(--oxide-700); font-weight: 600; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .topic-source small { display: block; flex-basis: 100%; width: 100%; margin-top: 3px; color: var(--ink-700); font: 400 .68rem var(--font-data); white-space: normal; overflow: hidden; text-overflow: ellipsis; }
+/* 论文 View 页卡片左上角的归属标签 */
+.topic-source--assign b.is-none { color: var(--ink-500); font-weight: 400; }
 .modal-head { margin-bottom: 14px; }
 .modal-head h3 { margin: 0 0 6px; font-size: 1rem; }
 .modal-head p { margin: 0; color: var(--ink-700); font-size: .78rem; line-height: 1.6; }
