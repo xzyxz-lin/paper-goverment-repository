@@ -1174,6 +1174,23 @@ def require_user(handler: BaseHTTPRequestHandler) -> int | None:
 
 
 # ===== 文件夹树 =====
+def _subtree_ids(conn: sqlite3.Connection, table: str, root_id: int) -> list[int]:
+    """收集 root_id 及其全部子孙的 id。调用前需保证无环（move 接口已做环检测）。"""
+    out: list[int] = []
+    stack = [root_id]
+    while stack:
+        cur = stack.pop()
+        out.append(cur)
+        for r in conn.execute(f"SELECT id FROM {table} WHERE parent_id = ?", (cur,)):
+            stack.append(r["id"])
+    return out
+
+
+def _in_subtree(conn: sqlite3.Connection, table: str, root_id: int, node_id: int) -> bool:
+    """node_id 是否在 root_id 的子树内（含自身）。移动节点时防环。"""
+    return node_id in _subtree_ids(conn, table, root_id)
+
+
 def build_folder_tree(project_id: int) -> list[dict]:
     conn = get_db()
     rows = conn.execute(
@@ -1778,6 +1795,18 @@ class Handler(BaseHTTPRequestHandler):
                     self._error(404, "项目已移入回收站")
                     return
                 json_response(self, {"folders": build_folder_tree(pid)})
+            elif path == "/api/folders/all":
+                # 所有项目的文件夹树汇总（跨项目移动的目标选择器用；已剔除回收站项目）
+                uid = require_user(self)
+                if not uid:
+                    self._error(401, "未登录")
+                    return
+                conn = get_db()
+                deleted_proj = set(load_deleted().get("projects", []))
+                projs = conn.execute("SELECT id, name FROM project WHERE user_id = ? ORDER BY id", (uid,)).fetchall()
+                out = [{"project_id": p["id"], "project_name": p["name"], "folders": build_folder_tree(p["id"])}
+                       for p in projs if p["id"] not in deleted_proj]
+                json_response(self, {"projects": out})
             elif path == "/api/topics/tree":
                 uid = require_user(self)
                 if not uid:
@@ -2296,6 +2325,44 @@ class Handler(BaseHTTPRequestHandler):
                 )
                 conn.commit()
                 json_response(self, {"ok": True, "id": cur.lastrowid})
+            elif path == "/api/folders/move":
+                # 移动文件夹（含全部子文件夹与论文）到另一项目 / 文件夹。
+                # paper 无冗余 project_id（归属随 folder 走），只需更新子树内 folder 的 project_id。
+                uid = require_user(self)
+                if not uid:
+                    self._error(401, "未登录")
+                    return
+                body = _read_json_body(self)
+                fid = int(body.get("id"))
+                project_id = int(body.get("project_id"))
+                parent_id = body.get("parent_id")
+                parent_id = int(parent_id) if parent_id else None
+                conn = get_db()
+                f = conn.execute(
+                    """SELECT f.* FROM folder f JOIN project p ON p.id = f.project_id
+                       WHERE f.id = ? AND p.user_id = ?""", (fid, uid),
+                ).fetchone()
+                if not f:
+                    self._error(404, "文件夹不存在")
+                    return
+                tp = conn.execute("SELECT id FROM project WHERE id = ? AND user_id = ?", (project_id, uid)).fetchone()
+                if not tp:
+                    self._error(404, "目标项目不存在")
+                    return
+                if parent_id:
+                    pf = conn.execute("SELECT * FROM folder WHERE id = ?", (parent_id,)).fetchone()
+                    if not pf or pf["project_id"] != project_id:
+                        self._error(400, "目标文件夹不在目标项目里")
+                        return
+                    if _in_subtree(conn, "folder", fid, pf["id"]):
+                        self._error(400, "不能移动到它自己或它的子级里")
+                        return
+                sub = _subtree_ids(conn, "folder", fid)
+                ph = ",".join("?" for _ in sub)
+                conn.execute(f"UPDATE folder SET project_id = ? WHERE id IN ({ph})", (project_id, *sub))
+                conn.execute("UPDATE folder SET parent_id = ? WHERE id = ?", (parent_id, fid))
+                conn.commit()
+                json_response(self, {"ok": True})
             elif path == "/api/papers":
                 uid = require_user(self)
                 if not uid:
@@ -2392,6 +2459,35 @@ class Handler(BaseHTTPRequestHandler):
                 )
                 conn.commit()
                 json_response(self, {"ok": True, "id": cur.lastrowid})
+            elif path == "/api/topic_nodes/move":
+                # 移动观点树节点（文件夹或观点）：换父级。观点是叶子，只能作为文件夹的孩子。
+                uid = require_user(self)
+                if not uid:
+                    self._error(401, "未登录")
+                    return
+                body = _read_json_body(self)
+                nid = int(body.get("id"))
+                parent_id = body.get("parent_id")
+                parent_id = int(parent_id) if parent_id else None
+                conn = get_db()
+                node = conn.execute("SELECT * FROM topic_node WHERE id = ? AND user_id = ?", (nid, uid)).fetchone()
+                if not node:
+                    self._error(404, "节点不存在")
+                    return
+                if parent_id:
+                    p = conn.execute("SELECT * FROM topic_node WHERE id = ? AND user_id = ?", (parent_id, uid)).fetchone()
+                    if not p:
+                        self._error(404, "目标文件夹不存在")
+                        return
+                    if p["kind"] != "folder":
+                        self._error(400, "只能移动到文件夹里（观点是最小单位，不能包含子级）")
+                        return
+                    if _in_subtree(conn, "topic_node", node["id"], p["id"]):
+                        self._error(400, "不能移动到它自己或它的子级里")
+                        return
+                conn.execute("UPDATE topic_node SET parent_id = ? WHERE id = ?", (parent_id, nid))
+                conn.commit()
+                json_response(self, {"ok": True})
             elif path == "/api/notes/assign":
                 # 条目归属操作：绑定 / 移动到另一观点文件 / 清除（变游民）
                 # topic_file_id 传 null 即清除归属

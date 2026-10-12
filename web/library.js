@@ -1038,6 +1038,7 @@ function renderTree() {
           <span class="tree-count">${node.paper_count || 0}</span>
           <span class="tree-actions">
             <button data-act="add" title="新建子文件夹"><svg><use href="#i-plus"/></svg></button>
+            <button data-act="move" title="移动到别的项目 / 文件夹（含全部子级与论文）"><svg><use href="#i-arrow"/></svg></button>
             <button data-act="del" title="删除文件夹"><svg><use href="#i-trash"/></svg></button>
           </span>
         </div>
@@ -1066,6 +1067,7 @@ function renderTree() {
       const fid = parseInt(row.dataset.fid);
       if (act) {
         if (act.dataset.act === "add") openFolderModal(fid);
+        else if (act.dataset.act === "move") openFolderMoveModal(fid);
         else if (act.dataset.act === "del") deleteFolder(fid);
         return;
       }
@@ -3211,7 +3213,9 @@ function setViewMode(mode) {
 }
 
 function currentTopicParentId() {
-  if (TOPIC_CURRENT_PARENT) return TOPIC_CURRENT_PARENT.id;
+  // 只有选中的是「文件夹」时才作为父级；选中观点 / 什么都没选 → 建在顶层。
+  // 否则先建了观点再点它，「新建文件夹」会永远没地方落（观点是叶子，不能挂子级）。
+  if (TOPIC_CURRENT_PARENT && TOPIC_CURRENT_PARENT.kind === "folder") return TOPIC_CURRENT_PARENT.id;
   return null;
 }
 
@@ -3250,6 +3254,7 @@ function renderTopicTree() {
             ${isTopic ? "" : `
             <button data-act="addf" title="新建子文件夹"><svg><use href="#i-folder"/></svg></button>
             <button data-act="addt" title="新建观点（观点直接装条目）"><svg><use href="#i-flag"/></svg></button>`}
+            <button data-act="move" title="移动到别的文件夹（含全部子级）"><svg><use href="#i-arrow"/></svg></button>
             <button data-act="del" title="删除（其下条目会变回游民，思考不会丢）"><svg><use href="#i-trash"/></svg></button>
           </span>
         </div>
@@ -3269,6 +3274,7 @@ function renderTopicTree() {
         e.stopPropagation();
         if (act.dataset.act === "addf") createTopicNode("folder", tid);
         else if (act.dataset.act === "addt") createTopicNode("topic", tid);
+        else if (act.dataset.act === "move") openTopicMoveModal(node);
         else if (act.dataset.act === "del") deleteTopicNode(node);
         return;
       }
@@ -3330,7 +3336,6 @@ async function openTopicFile(n) {
     $("#topic-file-title").textContent = f.name;
     $("#topic-hint").hidden = true;
     $("#topic-add-note-btn").disabled = false;
-    $("#add-topic-folder-btn").disabled = true;
     renderTopicNotes(f);
   } catch (e) {
     toast("加载观点文件失败", true);
@@ -3409,9 +3414,107 @@ function renderTopicNotes(f) {
   });
 }
 
+/* ---- 移动节点：目标选择弹窗（论文视图 / 观点视图共用骨架） ---- */
+function openMoveTargetModal(opts) {
+  const rows = opts.options.map((o, i) => `
+    <div class="picker-row" data-mi="${i}"><b>${esc(o.label)}</b>${o.sub ? `<small>${esc(o.sub)}</small>` : ""}</div>`).join("");
+  openModal(`
+    <button class="icon-button" id="m-close" type="button" aria-label="关闭"><svg><use href="#i-close"/></svg></button>
+    <p class="eyebrow">MOVE</p>
+    <h3>${esc(opts.title)}</h3>
+    <p class="modal-hint">点选一个目标位置，再点「确定」。它自己和它的子级已从列表里隐藏，不会形成环。</p>
+    <div class="picker-list" id="move-target-list" style="max-height:340px;">${rows}</div>
+    <div class="modal-actions">
+      <button class="scan-button scan-button--ghost" id="move-cancel" type="button">取消</button>
+      <button class="scan-button" id="move-ok" type="button" disabled><svg style="width:14px;height:14px;"><use href="#i-check"/></svg><span>确定</span></button>
+    </div>`, "modal--wide");
+  $("#m-close").onclick = closeModal;
+  $("#move-cancel").onclick = closeModal;
+  let picked = null;
+  const list = $("#move-target-list");
+  const okBtn = $("#move-ok");
+  list.addEventListener("click", (e) => {
+    const row = e.target.closest(".picker-row");
+    if (!row) return;
+    $$(".picker-row", list).forEach(r => r.classList.remove("is-chosen"));
+    row.classList.add("is-chosen");
+    picked = opts.options[parseInt(row.dataset.mi)];
+    okBtn.disabled = false;
+  });
+  okBtn.addEventListener("click", () => { if (picked) opts.onPick(picked); });
+}
+
+/* 观点视图：移动文件夹 / 观点到别的文件夹或顶层 */
+function openTopicMoveModal(node) {
+  const banned = new Set();
+  (function collect(n) { banned.add(n.id); (n.children || []).forEach(collect); })(node);
+  const options = [{ key: "root", label: "（顶层）", sub: "移动后挂在观点树最外层" }];
+  (function walk(ns, prefix) {
+    (ns || []).forEach(n => {
+      if (n.kind !== "folder") return;
+      const path = prefix ? prefix + " / " + n.name : n.name;
+      if (!banned.has(n.id)) options.push({ key: "f" + n.id, label: path, sub: "文件夹" });
+      walk(n.children || [], path);
+    });
+  })(TOPIC_TREE, "");
+  openMoveTargetModal({
+    title: "移动「" + node.name + "」",
+    options,
+    onPick: async (picked) => {
+      const parent_id = picked.key === "root" ? null : parseInt(picked.key.slice(1));
+      try {
+        await req("POST", "/api/topic_nodes/move", { id: node.id, parent_id });
+        closeModal();
+        toast("已移动");
+        await loadTopicTree();
+      } catch (e) { toast(e.message, true); }
+    },
+  });
+}
+
+/* 论文视图：移动文件夹到别的项目 / 文件夹（子树整体搬家，论文跟随） */
+async function openFolderMoveModal(fid) {
+  let all;
+  try {
+    all = await req("GET", "/api/folders/all");
+  } catch (e) { toast("加载项目列表失败", true); return; }
+  const node = findFolder(state.folderTree, fid);
+  if (!node) { toast("找不到该文件夹", true); return; }
+  const banned = new Set();
+  (function collect(n) { banned.add(n.id); (n.children || []).forEach(collect); })(node);
+  const options = [];
+  (all.projects || []).forEach(p => {
+    options.push({ key: "p" + p.project_id, label: p.project_name + " · 顶层", sub: "项目根目录", projectId: p.project_id, parentId: null });
+    (function walk(ns, prefix) {
+      (ns || []).forEach(f => {
+        if (banned.has(f.id)) return; // 自己的子树整体剪掉，防环
+        const path = prefix ? prefix + " / " + f.name : f.name;
+        options.push({ key: "f" + f.id, label: p.project_name + " / " + path, sub: "文件夹", projectId: p.project_id, parentId: f.id });
+        walk(f.children || [], path);
+      });
+    })(p.folders || [], "");
+  });
+  openMoveTargetModal({
+    title: "移动「" + node.name + "」",
+    options,
+    onPick: async (picked) => {
+      try {
+        await req("POST", "/api/folders/move", { id: fid, project_id: picked.projectId, parent_id: picked.parentId });
+        closeModal();
+        toast("已移动（子文件夹与论文一并搬过去了）");
+        await loadProjects();
+        await loadTree(state.currentProjectId);
+      } catch (e) { toast(e.message, true); }
+    },
+  });
+}
+
 async function createTopicNode(kind, parentId) {
-  const label = kind === "topic" ? "观点" : (kind === "folder" ? "文件夹" : "文件");
-  const name = prompt("新建" + label + "，请输入名称：");
+  const label = kind === "topic" ? "观点" : "文件夹";
+  // 写明会建在哪，不让用户猜：选中文件夹→建里面，否则→顶层
+  const parentNode = parentId ? findTopicNode(TOPIC_TREE, parentId) : null;
+  const where = parentNode ? "（建在「" + parentNode.name + "」中）" : "（建在顶层）";
+  const name = prompt("新建" + label + where + "，请输入名称：");
   if (!name || !name.trim()) return;
   try {
     await req("POST", "/api/topic_nodes", { kind: kind, name: name.trim(), parent_id: parentId });
