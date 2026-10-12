@@ -80,6 +80,131 @@ function esc(s) {
   return String(s == null ? "" : s).replace(/[&<>"']/g, c => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c]));
 }
 
+/* ============ 全局撤销 / 重做（Ctrl+Z / Ctrl+Shift+Z / Ctrl+Y） ============
+   会话级操作历史：每个改动型操作成功后 push 一条 {label, undo, redo}。
+   - undo / redo 都是 async 闭包，直接调后端接口做逆向操作；
+   - 刷新页面后历史清空；
+   - 焦点在输入框 / 思考编辑器里时快捷键交给浏览器原生撤销，不抢。 */
+
+const UNDO_STACK = [];
+const REDO_STACK = [];
+const HISTORY_LIMIT = 50;
+let _historyBusy = false;
+
+function pushUndoEntry(entry) {
+  UNDO_STACK.push(entry);
+  if (UNDO_STACK.length > HISTORY_LIMIT) UNDO_STACK.shift();
+  REDO_STACK.length = 0;
+}
+function pushUndo(label, undo, redo) { pushUndoEntry({ label, undo, redo }); }
+
+async function _historyAct(stackFrom, stackTo, verb) {
+  if (_historyBusy) return;
+  const entry = stackFrom.pop();
+  if (!entry) { toast(verb === "撤销" ? "没有可撤销的操作" : "没有可重做的操作"); return; }
+  _historyBusy = true;
+  try {
+    if (verb === "撤销") await entry.undo();
+    else await (entry.redo || entry.undo)();
+    stackTo.push(entry);
+    toast(verb + "：" + entry.label);
+    await refreshAfterHistory();
+  } catch (e) {
+    stackFrom.push(entry); // 失败放回，历史不丢
+    toast(verb + "失败：" + (e.message || "未知错误"), true);
+  } finally {
+    _historyBusy = false;
+  }
+}
+function doUndo() { return _historyAct(UNDO_STACK, REDO_STACK, "撤销"); }
+function doRedo() { return _historyAct(REDO_STACK, UNDO_STACK, "重做"); }
+
+/* 撤销 / 重做后刷新当前视图，保证界面与数据一致 */
+async function refreshAfterHistory() {
+  try {
+    const name = state.currentView; // 视图切换走 class，不看 hidden
+    if (name === "paper-view" && state._viewPaper) {
+      await openPaperView(state._viewPaper.id);
+    } else if (name === "topics") {
+      await loadTopicTree();
+      if (TOPIC_CURRENT_FILE) {
+        const node = findTopicNode(TOPIC_TREE, TOPIC_CURRENT_FILE.id);
+        if (node) await openTopicFile(node);
+      }
+    } else if (name === "recycle") {
+      await loadRecycle();
+    } else if (name === "project" && state.currentProjectId) {
+      await loadTree(state.currentProjectId);
+      await loadPapers();
+    } else {
+      await loadProjects();
+    }
+  } catch (e) { /* 刷新失败不打断主流程 */ }
+}
+
+/* 删除项目/文件夹/论文的撤销：按 entity_id 从回收站找回对应条目并恢复 */
+async function restoreRecycleByEntities(kind, entityIds) {
+  const d = await req("GET", "/api/recycle");
+  const want = new Set(entityIds);
+  const ids = (d.items || []).filter(it => it.kind === kind && want.has(it.entity_id)).map(it => it.id);
+  if (!ids.length) throw new Error("回收站里没找到对应条目（可能已被清空）");
+  await req("POST", "/api/recycle/restore", { ids });
+}
+
+/* 恢复被删思考：走后端历史版本接口（与条目上的「撤销」按钮同一通道） */
+async function restoreNotesByIds(ids) {
+  for (const id of ids) await req("POST", "/api/note_versions/restore", { note_id: id });
+}
+
+/* 删除观点节点前抓快照：子树结构 + 各观点名下条目，撤销时按快照重建 */
+async function snapshotTopicSubtree(rootId) {
+  const nodes = [];
+  const noteRefs = [];
+  const root = findTopicNode(TOPIC_TREE, rootId);
+  async function walk(node, parentId) {
+    if (!node) return;
+    nodes.push({ id: node.id, kind: node.kind, name: node.name, parent_id: parentId });
+    if (node.kind === "topic") {
+      try {
+        const d = await req("GET", "/api/topics/file?id=" + node.id);
+        (d.file.notes || []).forEach(n => noteRefs.push({ noteId: n.id, oldTopicId: node.id }));
+      } catch (e) { /* 拿不到条目就只重建结构 */ }
+    }
+    for (const c of node.children || []) await walk(c, node.id);
+  }
+  if (root) await walk(root, root.parent_id);
+  return { nodes, noteRefs };
+}
+
+/* 按快照重建子树（父在前），返回 旧id→新id 映射 */
+async function rebuildTopicSubtree(snapshot) {
+  const idMap = {};
+  for (const n of snapshot.nodes) {
+    const d = await req("POST", "/api/topic_nodes", {
+      kind: n.kind, name: n.name,
+      // 子树内部节点用新 id；根节点的外部父节点不在快照里，直接用原 id 挂回去
+      parent_id: n.parent_id != null ? (idMap[n.parent_id] || n.parent_id) : null,
+    });
+    idMap[n.id] = d.id;
+  }
+  for (const ref of snapshot.noteRefs) {
+    const newId = idMap[ref.oldTopicId];
+    if (newId) await req("POST", "/api/notes/assign", { note_id: ref.noteId, topic_file_id: newId });
+  }
+  return idMap;
+}
+
+/* 快捷键：Ctrl+Z 撤销，Ctrl+Shift+Z / Ctrl+Y 重做（输入时让给原生撤销） */
+document.addEventListener("keydown", (e) => {
+  if (!(e.ctrlKey || e.metaKey) || e.altKey) return;
+  const t = e.target;
+  const editable = t && (t.isContentEditable || /^(INPUT|TEXTAREA|SELECT)$/.test(t.tagName || ""));
+  if (editable) return;
+  const key = (e.key || "").toLowerCase();
+  if (key === "z") { e.preventDefault(); if (e.shiftKey) doRedo(); else doUndo(); }
+  else if (key === "y") { e.preventDefault(); doRedo(); }
+});
+
 function placeCaretAtEnd(el) {
   const range = document.createRange();
   range.selectNodeContents(el);
@@ -492,6 +617,18 @@ async function doBulkDelete() {
       okCount += (r.deleted || 0);
       state.selPapers.clear();
     }
+    // 撤销批量删除 = 按原 id 从回收站恢复；重做 = 再删一遍
+    const undoDeletes = async () => {
+      if (projectIds.length) await restoreRecycleByEntities("project", projectIds);
+      if (folderIds.length) await restoreRecycleByEntities("folder", folderIds);
+      if (paperIds.length) await restoreRecycleByEntities("paper", paperIds);
+    };
+    const redoDeletes = async () => {
+      if (projectIds.length) await req("POST", "/api/projects/delete", { ids: projectIds });
+      if (folderIds.length) await req("POST", "/api/folders/delete", { ids: folderIds });
+      if (paperIds.length) await req("POST", "/api/papers/delete", { ids: paperIds });
+    };
+    pushUndo("删除 " + okCount + " 项", undoDeletes, redoDeletes);
     toast(`已删除 ${okCount} 项`);
     // 刷新视图
     await loadProjects();
@@ -1471,6 +1608,10 @@ async function addNote(paperId, editor) {
     for (const img of images) {
       await req("POST", "/api/notes/images", { note_id: nid, data: img.data, ext: img.ext });
     }
+    // 撤销新增 = 软删这条思考（进历史版本）；重做 = 从历史版本恢复
+    pushUndo("新增思考",
+      async () => { await req("DELETE", "/api/notes?id=" + nid); },
+      async () => { await restoreNotesByIds([nid]); });
     toast("已保存思考");
     state.composeImages = [];
     state.composeDrafts.delete(paperId);
@@ -1488,6 +1629,9 @@ async function refreshPaper(pid) {
 async function deleteNote(nid, paperId) {
   if (!confirm("删除这条思考？删除后可在历史版本保留 7 天，提示条里点「撤销」可立即找回。")) return;
   await req("DELETE", "/api/notes?id=" + nid);
+  pushUndo("删除思考",
+    async () => { await restoreNotesByIds([nid]); },
+    async () => { await req("DELETE", "/api/notes?id=" + nid); });
   toastAction("已删除 1 条思考", "撤销", () => undoDeleteNotes([nid], () => refreshPaper(paperId)));
   await refreshPaper(paperId);
 }
@@ -1497,6 +1641,9 @@ async function deleteSelectedNotes(paperId) {
   if (!ids.length) return;
   if (!confirm(`确定删除选中的 ${ids.length} 条思考？删除后可在历史版本保留 7 天，提示条里点「撤销」可立即找回。`)) return;
   await req("DELETE", "/api/notes?ids=" + ids.join(","));
+  pushUndo("删除 " + ids.length + " 条思考",
+    async () => { await restoreNotesByIds(ids); },
+    async () => { await req("DELETE", "/api/notes?ids=" + ids.join(",")); });
   state.selNotes.clear();
   toastAction(`已删除 ${ids.length} 条思考`, "撤销", () => undoDeleteNotes(ids, () => refreshPaper(paperId)));
   await refreshPaper(paperId);
@@ -1732,6 +1879,9 @@ function layoutViewImages(root) {
 async function deleteViewNote(note, paperId) {
   if (!confirm("删除这条思考？删除后可在历史版本中保留 7 天，提示条里点「撤销」可立即找回。")) return;
   await req("DELETE", "/api/notes?id=" + note.id);
+  pushUndo("删除思考",
+    async () => { await restoreNotesByIds([note.id]); },
+    async () => { await req("DELETE", "/api/notes?id=" + note.id); });
   toastAction("已删除 1 条思考", "撤销", () => undoDeleteNotes([note.id], () => openPaperView(paperId)));
   await openPaperView(paperId);
 }
@@ -1779,8 +1929,9 @@ function exitArrangeMode(notify = true) {
   if (state._arrangeScrollTimer) { clearInterval(state._arrangeScrollTimer); state._arrangeScrollTimer = null; }
   if (state._arrangeDragoverFn) { document.removeEventListener("dragover", state._arrangeDragoverFn); state._arrangeDragoverFn = null; }
   state._arrangeDragY = null;
-  const card = document.querySelector(`.pv-card[data-note-id="${a.noteId}"]`);
-  if (card) {
+  // 同一条思考可能在观点视图和论文 View 各渲染一份（隐藏视图的 DOM 仍在），
+  // 必须把所有同 id 卡片都复位，否则只复位了文档顺序靠前的那张（排版按钮卡在「完成」的根因）
+  $$(`.pv-card[data-note-id="${a.noteId}"]`).forEach(card => {
     card.classList.remove("is-arranging");
     $$(".pv-block", card).forEach(el => {
       el.draggable = false;
@@ -1788,7 +1939,7 @@ function exitArrangeMode(notify = true) {
     });
     const btn = card.querySelector(".pv-card__action[data-action='arrange'] span");
     if (btn) btn.textContent = "排版";
-  }
+  });
   if (notify && a.dirty) toast("排版已保存");
 }
 
@@ -1956,7 +2107,12 @@ async function applyArrangeAndSave(card) {
   bindArrangeDrag(card);
   try {
     await req("PUT", "/api/notes/layout", { id: note.id, layout });
+    const oldLayout = note.layout;
     note.layout = layout; // 同步内存，后续重渲染保持新排版
+    // 撤销排版 = 存回旧 layout；重做 = 再存新 layout
+    pushUndo("调整排版",
+      async () => { await req("PUT", "/api/notes/layout", { id: note.id, layout: oldLayout }); note.layout = oldLayout; },
+      async () => { await req("PUT", "/api/notes/layout", { id: note.id, layout }); note.layout = layout; });
   } catch (err) {
     toast("排版保存失败：" + (err && err.message || err));
   }
@@ -1967,6 +2123,9 @@ async function deleteSelectedViewNotes(paperId) {
   if (!ids.length) return;
   if (!confirm(`确定删除选中的 ${ids.length} 条思考？删除后可在历史版本保留 7 天，提示条里点「撤销」可立即找回。`)) return;
   await req("DELETE", "/api/notes?ids=" + ids.join(","));
+  pushUndo("删除 " + ids.length + " 条思考",
+    async () => { await restoreNotesByIds(ids); },
+    async () => { await req("DELETE", "/api/notes?ids=" + ids.join(",")); });
   state.selViewNotes.clear();
   toastAction(`已删除 ${ids.length} 条思考`, "撤销", () => undoDeleteNotes(ids, () => openPaperView(paperId)));
   await openPaperView(paperId);
@@ -2528,10 +2687,34 @@ async function openNoteComposeEditor(opts) {
           await req("POST", "/api/notes/images", { note_id: nid, data: img.data, ext: img.ext });
         }
         await req("PUT", "/api/notes/layout", { id: nid, layout });
+        // 撤销新增 = 软删（进历史版本，连同归属）；重做 = 从历史版本恢复
+        pushUndo("新增思考",
+          async () => { await req("DELETE", "/api/notes?id=" + nid); },
+          async () => { await restoreNotesByIds([nid]); });
         toast("已新增思考");
       } else {
+        // 撤销/重做编辑：PUT 会物理删除未被内容引用的图片文件，
+        // 所以旧内容必须用 [[existing-img:ID]] 回写（复用还活着的图，不丢文件）；
+        // 重做则带上原始 base64 重传新图。编辑前保存时后端已写入历史版本兜底。
+        const oldContent = note.content || "";
+        const oldImgIds = (note.images || []).map(i => i.id);
+        const oldContentAsExisting = oldContent.replace(/\[\[img:(\d+)\]\]/g, (m, n) => {
+          const iid = oldImgIds[parseInt(n, 10)];
+          return iid ? `[[existing-img:${iid}]]` : "";
+        });
+        const oldLayout = note.layout;
+        const oldFlagged = note.flagged;
         await req("PUT", "/api/notes", { id: note.id, content, images: newImages, flagged });
         await req("PUT", "/api/notes/layout", { id: note.id, layout });
+        pushUndo("编辑思考",
+          async () => {
+            await req("PUT", "/api/notes", { id: note.id, content: oldContentAsExisting, images: [], flagged: oldFlagged });
+            if (oldLayout) await req("PUT", "/api/notes/layout", { id: note.id, layout: oldLayout });
+          },
+          async () => {
+            await req("PUT", "/api/notes", { id: note.id, content, images: newImages, flagged });
+            await req("PUT", "/api/notes/layout", { id: note.id, layout });
+          });
         toast("已保存修改");
       }
       closeModal();
@@ -2682,7 +2865,11 @@ function openProjectModal() {
     const name = $("#m-name").value.trim();
     if (!name) { toast("请输入项目名"); return; }
     try {
-      await req("POST", "/api/projects", { name, note: $("#m-note").value.trim() });
+      const pr = await req("POST", "/api/projects", { name, note: $("#m-note").value.trim() });
+      // 撤销新建项目 = 软删进回收站；重做 = 从回收站恢复
+      pushUndo("新建项目「" + name + "」",
+        async () => { await req("POST", "/api/projects/delete", { ids: [pr.id] }); },
+        async () => { await restoreRecycleByEntities("project", [pr.id]); });
       closeModal();
       toast("项目已创建");
       await loadProjects();
@@ -2707,7 +2894,11 @@ function openFolderModal(parentId) {
     const name = $("#m-name").value.trim();
     if (!name) { toast("请输入文件夹名"); return; }
     try {
-      await req("POST", "/api/folders", { project_id: state.currentProjectId, parent_id: parentId || null, name });
+      const fr = await req("POST", "/api/folders", { project_id: state.currentProjectId, parent_id: parentId || null, name });
+      // 撤销新建文件夹 = 软删进回收站；重做 = 从回收站恢复
+      pushUndo("新建文件夹「" + name + "」",
+        async () => { await req("DELETE", "/api/folders?id=" + fr.id); },
+        async () => { await restoreRecycleByEntities("folder", [fr.id]); });
       closeModal();
       toast("文件夹已创建");
       await loadTree();
@@ -2721,6 +2912,9 @@ async function deleteFolder(fid) {
   const extra = node && node.children && node.children.length ? "（含其所有子文件夹）" : "";
   if (!confirm(`删除文件夹「${node?.name || ""}」${extra}？其中的论文会一起进入回收站，可在 7 天内恢复。`)) return;
   const r = await req("DELETE", "/api/folders?id=" + fid);
+  pushUndo("删除文件夹「" + (node?.name || "") + "」",
+    async () => { await restoreRecycleByEntities("folder", [fid]); },
+    async () => { await req("DELETE", "/api/folders?id=" + fid); });
   toast(r.message || "已删除");
   state.selFolders.delete(fid);
   if (state.currentFolderId === fid) { state.currentFolderId = null; state.currentFolderPath = []; }
@@ -2783,7 +2977,17 @@ function openPaperModal(existing, onSaved) {
     };
     try {
       if (isEdit) {
+        // 撤销编辑论文 = 存回旧字段；重做 = 再存新字段
+        const oldFields = {
+          title_en: existing.title_en || "", title_zh: existing.title_zh || "",
+          journal: existing.journal || "", authors: existing.authors || "",
+          publish_date: existing.publish_date || "", doi: existing.doi || "",
+          url: existing.url || "", local_path: existing.local_path || "",
+        };
         await req("PUT", "/api/papers", { id: existing.id, ...payload });
+        pushUndo("编辑论文信息",
+          async () => { await req("PUT", "/api/papers", { id: existing.id, ...oldFields }); },
+          async () => { await req("PUT", "/api/papers", { id: existing.id, ...payload }); });
         toast("已保存修改");
         closeModal();
         if (onSaved) onSaved(existing.id);
@@ -2802,6 +3006,10 @@ function openPaperModal(existing, onSaved) {
           if (hits.length) { openDupChoiceModal(hits, payload, fid); return; }
         }
         const r = await req("POST", "/api/papers", { folder_id: fid, ...payload });
+        // 撤销导入 = 软删进回收站；重做 = 从回收站恢复
+        pushUndo("导入论文",
+          async () => { await req("DELETE", "/api/papers?id=" + r.id); },
+          async () => { await restoreRecycleByEntities("paper", [r.id]); });
         toast("论文已保存");
         closeModal();
         if (onSaved) onSaved(r && r.id);
@@ -2977,6 +3185,9 @@ function openDupChoiceModal(hits, payload, folderId) {
   $("#dup-share").onclick = async () => {
     try {
       await req("POST", "/api/papers/share", { paper_id: chosen, folder_id: folderId });
+      pushUndo("共享论文到文件夹",
+        async () => { await req("DELETE", "/api/papers/unshare?paper_id=" + chosen + "&folder_id=" + folderId); },
+        async () => { await req("POST", "/api/papers/share", { paper_id: chosen, folder_id: folderId }); });
       closeModal();
       toast("已引用库内已有论文，没有产生重复记录");
       await loadTree();
@@ -2991,7 +3202,10 @@ function openDupChoiceModal(hits, payload, folderId) {
   };
   $("#dup-force").onclick = async () => {
     try {
-      await req("POST", "/api/papers", { folder_id: folderId, ...payload });
+      const r = await req("POST", "/api/papers", { folder_id: folderId, ...payload });
+      pushUndo("导入论文",
+        async () => { await req("DELETE", "/api/papers?id=" + r.id); },
+        async () => { await restoreRecycleByEntities("paper", [r.id]); });
       DUP_FORCE_IMPORT = false;
       closeModal();
       toast("已导入为新论文（之后可在「重复清理」里合并）");
@@ -3305,7 +3519,20 @@ async function deleteTopicNode(node) {
   const extra = node.children && node.children.length ? "（含其所有子级）" : "";
   if (!confirm(`删除${label}「${node.name}」${extra}？\n它下面的条目会变回「未归属 · 游民」（思考本身还在论文里），观点层级结构删除后不可恢复。`)) return;
   try {
+    // 删除前抓快照（子树结构 + 各观点名下条目），供 Ctrl+Z 重建
+    const snap = await snapshotTopicSubtree(node.id);
     const r = await req("DELETE", "/api/topic_nodes?id=" + node.id);
+    // 撤销按快照重建子树（节点会拿到新 id），redo 删除目标随之更新
+    let redoNodeId = node.id;
+    const entry = {
+      label: "删除" + label + "「" + node.name + "」",
+      undo: async () => {
+        const idMap = await rebuildTopicSubtree(snap);
+        redoNodeId = idMap[node.id];
+      },
+      redo: async () => { await req("DELETE", "/api/topic_nodes?id=" + redoNodeId); },
+    };
+    pushUndoEntry(entry);
     toast(r.message || "已删除");
     // 当前打开/选中的节点被删掉就清空右侧
     const stillThere = (n) => n && findTopicNode(TOPIC_TREE, n.id);
@@ -3409,6 +3636,9 @@ function renderTopicNotes(f) {
           if (!confirm("删除这条思考？提示条里点「撤销」可立即找回。")) return;
           try {
             await req("DELETE", "/api/notes?id=" + n.id);
+            pushUndo("删除思考",
+              async () => { await restoreNotesByIds([n.id]); },
+              async () => { await req("DELETE", "/api/notes?id=" + n.id); });
             toastAction("已删除 1 条思考", "撤销", () => undoDeleteNotes([n.id], refresh));
             await refresh();
           } catch (e) { toast(e.message, true); }
@@ -3479,7 +3709,11 @@ function openTopicMoveModal(node) {
     onPick: async (picked) => {
       const parent_id = picked.key === "root" ? null : parseInt(picked.key.slice(1));
       try {
+        const oldParentId = node.parent_id;
         await req("POST", "/api/topic_nodes/move", { id: node.id, parent_id });
+        pushUndo("移动「" + node.name + "」",
+          async () => { await req("POST", "/api/topic_nodes/move", { id: node.id, parent_id: oldParentId }); },
+          async () => { await req("POST", "/api/topic_nodes/move", { id: node.id, parent_id }); });
         closeModal();
         toast("已移动");
         await loadTopicTree();
@@ -3515,7 +3749,14 @@ async function openFolderMoveModal(fid) {
     options,
     onPick: async (picked) => {
       try {
+        const node = findFolder(state.folderTree, fid);
+        // 节点上不一定带 project_id，兜底用当前项目
+        const oldProjectId = (node && node.project_id) || state.currentProjectId;
+        const oldParentId = node ? node.parent_id : null;
         await req("POST", "/api/folders/move", { id: fid, project_id: picked.projectId, parent_id: picked.parentId });
+        pushUndo("移动文件夹「" + (node ? node.name : "") + "」",
+          async () => { await req("POST", "/api/folders/move", { id: fid, project_id: oldProjectId, parent_id: oldParentId }); },
+          async () => { await req("POST", "/api/folders/move", { id: fid, project_id: picked.projectId, parent_id: picked.parentId }); });
         closeModal();
         toast("已移动（子文件夹与论文一并搬过去了）");
         await loadProjects();
@@ -3533,7 +3774,16 @@ async function createTopicNode(kind, parentId) {
   const name = prompt("新建" + label + where + "，请输入名称：");
   if (!name || !name.trim()) return;
   try {
-    await req("POST", "/api/topic_nodes", { kind: kind, name: name.trim(), parent_id: parentId });
+    const nr = await req("POST", "/api/topic_nodes", { kind: kind, name: name.trim(), parent_id: parentId });
+    // 撤销新建 = 删掉这个节点（节点下还没条目，直接删无副作用）；重做 = 原样重建
+    // 重做会换新 id，用可变量让撤销始终指向最新 id
+    let currentNodeId = nr.id;
+    pushUndo("新建" + label + "「" + name.trim() + "」",
+      async () => { await req("DELETE", "/api/topic_nodes?id=" + currentNodeId); },
+      async () => {
+        const rr = await req("POST", "/api/topic_nodes", { kind: kind, name: name.trim(), parent_id: parentId });
+        currentNodeId = rr.id;
+      });
     toast("已创建" + label);
     if (parentId) TOPIC_OPEN[parentId] = true; // 新建的子级要能立刻看到
     loadTopicTree();
@@ -3855,7 +4105,11 @@ async function openNoteAssignModal(note, onDone) {
   saveBtn.onclick = async () => {
     if (!chosen) { toast("请先选一个观点文件"); return; }
     try {
+      const oldTopic = note.topic_file_id;
       await req("POST", "/api/notes/assign", { note_id: note.id, topic_file_id: chosen });
+      pushUndo("调整条目归属",
+        async () => { await req("POST", "/api/notes/assign", { note_id: note.id, topic_file_id: oldTopic }); },
+        async () => { await req("POST", "/api/notes/assign", { note_id: note.id, topic_file_id: chosen }); });
       closeModal();
       toast("已归属到观点");
       if (onDone) await onDone();
@@ -3865,7 +4119,11 @@ async function openNoteAssignModal(note, onDone) {
   if (clearBtn && note.topic_file_id) {
     clearBtn.onclick = async () => {
       try {
+        const oldTopic = note.topic_file_id;
         await req("POST", "/api/notes/assign", { note_id: note.id, topic_file_id: null });
+        pushUndo("清除条目归属",
+          async () => { await req("POST", "/api/notes/assign", { note_id: note.id, topic_file_id: oldTopic }); },
+          async () => { await req("POST", "/api/notes/assign", { note_id: note.id, topic_file_id: null }); });
         closeModal();
         toast("已清除归属，这条变成游民（思考本身没删）");
         if (onDone) await onDone();
@@ -3940,6 +4198,9 @@ async function openSharePaperModal() {
     if (!chosen) return;
     try {
       await req("POST", "/api/papers/share", { paper_id: chosen, folder_id: fid });
+      pushUndo("共享论文到文件夹",
+        async () => { await req("DELETE", "/api/papers/unshare?paper_id=" + chosen + "&folder_id=" + fid); },
+        async () => { await req("POST", "/api/papers/share", { paper_id: chosen, folder_id: fid }); });
       closeModal();
       toast("已引用库内已有论文");
       await loadTree();
