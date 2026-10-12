@@ -1615,12 +1615,13 @@ function renderPaperView(p) {
         <p>点击上方「新增思考」写下第一条，或回到抽屉添加。</p>
       </div>`;
   } else {
-    // 每张卡片左上角直接标明归属观点（右上角的「归属」按钮保持原有交互不动）
+    // 每张卡片左上角：归属观点大胶囊，醒目、点击跳到观点视图打开该观点
+    // （右上角的「归属」按钮保持原有交互不动）
     list.innerHTML = notes.map((n, idx) => {
       const tp = (n.topic_path || "").trim();
-      const tag = `<div class="topic-source topic-source--assign"><span>归属观点</span>`
-        + (tp ? `<b title="${esc(tp)}">${esc(tp)}</b>` : `<b class="is-none">未归属</b>`)
-        + `</div>`;
+      const tag = tp
+        ? `<button class="assign-chip" data-tfid="${n.topic_file_id}" type="button" title="点击跳转到观点视图打开该观点"><svg><use href="#i-flag"/></svg><span>${esc(tp)}</span></button>`
+        : `<span class="assign-chip is-none" title="还没归属到任何观点"><svg><use href="#i-flag"/></svg><span>未归属</span></span>`;
       return renderViewNoteCard(n, idx + 1).replace('<div class="pv-card__head">', tag + '<div class="pv-card__head">');
     }).join("");
   }
@@ -1645,6 +1646,11 @@ function renderPaperView(p) {
   if (bulkDel) bulkDel.onclick = () => deleteSelectedViewNotes(p.id);
   const bulkClear = $("#pv-bulk-clear");
   if (bulkClear) bulkClear.onclick = () => { state.selViewNotes.clear(); renderPaperView(p); };
+
+  // 归属胶囊：点击跳到观点视图打开该观点
+  $$("#pv-list .assign-chip[data-tfid]").forEach(chip => {
+    chip.addEventListener("click", () => jumpToTopicFile(parseInt(chip.dataset.tfid)));
+  });
 
   // 绑定每条思考的 新增 / 删除 / 编辑 / 全屏 按钮
   $$(".pv-card__action[data-action='add']").forEach(btn => {
@@ -3374,16 +3380,19 @@ function renderTopicNotes(f) {
       card.textContent = n.content || ("（条目 #" + n.id + " 渲染失败）");
     }
     if (n.paper) {
-      // 来源标签：英文为主行（平时读英文，认得出是哪篇），中文作副行 / title
+      // 来源文献胶囊：英文为主行（平时读英文认得出是哪篇），中文放 title；
+      // 醒目大按钮，点击直接跳到这篇论文的 View 页
       const en = (n.paper.title_en || "").trim();
       const zh = (n.paper.title_zh || "").trim();
       const main = en || zh || "未命名";
       const sub = (en && zh) ? zh : "";
-      const tag = document.createElement("div");
-      tag.className = "topic-source";
-      tag.innerHTML = "<span>来源文献</span><b" + (sub ? ' title="' + esc(sub) + '"' : "") + ">"
-        + esc(main) + "</b>" + (sub ? "<small>" + esc(sub) + "</small>" : "");
-      card.insertBefore(tag, card.firstChild);
+      const chip = document.createElement("button");
+      chip.type = "button";
+      chip.className = "assign-chip assign-chip--source";
+      chip.title = sub ? "来源：" + sub + "（点击打开这篇论文）" : "点击打开这篇论文";
+      chip.innerHTML = "<svg><use href=\"#i-doc\"/></svg><span>" + esc(main) + "</span>";
+      chip.addEventListener("click", () => jumpToPaper(n.paper.id));
+      card.insertBefore(chip, card.firstChild);
     }
     // 绑定卡片上的全部操作按钮 —— 与论文 View 页同一套行为，缺一个就是点不动
     const paperId = n.paper_id || (n.paper && n.paper.id);
@@ -3752,6 +3761,12 @@ async function jumpToTopicFile(fileId) {
   const node = findTopicNode(TOPIC_TREE, fileId);
   if (node) await openTopicFile(node);
   else toast("找不到该观点文件", true);
+}
+
+/* 反向：从观点视图跳到某篇论文的 View 页 */
+async function jumpToPaper(pid) {
+  setViewMode("projects");
+  await openPaperView(pid);
 }
 
 function findTopicNode(nodes, id) {

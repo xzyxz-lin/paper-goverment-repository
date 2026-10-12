@@ -87,12 +87,26 @@ svg { width: 1.25rem; height: 1.25rem; fill: none; stroke: currentColor; stroke-
 .view-switch__btn.is-active { color: white; background: rgba(42,109,103,.42); border-color: rgba(95,147,141,.45); }
 .topic-hint { margin: 0 0 14px; padding: 12px 14px; color: var(--ink-700); background: var(--paper-50); border-left: 3px solid var(--oxide-400); border-radius: 3px; font-size: .82rem; line-height: 1.75; }
 .tree-empty { margin: 0; padding: 18px 14px; color: var(--ink-700); font-size: .82rem; text-align: center; }
-.topic-source { display: flex; flex-wrap: wrap; align-items: baseline; gap: 6px; margin-bottom: 8px; padding-bottom: 8px; border-bottom: 1px dashed var(--paper-300); font-size: .74rem; }
-.topic-source span { flex: none; color: var(--ink-500); font: 600 .62rem var(--font-data); letter-spacing: .06em; text-transform: uppercase; }
-.topic-source b { color: var(--oxide-700); font-weight: 600; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-.topic-source small { display: block; flex-basis: 100%; width: 100%; margin-top: 3px; color: var(--ink-700); font: 400 .68rem var(--font-data); white-space: normal; overflow: hidden; text-overflow: ellipsis; }
-/* 论文 View 页卡片左上角的归属标签 */
-.topic-source--assign b.is-none { color: var(--ink-500); font-weight: 400; }
+/* 归属 / 来源胶囊：大而醒目、可点击跳转。
+   论文 View 的归属 → 跳观点视图；观点卡片的来源 → 跳论文 View。 */
+.assign-chip {
+  display: inline-flex; align-items: center; gap: 8px;
+  margin: 0 0 13px; padding: 9px 19px;
+  background: rgba(31,91,87,.09);
+  border: 1.5px solid var(--oxide-700);
+  border-radius: 999px;
+  color: var(--oxide-700);
+  font: 600 .92rem var(--font-display);
+  cursor: pointer;
+  transition: background .15s ease;
+}
+.assign-chip:hover { background: rgba(31,91,87,.2); }
+.assign-chip svg { width: 15px; height: 15px; flex: none; }
+.assign-chip span { max-width: 640px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.assign-chip.is-none { color: var(--ink-500); border-color: var(--paper-300); background: var(--paper-50); cursor: default; }
+.assign-chip.is-none:hover { background: var(--paper-50); }
+.assign-chip--source { background: rgba(183,94,29,.07); border-color: var(--copper-600); color: var(--copper-600); }
+.assign-chip--source:hover { background: rgba(183,94,29,.15); }
 .modal-head { margin-bottom: 14px; }
 .modal-head h3 { margin: 0 0 6px; font-size: 1rem; }
 .modal-head p { margin: 0; color: var(--ink-700); font-size: .78rem; line-height: 1.6; }
