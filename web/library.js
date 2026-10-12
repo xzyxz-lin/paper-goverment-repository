@@ -2410,7 +2410,9 @@ async function openNoteComposeEditor(opts) {
           <b>${esc((sourcePaper && (sourcePaper.title_en || sourcePaper.title_zh)) || "未指定")}</b>
           ${(sourcePaper && sourcePaper.title_en && sourcePaper.title_zh) ? "<small>" + esc(sourcePaper.title_zh) + "</small>" : ""}
         </div>
+        ${sourceId ? `<button class="scan-button scan-button--sm scan-button--ghost" id="m-src-notes" type="button" title="就地查看这篇文献已有的全部条目、归属状态，并能直接处理（游民归入当前观点 / 改归 / 跳转）">查看已有 ${(sourcePaper && sourcePaper.notes ? sourcePaper.notes.length : 0)} 条</button>` : ""}
       </div>
+      <div id="src-notes-slot"></div>
       <div class="layout-sections" id="layout-sections">
         ${secHtml}
         <button class="layout-section__add" id="m-layout-add" type="button">＋ 新增一栏</button>
@@ -2428,6 +2430,26 @@ async function openNoteComposeEditor(opts) {
     bindComposeDrag();
     $("#m-close").onclick = closeModal;
     $("#m-layout-cancel").onclick = closeModal;
+    // 来源文献区「查看已有 N 条」：就地展开该文献全部条目 + 归属 + 处理
+    const srcNotesBtn = $("#m-src-notes");
+    if (srcNotesBtn) {
+      srcNotesBtn.onclick = async () => {
+        const slot = $("#src-notes-slot");
+        const existing = slot.querySelector(".paper-notes-panel");
+        if (existing) { existing.remove(); return; }
+        const topicName = TOPIC_CURRENT_FILE ? TOPIC_CURRENT_FILE.name : "";
+        const panel = await buildPaperNotesPanel(sourceId, topicFileId, topicName, async () => {
+          // 归属变化后同步编辑器顶部的计数
+          try {
+            const d = await req("GET", "/api/paper?id=" + sourceId);
+            sourcePaper = (d && (d.paper || d)) || sourcePaper;
+            const btn = $("#m-src-notes");
+            if (btn) btn.textContent = "查看已有 " + ((sourcePaper && sourcePaper.notes ? sourcePaper.notes.length : 0)) + " 条";
+          } catch (e) { /* 忽略 */ }
+        });
+        slot.appendChild(panel);
+      };
+    }
     $("#m-layout-add").onclick = () => {
       sections.push({ id: "s" + (++secCounter), col: "full", items: [{ key: newKey("t"), type: "text", text: "" }] });
       render();
@@ -3796,6 +3818,171 @@ async function createTopicNode(kind, parentId) {
    布局：左侧 项目→文件夹 树形导航（论文是按项目组织的，选文献也该这样，不能一上来平铺几千篇），
    右侧论文列表。论文同时给英文和中文标题 —— 平时读的是英文，只给中文反而认不出是哪篇。
    还可以就地导入一篇新论文（拖 PDF / 手填），导入完回到本选择器。 */
+/* 二级确认小对话框：独立挂到 body，**不复用 #modal**——
+   否则会把父级弹窗（来源选择器 / 编辑器）整个覆盖掉，父窗口里的面板就丢了 */
+function openConfirmDialog({ eyebrow, title, hint, cancelText, okText, onOk, okDanger }) {
+  const wrap = document.createElement("div");
+  wrap.className = "mini-dialog-backdrop";
+  wrap.innerHTML = `
+    <div class="mini-dialog" role="alertdialog" aria-modal="true">
+      <p class="eyebrow">${esc(eyebrow || "CONFIRM")}</p>
+      <h3>${esc(title || "确认")}</h3>
+      <p class="mini-dialog__hint">${hint || ""}</p>
+      <div class="modal-actions">
+        <button class="scan-button scan-button--ghost" id="md-cancel" type="button">${esc(cancelText || "取消")}</button>
+        <button class="scan-button${okDanger ? " btn-danger" : ""}" id="md-ok" type="button">${esc(okText || "确定")}</button>
+      </div>
+    </div>`;
+  document.body.appendChild(wrap);
+  const close = () => wrap.remove();
+  wrap.querySelector("#md-cancel").onclick = close;
+  wrap.querySelector("#md-ok").onclick = async () => { close(); if (onOk) await onOk(); };
+  wrap.addEventListener("click", (e) => { if (e.target === wrap) close(); });
+  return { close };
+}
+
+/* ============================================================
+   来源文献的「已有条目」面板
+   在选择文献 / 写思考的地方就地展开某篇论文的所有条目，显示每条归属，并按情况处理：
+   - 游民        → 一键归入当前观点（可 Ctrl+Z 反悔）
+   - 归属别的观点 → 二次警告后改归到当前观点
+   - 归属当前观点 → 二次确认「点错了」还是「跳到该观点继续写」
+   ============================================================ */
+async function buildPaperNotesPanel(paperId, topicFileId, currentTopicName, onChanged) {
+  const panel = document.createElement("div");
+  panel.className = "paper-notes-panel";
+  panel.dataset.paper = paperId;
+  panel.innerHTML = '<p class="tree-empty">加载条目中…</p>';
+
+  const strip = (s) => String(s || "")
+    .replace(/\[\[(?:img:\d+|existing-img:\d+|blk)\]\]/g, " ").replace(/\s+/g, " ").trim();
+
+  const assignTo = async (noteId, tfid, oldTfid) => {
+    await req("POST", "/api/notes/assign", { note_id: noteId, topic_file_id: tfid });
+    pushUndo("条目归属调整",
+      async () => { await req("POST", "/api/notes/assign", { note_id: noteId, topic_file_id: oldTfid }); },
+      async () => { await req("POST", "/api/notes/assign", { note_id: noteId, topic_file_id: tfid }); });
+    toast(tfid ? "已归入当前观点（Ctrl+Z 可反悔）" : "已取消归属");
+  };
+
+  const confirmReassign = (n) => {
+    openConfirmDialog({
+      eyebrow: "REASSIGN",
+      title: "改归确认",
+      hint: `这条条目当前已经归属到<br><b>${esc(n.topic_path || "别的观点")}</b><br>`
+        + `要把它改归到当前观点 <b>${esc(currentTopicName || "（当前观点）")}</b> 吗？改归后原观点下不再显示它。`,
+      cancelText: "取消",
+      okText: "确定改归",
+      okDanger: true,
+      onOk: async () => {
+        try {
+          await assignTo(n.id, topicFileId, n.topic_file_id);
+          await load();
+          if (onChanged) await onChanged();
+        } catch (e) { toast(e.message, true); }
+      },
+    });
+  };
+
+  const confirmJumpSameTopic = (sameCount) => {
+    openConfirmDialog({
+      eyebrow: "ALREADY HERE",
+      title: "点错了，还是要接着写？",
+      hint: `这篇文献已经有 <b>${sameCount}</b> 条条目就在当前观点 `
+        + `<b>${esc(currentTopicName || "（当前观点）")}</b> 下了。<br>`
+        + `如果只是点错，取消即可；如果想接着写，直接跳到该观点看已有的想法。`,
+      cancelText: "点错了，取消",
+      okText: "跳到该观点继续写",
+      onOk: async () => {
+        await jumpToTopicFile(topicFileId);
+      },
+    });
+  };
+
+  const load = async () => {
+    let paper;
+    try {
+      paper = (await req("GET", "/api/paper?id=" + paperId)).paper;
+    } catch (e) {
+      panel.innerHTML = '<p class="tree-empty">加载失败：' + esc(e.message || "未知错误") + "</p>";
+      return;
+    }
+    const notes = paper.notes || [];
+    if (!notes.length) {
+      panel.innerHTML = '<p class="pnp-empty">这篇文献还没有任何条目，你写的就是第一条。</p>';
+      return;
+    }
+    const nomads = notes.filter(n => !n.topic_file_id);
+    const same = notes.filter(n => n.topic_file_id && n.topic_file_id === topicFileId);
+    const others = notes.filter(n => n.topic_file_id && n.topic_file_id !== topicFileId);
+    panel.innerHTML = `
+      <div class="pnp-head">
+        <span class="pnp-count">已有 <b>${notes.length}</b> 条条目</span>
+        <span class="pnp-legend">
+          <i class="dot dot--nomad"></i>游民 ${nomads.length}
+          ${topicFileId
+            ? `<i class="dot dot--same"></i>当前观点 ${same.length}<i class="dot dot--other"></i>别的观点 ${others.length}`
+            : `<i class="dot dot--other"></i>已归属 ${others.length}`}
+        </span>
+        ${topicFileId && nomads.length
+          ? `<button class="scan-button scan-button--sm" id="pnp-all" type="button">全部 ${nomads.length} 条游民归入当前观点</button>`
+          : ""}
+      </div>
+      <div class="pnp-list"></div>`;
+    const list = panel.querySelector(".pnp-list");
+    notes.forEach(n => {
+      const full = strip(n.content);
+      const preview = full.slice(0, 90) || "（截图条目）";
+      const item = document.createElement("div");
+      item.className = "pnp-item";
+      const chip = n.topic_file_id == null
+        ? '<span class="pnp-chip is-nomad" title="还没归属到任何观点">游民</span>'
+        : `<span class="pnp-chip ${n.topic_file_id === topicFileId ? "is-same" : "is-other"}" title="${esc(n.topic_path || "")}">${esc(String(n.topic_path || "").split("/").pop())}</span>`;
+      item.innerHTML = `<span class="pnp-text" title="${esc(full)}">${esc(preview)}</span>${chip}<span class="pnp-acts"></span>`;
+      const acts = item.querySelector(".pnp-acts");
+      if (topicFileId) {
+        if (n.topic_file_id == null) {
+          const b = document.createElement("button");
+          b.type = "button"; b.className = "scan-button scan-button--sm"; b.textContent = "归入当前观点";
+          b.onclick = async () => {
+            try { await assignTo(n.id, topicFileId, null); await load(); if (onChanged) await onChanged(); }
+            catch (e) { toast(e.message, true); }
+          };
+          acts.appendChild(b);
+        }
+        else if (n.topic_file_id === topicFileId) {
+          const b = document.createElement("button");
+          b.type = "button"; b.className = "scan-button scan-button--sm scan-button--ghost"; b.textContent = "跳到该观点";
+          b.onclick = () => confirmJumpSameTopic(same.length);
+          acts.appendChild(b);
+        } else {
+          const b = document.createElement("button");
+          b.type = "button"; b.className = "scan-button scan-button--sm scan-button--ghost"; b.textContent = "改归…";
+          b.onclick = () => confirmReassign(n);
+          acts.appendChild(b);
+        }
+      } else if (n.topic_file_id) {
+        const b = document.createElement("button");
+        b.type = "button"; b.className = "scan-button scan-button--sm scan-button--ghost"; b.textContent = "去看看";
+        b.onclick = () => jumpToTopicFile(n.topic_file_id);
+        acts.appendChild(b);
+      }
+      list.appendChild(item);
+    });
+    const allBtn = panel.querySelector("#pnp-all");
+    if (allBtn) allBtn.onclick = async () => {
+      try {
+        for (const n of nomads) await assignTo(n.id, topicFileId, null);
+        await load();
+        if (onChanged) await onChanged();
+      } catch (e) { toast(e.message, true); }
+    };
+  };
+
+  await load();
+  return panel;
+}
+
 async function openTopicNoteComposer(topicFileId) {
   const load = async (q) => {
     const d = await req("GET", "/api/papers/search?q=" + encodeURIComponent(q || ""));
@@ -3874,6 +4061,7 @@ async function openTopicNoteComposer(topicFileId) {
   };
 
   /* 右侧列表：英文标题为主行，中文标题（若有）放副行 —— 平时读的是英文，只给中文认不出是哪篇 */
+  let expandedId = null; // 当前展开「已有条目」面板的论文 id（同时只展开一个）
   const paperRow = (p) => {
     const en = (p.title_en || "").trim();
     const zh = (p.title_zh || "").trim();
@@ -3883,14 +4071,27 @@ async function openTopicNoteComposer(topicFileId) {
       + (p.journal ? " · " + p.journal : "");
     const row = document.createElement("div");
     row.className = "picker-row";
-    row.innerHTML = `<b title="${esc(main)}">${esc(main)}</b><small>${esc(sub)}</small>`;
-    row.addEventListener("click", () => {
+    row.innerHTML = `<b title="${esc(main)}">${esc(main)}</b><small>${esc(sub)}</small>`
+      + `<span class="picker-row__more" title="点这张行就能看到这篇文献已有的全部条目、归属状态，并能直接处理">已有条目</span>`;
+    row.addEventListener("click", async () => {
       // 点击不立即进编辑器，先高亮选中；点底部「确定」才进
       list.querySelectorAll(".picker-row.is-chosen").forEach(el => el.classList.remove("is-chosen"));
       row.classList.add("is-chosen");
       chosenPaper = p;
       okBtn.disabled = false;
       okBtn.querySelector("span").textContent = "确定 · " + (en || zh || "").slice(0, 22);
+      // 同时展开这篇文献的「已有条目」面板：就地看全部条目 + 归属 + 处理
+      const old = list.querySelector(".paper-notes-panel");
+      if (old) old.remove();
+      if (expandedId === p.id) { expandedId = null; return; }
+      expandedId = p.id;
+      const topicName = TOPIC_CURRENT_FILE ? TOPIC_CURRENT_FILE.name : "";
+      const panel = await buildPaperNotesPanel(p.id, topicFileId, topicName, async () => {
+        // 归属处理完后同步刷新选择器数据（条目数会变）
+        try { papers = await load(""); } catch (e) { /* 忽略 */ }
+      });
+      row.after(panel);
+      panel.scrollIntoView({ block: "nearest" });
     });
     return row;
   };
@@ -3913,7 +4114,16 @@ async function openTopicNoteComposer(topicFileId) {
         + "</p>";
       return;
     }
-    rows.forEach(p => list.appendChild(paperRow(p)));
+    rows.forEach(p => {
+      const row = paperRow(p);
+      list.appendChild(row);
+      // 重新渲染（搜索/切换文件夹）后，已展开的面板要跟着恢复
+      if (expandedId === p.id) {
+        buildPaperNotesPanel(p.id, topicFileId, TOPIC_CURRENT_FILE ? TOPIC_CURRENT_FILE.name : "", async () => {
+          try { papers = await load(""); } catch (e) { /* 忽略 */ }
+        }).then(panel => row.after(panel));
+      }
+    });
   };
 
   buildNav();
