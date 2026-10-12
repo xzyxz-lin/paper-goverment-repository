@@ -18,3 +18,5 @@ picture asset/
 
 # 测试临时文件
 test_sample.pdf
+web/.playwright-cli/
+data/server.log
