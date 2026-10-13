@@ -2001,6 +2001,7 @@ function exitArrangeMode(notify = true) {
       el.draggable = false;
       el.classList.remove("is-dragging", "is-insert-before", "is-insert-after", "is-drop-col-1", "is-drop-col-2", "is-selected");
     });
+    $$(".pv-slot", card).forEach(el => el.classList.remove("is-drop-slot-col-1", "is-drop-slot-col-2"));
     const btn = card.querySelector(".pv-card__action[data-action='arrange'] span");
     if (btn) btn.textContent = "排版";
     const body = card.querySelector(".pv-card__body");
@@ -2016,6 +2017,12 @@ function arrangeLayout() {
   return { blocks: state.arrange.blocks.map(b => ({ key: b.key, col: b.col, order: b.order })) };
 }
 
+// 清空所有拖拽落点提示（块的上/下插入线 + 左/右并排带 + 空位高亮带）
+function clearArrangeHints(card) {
+  $$(".pv-block", card).forEach(x => x.classList.remove("is-insert-before", "is-insert-after", "is-drop-col-1", "is-drop-col-2"));
+  $$(".pv-slot", card).forEach(x => x.classList.remove("is-drop-slot-col-1", "is-drop-slot-col-2"));
+}
+
 function bindArrangeDrag(card) {
   $$(".pv-block", card).forEach(el => {
     el.draggable = true;
@@ -2029,10 +2036,8 @@ function bindArrangeDrag(card) {
     el.addEventListener("dragend", () => {
       el.classList.remove("is-dragging");
       state._arrangeDragY = null;
-      $$(".pv-block", card).forEach(x => {
-        x.classList.remove("is-insert-before", "is-insert-after", "is-drop-col-1", "is-drop-col-2");
-        delete x.dataset.dropCol;
-      });
+      clearArrangeHints(card);
+      $$(".pv-block", card).forEach(x => delete x.dataset.dropCol);
     });
     el.addEventListener("dragover", (e) => {
       const dragging = card.querySelector(".pv-block.is-dragging");
@@ -2052,6 +2057,7 @@ function bindArrangeDrag(card) {
         x.classList.remove("is-insert-before", "is-insert-after", "is-drop-col-1", "is-drop-col-2");
         if (x !== el) delete x.dataset.dropCol;
       });
+      $$(".pv-slot", card).forEach(x => x.classList.remove("is-drop-slot-col-1", "is-drop-slot-col-2"));
       // 两种落点提示互斥，信号才不混淆：
       //  左/右 1/3 → 只亮「并排到左/右」虚线带（落下=与目标并排成一行）；
       //  中间 1/3 → 只亮上/下铜橙插入线（落下=插到它前面/后面，列不变）。
@@ -2110,6 +2116,32 @@ function bindArrangeDrag(card) {
         el.classList.add("is-selected");
         toast("已选中一块。滚动找到目标块后，按住 Ctrl 点击它即可对换；再点一下取消选中");
       }
+    });
+  });
+  // 空位（没有实体块的半格）也是可放置落点：拖到空位 = 把拖拽块放进来、与同行的实体块并排成一行
+  $$(".pv-slot", card).forEach(slot => {
+    slot.addEventListener("dragover", (e) => {
+      const dragging = card.querySelector(".pv-block.is-dragging");
+      if (!dragging) return;
+      e.preventDefault();
+      e.dataTransfer.dropEffect = "move";
+      clearArrangeHints(card);
+      const c = slot.dataset.col;
+      slot.classList.add(c === "1" ? "is-drop-slot-col-1" : "is-drop-slot-col-2");
+    });
+    slot.addEventListener("dragleave", () => {
+      slot.classList.remove("is-drop-slot-col-1", "is-drop-slot-col-2");
+    });
+    slot.addEventListener("drop", (e) => {
+      e.preventDefault();
+      slot.classList.remove("is-drop-slot-col-1", "is-drop-slot-col-2");
+      const key = e.dataTransfer.getData("text/plain");
+      const dropCol = slot.dataset.col;
+      // 同行实体块作为「并排目标」（拖到它所在行的空半格 → 拖拽块占该半格，它占另一半）
+      const rowEl = slot.closest(".pv-row");
+      const targetEl = rowEl ? rowEl.querySelector(".pv-block") : null;
+      if (!key || !targetEl || key === targetEl.dataset.key || !state.arrange) return;
+      insertArrangeBlock(key, targetEl.dataset.key, true, card, dropCol);
     });
   });
 }
@@ -2474,7 +2506,29 @@ function renderViewNoteBlocks(n, opts) {
     return `<div class="pv-block pv-block--media ${colClass}" data-key="${b.key}"${autoAttr}>${tools}<span class="pv-block__label">截图</span><img src="/assets/${encodeURI(b.image.rel_path)}" alt="截图" loading="lazy"></div>`;
   };
 
-  return visualRows(blocks).map(row => `<div class="pv-row">${row.map(blockHtml).join("")}</div>`).join("");
+  // 空位占位：排版模式下，独占半格（同行只有一块 col1/col2）时，另一半是空白网格、无 DOM，
+  // 无法成为落点。给它补一个 .pv-slot 占位，使「把右边块拖到左边空白格」也可行。
+  const slotHtml = (col, ri) => {
+    const side = String(col) === "1" ? "放左侧 ←" : "→ 放右侧";
+    return `<div class="pv-slot pv-slot--col-${col}" data-col="${col}" data-row="${ri}"><span class="pv-slot__hint">${side}</span></div>`;
+  };
+
+  return visualRows(blocks).map((row, ri) => {
+    const isFull = row.length === 1 && String(row[0].col) === "full";
+    let inner;
+    if (isFull) {
+      inner = row.map(blockHtml).join("");
+    } else if (row.length === 1) {
+      // 独占半格：补一个对向空白位（仅排版模式显示/可放置）
+      const c = String(row[0].col);              // 已有块所在列
+      const slotCol = c === "1" ? 2 : 1;         // 空位所在列
+      const slot = arrange ? slotHtml(slotCol, ri) : "";
+      inner = c === "1" ? blockHtml(row[0]) + slot : slot + blockHtml(row[0]);
+    } else {
+      inner = row.map(blockHtml).join("");
+    }
+    return `<div class="pv-row" data-row="${ri}">${inner}</div>`;
+  }).join("");
 }
 
 /* ============ 排版编辑器：可排序的功能栏（左/右/全宽） ============ */
