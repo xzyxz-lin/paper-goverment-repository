@@ -435,7 +435,10 @@ function showView(view) {
   } else if (view === "topics") {
     $("#page-title").textContent = "观点库";
     $("#page-eyebrow").textContent = "TOPIC LIBRARY";
-    loadTopicTree();
+    // 回到观点视图时重新拉取当前文件：别的视图里删/改/新增过的条目会立即同步，
+    // 否则 #topic-notes 还是上次渲染的旧 DOM（被删的条目会「僵」在屏幕上点不动）
+    // _topicNavInProgress：跳转（jumpToTopicFile）自己会打开目标文件与刷新树，这里不重复
+    if (!_topicNavInProgress) refreshTopicViewFile();
   }
 
   // 在 VIEW 全屏浏览页隐藏 topbar 的「回收站」「新建项目」，避免干扰阅读
@@ -1777,7 +1780,7 @@ function closeDrawer() {
 $("#drawer-backdrop").addEventListener("click", closeDrawer);
 
 /* ============ 论文思考全屏浏览（VIEW） ============ */
-async function openPaperView(pid) {
+async function openPaperView(pid, focusNoteId) {
   const data = await req("GET", "/api/paper?id=" + pid);
   const paper = data.paper;
   state._viewPaper = paper;
@@ -1785,6 +1788,8 @@ async function openPaperView(pid) {
   state.selViewNotes.clear();
   renderPaperView(paper);
   showView("paper-view");
+  // 跨视图横跳：把点过来的那条思考滚到视口居中
+  if (focusNoteId != null) centerNoteIn("#pv-list", focusNoteId);
 }
 
 function closePaperView() {
@@ -1793,7 +1798,6 @@ function closePaperView() {
   const back = state._viewPaperReturnTo || "project";
   state._viewPaper = null;
   state._viewPaperReturnTo = null;
-  state._topicReturn = null; // 没走「归属胶囊反跳」就退出 View → 跳走时的位置快照作废
   state.selViewNotes.clear();
   // 退出观察后回到该论文的抽屉状态，而不是退回到无选中的初始界面
   if (paper && paper.id) {
@@ -1859,9 +1863,13 @@ function renderPaperView(p) {
   const bulkClear = $("#pv-bulk-clear");
   if (bulkClear) bulkClear.onclick = () => { state.selViewNotes.clear(); renderPaperView(p); };
 
-  // 归属胶囊：点击跳到观点视图打开该观点
+  // 归属胶囊：点击跳到观点视图打开该观点，并定位到这张卡片（而不是回到上次离开的观点）
   $$("#pv-list .assign-chip[data-tfid]").forEach(chip => {
-    chip.addEventListener("click", () => jumpToTopicFile(parseInt(chip.dataset.tfid)));
+    chip.addEventListener("click", () => {
+      const card = chip.closest(".pv-card");
+      const nid = card ? parseInt(card.dataset.noteId) : null;
+      jumpToTopicFile(parseInt(chip.dataset.tfid), nid);
+    });
   });
 
   // 绑定每条思考的 新增 / 删除 / 编辑 / 全屏 按钮
@@ -2903,6 +2911,7 @@ async function openNoteComposeEditor(opts) {
       return;
     }
     const layout = { blocks: flat };
+    let focusNoteId = isEdit ? note.id : null; // 保存后要定位到的条目（新增=新 id，编辑=本条）
     try {
       if (!isEdit) {
         const nd = await req("POST", "/api/notes", {
@@ -2910,6 +2919,7 @@ async function openNoteComposeEditor(opts) {
           topic_file_id: topicFileId || null,
         });
         const nid = nd.id;
+        focusNoteId = nid;
         for (const img of newImages) {
           await req("POST", "/api/notes/images", { note_id: nid, data: img.data, ext: img.ext });
         }
@@ -2951,10 +2961,9 @@ async function openNoteComposeEditor(opts) {
       if (paperId && state._currentPaper && state._currentPaper.id === paperId) await refreshPaper(paperId);
       else if (isEdit && state._currentPaper && state._currentPaper.id === note.paper_id) await refreshPaper(note.paper_id);
       if (topicFileId && TOPIC_CURRENT_FILE && TOPIC_CURRENT_FILE.id === topicFileId) {
-        // 观点视图里保存：原地刷新列表，但保住滚动位置——新增/编辑不能把人拽回顶部
-        const y = state.currentView === "topics" ? window.scrollY : null;
+        // 观点视图里保存：原地刷新列表，并把刚写/刚改的条目滚到视口居中
         await openTopicFile(TOPIC_CURRENT_FILE);
-        if (y != null) restoreTopicScrollAt(y);
+        centerNoteIn("#topic-notes", focusNoteId);
       }
     } catch (e) { toast(e.message, true); }
   }
@@ -3674,6 +3683,7 @@ document.addEventListener("DOMContentLoaded", init);
 let TOPIC_TREE = [];
 let TOPIC_CURRENT_FILE = null;   // 当前打开的叶子「文件」节点
 let TOPIC_CURRENT_PARENT = null; // 当前选中的观点/文件夹（作为新建的父节点）
+let _topicNavInProgress = false; // 跳转中标记：showView("topics") 不抢先渲染旧文件
 
 function bindTopics() {
   const sw = $("#view-switch");
@@ -3890,7 +3900,7 @@ function renderTopicNotes(f) {
       chip.className = "assign-chip assign-chip--source";
       chip.title = sub ? "来源：" + sub + "（点击打开这篇论文）" : "点击打开这篇论文";
       chip.innerHTML = "<svg><use href=\"#i-doc\"/></svg><span>" + esc(main) + "</span>";
-      chip.addEventListener("click", () => jumpToPaper(n.paper.id));
+      chip.addEventListener("click", () => jumpToPaper(n.paper.id, n.id));
       card.insertBefore(chip, card.firstChild);
     }
     // 绑定卡片上的全部操作按钮 —— 与论文 View 页同一套行为，缺一个就是点不动
@@ -4498,36 +4508,50 @@ function renderNotesGrouped(notes) {
     </div>` : "");
 }
 
-/* 恢复观点视图滚动位置（窗口是滚动容器；html 有 scroll-behavior:smooth，必须用 instant 覆盖） */
-function restoreTopicScrollAt(y) {
-  if (y == null) return;
-  window.scrollTo({ top: y, behavior: "instant" });
-  // 懒加载图片陆续撑高文档后再校正一次，防止位置被 clamp 到偏上处
-  setTimeout(() => window.scrollTo({ top: y, behavior: "instant" }), 350);
+/* 把某条条目滚到视口居中（跨视图横跳 / 新增条目后定位用）。
+   html 有 scroll-behavior:smooth，必须用 instant 覆盖；
+   懒加载图片陆续撑高文档会挪动位置，故稍后再校正一次。 */
+function centerNoteIn(containerSel, noteId) {
+  if (noteId == null) return;
+  const doCenter = () => {
+    const el = document.querySelector(`${containerSel} .pv-card[data-note-id="${noteId}"]`);
+    if (el) el.scrollIntoView({ block: "center", behavior: "instant" });
+  };
+  doCenter();
+  setTimeout(doCenter, 350);
 }
 
-/* 从论文抽屉 / 分组头跳到观点视图并打开指定文件 */
-async function jumpToTopicFile(fileId) {
-  closeDrawer();
-  // 从论文视图反跳回观点视图：如果这正是之前跳走的那个文件，原位恢复滚动位置
-  const back = state._topicReturn;
-  state._topicReturn = null;
-  setViewMode("topics");
+/* 回到观点视图时重新拉取当前文件（保证与论文视图的增删改实时一致） */
+async function refreshTopicViewFile() {
   await loadTopicTree();
-  const node = findTopicNode(TOPIC_TREE, fileId);
-  if (node) {
-    await openTopicFile(node);
-    if (back && back.fileId === fileId) restoreTopicScrollAt(back.y);
-  }
-  else toast("找不到该观点文件", true);
+  if (!TOPIC_CURRENT_FILE) return;
+  const node = findTopicNode(TOPIC_TREE, TOPIC_CURRENT_FILE.id);
+  if (node) await openTopicFile(node);
 }
 
-/* 反向：从观点视图跳到某篇论文的 View 页 */
-async function jumpToPaper(pid) {
-  // 记下从观点视图哪个文件、哪个滚动位置跳走的，反跳回来时恢复
-  state._topicReturn = { fileId: TOPIC_CURRENT_FILE ? TOPIC_CURRENT_FILE.id : null, y: window.scrollY };
+/* 从论文抽屉 / 分组头跳到观点视图并打开指定文件；centerNoteId：把点过来的那条条目滚到居中 */
+async function jumpToTopicFile(fileId, centerNoteId) {
+  closeDrawer();
+  // 标记「跳转中」：showView("topics") 因此不抢先渲染旧文件，由本函数渲染目标文件
+  _topicNavInProgress = true;
+  try {
+    setViewMode("topics");
+    await loadTopicTree();
+    const node = findTopicNode(TOPIC_TREE, fileId);
+    if (node) {
+      await openTopicFile(node);
+      // 定位到「我真实点击的那条归属」所在的观点文件里的那条条目（而不是抱死回上一个观点）
+      if (centerNoteId != null) centerNoteIn("#topic-notes", centerNoteId);
+    } else toast("找不到该观点文件", true);
+  } finally {
+    _topicNavInProgress = false;
+  }
+}
+
+/* 反向：从观点视图跳到某篇论文的 View 页，并把点过来的那条条目滚到居中 */
+async function jumpToPaper(pid, centerNoteId) {
   setViewMode("papers"); // 按钮 data-viewmode 是 papers，传 projects 会一个都点不亮
-  await openPaperView(pid);
+  await openPaperView(pid, centerNoteId);
 }
 
 function findTopicNode(nodes, id) {
