@@ -404,6 +404,16 @@ function showView(view) {
   $$(".page").forEach(p => p.classList.remove("is-visible"));
   const page = $(`.page[data-view="${view}"]`);
   if (page) page.classList.add("is-visible");
+  // 左上角 论文视图/观点视图 高亮跟随实际所在视图：
+  // 论文 View / 项目侧一律亮「论文视图」，观点库亮「观点视图」——
+  // 之前只靠 setViewMode 同步，而 setViewMode("projects") 传的值和按钮的
+  // data-viewmode="papers" 对不上 → 跳进论文视图后两个按钮都不亮
+  const swMode = view === "topics" ? "topics" : "papers";
+  $$(".view-switch__btn").forEach(b => {
+    const on = b.dataset.viewmode === swMode;
+    b.classList.toggle("is-active", on);
+    b.setAttribute("aria-selected", on ? "true" : "false");
+  });
 
   if (view === "projects") {
     $("#page-title").textContent = "项目总览";
@@ -1783,6 +1793,7 @@ function closePaperView() {
   const back = state._viewPaperReturnTo || "project";
   state._viewPaper = null;
   state._viewPaperReturnTo = null;
+  state._topicReturn = null; // 没走「归属胶囊反跳」就退出 View → 跳走时的位置快照作废
   state.selViewNotes.clear();
   // 退出观察后回到该论文的抽屉状态，而不是退回到无选中的初始界面
   if (paper && paper.id) {
@@ -2934,10 +2945,17 @@ async function openNoteComposeEditor(opts) {
         toast("已保存修改");
       }
       closeModal();
-      if (state._viewPaper) await openPaperView(state._viewPaper.id);
+      // 只在当前就停在论文 View 里时才重渲染 View。之前无脑看 state._viewPaper，
+      // 但从 View 跳去观点视图后这个引用一直残留 → 观点视图里新增/编辑保存会被硬拽进论文 View
+      if (state.currentView === "paper-view" && state._viewPaper) await openPaperView(state._viewPaper.id);
       if (paperId && state._currentPaper && state._currentPaper.id === paperId) await refreshPaper(paperId);
       else if (isEdit && state._currentPaper && state._currentPaper.id === note.paper_id) await refreshPaper(note.paper_id);
-      if (topicFileId && TOPIC_CURRENT_FILE && TOPIC_CURRENT_FILE.id === topicFileId) await openTopicFile(TOPIC_CURRENT_FILE);
+      if (topicFileId && TOPIC_CURRENT_FILE && TOPIC_CURRENT_FILE.id === topicFileId) {
+        // 观点视图里保存：原地刷新列表，但保住滚动位置——新增/编辑不能把人拽回顶部
+        const y = state.currentView === "topics" ? window.scrollY : null;
+        await openTopicFile(TOPIC_CURRENT_FILE);
+        if (y != null) restoreTopicScrollAt(y);
+      }
     } catch (e) { toast(e.message, true); }
   }
 
@@ -4480,19 +4498,35 @@ function renderNotesGrouped(notes) {
     </div>` : "");
 }
 
+/* 恢复观点视图滚动位置（窗口是滚动容器；html 有 scroll-behavior:smooth，必须用 instant 覆盖） */
+function restoreTopicScrollAt(y) {
+  if (y == null) return;
+  window.scrollTo({ top: y, behavior: "instant" });
+  // 懒加载图片陆续撑高文档后再校正一次，防止位置被 clamp 到偏上处
+  setTimeout(() => window.scrollTo({ top: y, behavior: "instant" }), 350);
+}
+
 /* 从论文抽屉 / 分组头跳到观点视图并打开指定文件 */
 async function jumpToTopicFile(fileId) {
   closeDrawer();
+  // 从论文视图反跳回观点视图：如果这正是之前跳走的那个文件，原位恢复滚动位置
+  const back = state._topicReturn;
+  state._topicReturn = null;
   setViewMode("topics");
   await loadTopicTree();
   const node = findTopicNode(TOPIC_TREE, fileId);
-  if (node) await openTopicFile(node);
+  if (node) {
+    await openTopicFile(node);
+    if (back && back.fileId === fileId) restoreTopicScrollAt(back.y);
+  }
   else toast("找不到该观点文件", true);
 }
 
 /* 反向：从观点视图跳到某篇论文的 View 页 */
 async function jumpToPaper(pid) {
-  setViewMode("projects");
+  // 记下从观点视图哪个文件、哪个滚动位置跳走的，反跳回来时恢复
+  state._topicReturn = { fileId: TOPIC_CURRENT_FILE ? TOPIC_CURRENT_FILE.id : null, y: window.scrollY };
+  setViewMode("papers"); // 按钮 data-viewmode 是 papers，传 projects 会一个都点不亮
   await openPaperView(pid);
 }
 
