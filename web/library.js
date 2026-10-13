@@ -4508,24 +4508,40 @@ function renderNotesGrouped(notes) {
     </div>` : "");
 }
 
-/* 把目标条目落到视口「上部」：让 归属/分组头 + 块上沿 完整露出，
+/* 吸顶头栏当前遮住视口顶部的高度（全局 topbar / 论文 VIEW 的 pv-hero / 观点库标题行）。
+   跨视图落位必须把内容落到它下面，否则块的「上沿」正好被吸顶头栏盖住、看着像上沿不见了。 */
+function stickyCoverHeight() {
+  let h = 0;
+  document.querySelectorAll(".topbar, .pv-hero, .papers-pane__head").forEach(el => {
+    if (!el || el.offsetParent === null) return;
+    const cs = getComputedStyle(el);
+    if (cs.position !== "sticky" && cs.position !== "fixed") return;
+    const r = el.getBoundingClientRect();
+    if (r.bottom > 0 && r.bottom < window.innerHeight * 0.6) h = Math.max(h, r.bottom);
+  });
+  return h;
+}
+
+/* 把目标条目落到视口「上部 · 吸顶头栏之下」：让 归属/块上沿 完整露出，
    下面再长也不影响——而不是死板地把整块正中摆在屏幕正中央。
    html 有 scroll-behavior:smooth，必须用 instant 覆盖；
    懒加载图片撑高文档会挪动位置，故稍后再校正一次。 */
 function landNoteIn(containerSel, noteId) {
   if (noteId == null) return;
-  const TOP_GAP = 92; // 顶部留白，保证圆角归属条不被贴边裁掉
+  const TOP_GAP = 14; // 相对吸顶头栏底部再留一点空隙
   const doLand = () => {
     const card = document.querySelector(`${containerSel} .pv-card[data-note-id="${noteId}"]`);
     if (!card) return;
-    // 若该卡片是所属分组的第一张，「归属分组头」就在它正上方 → 从上方的分组头开始落位，
-    // 这样归属和块上沿一起露出（点进来的那条若在组中间，则直接以卡片上沿为准）
+    // 若该卡片是所属分组的第一张，「归属分组头」就在它正上方 → 以分组头为锚，归属和块上沿一起露出
     const group = card.closest(".note-group");
     const head = group ? group.querySelector(".note-group__head") : null;
     const firstCard = group ? group.querySelector(".pv-card") : null;
     const anchor = (head && firstCard === card) ? head : card;
-    const top = anchor.getBoundingClientRect().top + window.scrollY - TOP_GAP;
-    window.scrollTo({ top: Math.max(0, top), behavior: "instant" });
+    // 第一遍：粗落位，把吸顶头栏「逼」回 pinned 状态，才能量到它实际遮住的高度
+    window.scrollTo({ top: Math.max(0, anchor.getBoundingClientRect().top + window.scrollY - 92), behavior: "instant" });
+    // 第二遍：按吸顶头栏实际遮住的高度校正，保证块上沿落在头栏下方、完整可见
+    const cover = stickyCoverHeight();
+    window.scrollTo({ top: Math.max(0, anchor.getBoundingClientRect().top + window.scrollY - (cover + TOP_GAP)), behavior: "instant" });
   };
   doLand();
   setTimeout(doLand, 350);
