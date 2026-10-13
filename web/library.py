@@ -42,6 +42,10 @@ ASSET_DIR = PROJECT_DIR / "picture asset"
 DELETED_PATH = PROJECT_DIR / "data" / "deleted.json"
 LOCK_PATH = DB_PATH.parent / "library.lock"
 RECYCLE_RETENTION_DAYS = 7
+# 每个项目自动有一个隐藏的「顶级」容器文件夹（folder.is_root=1）。
+# 它不显示在文件夹树里，但里面的论文会以「顶级」的身份出现在项目最外层，
+# 与「膜实验基础操作」等顶层文件夹同级——从观点库导入的论文就落在这里，便于查找。
+ROOT_FOLDER_NAME = "顶级"
 DB_PATH.parent.mkdir(parents=True, exist_ok=True)
 ASSET_DIR.mkdir(parents=True, exist_ok=True)
 
@@ -934,6 +938,7 @@ def init_db() -> None:
     _migrate_note_topic_file(conn)
     _migrate_topic_kinds(conn)
     _migrate_paper_placement_backfill(conn)
+    _migrate_folder_root(conn)
     # 注意：Python sqlite3 只对 INSERT/UPDATE/DELETE 开启隐式事务，DDL(ALTER TABLE) 走自动提交。
     # 因此像「回填放置位置」这类 INSERT 必须显式提交，否则进程退出即回滚。
     conn.commit()
@@ -1011,6 +1016,53 @@ def _migrate_paper_placement_backfill(conn: sqlite3.Connection) -> None:
                VALUES (?,?,?,1,?)""",
             (r["pid"], r["proj"], r["fid"], r["ts"] or now_iso()),
         )
+
+
+def _migrate_folder_root(conn: sqlite3.Connection) -> None:
+    """为 folder 表补 is_root 标记列。
+
+    每个项目有且只有一个「顶级」容器文件夹（is_root=1），它不在文件夹树里显示，
+    但装在里面的论文会以「顶级」身份出现在项目最外层——与顶层文件夹同级。
+    用途：从观点库就地导入的新论文不该悄悄落进某个文件夹，而是落在最显眼处。
+    只是加一列，不动 paper.folder_id（它仍是 NOT NULL，全库 JOIN 逻辑零改动）。
+    """
+    cur = conn.execute("SELECT name FROM sqlite_master WHERE type='table' AND name='folder'")
+    if not cur.fetchone():
+        return
+    cols = {r[1] for r in conn.execute("PRAGMA table_info(folder)")}
+    if "is_root" not in cols:
+        conn.execute("ALTER TABLE folder ADD COLUMN is_root INTEGER NOT NULL DEFAULT 0")
+
+
+def _drop_root_folders(conn: sqlite3.Connection, ids: list[int]) -> list[int]:
+    """删除文件夹时剔除「顶级」容器：它不算用户文件夹，删掉会让整项目的顶级论文失去落点。"""
+    if not ids:
+        return []
+    ph = ",".join("?" for _ in ids)
+    bad = {
+        r["id"]
+        for r in conn.execute(
+            f"SELECT id FROM folder WHERE id IN ({ph}) AND is_root = 1", ids
+        ).fetchall()
+    }
+    return [i for i in ids if i not in bad]
+
+
+def ensure_project_root_folder(conn: sqlite3.Connection, project_id: int) -> int:
+    """取（必要时建）该项目的「顶级」容器文件夹 id。幂等。"""
+    row = conn.execute(
+        "SELECT id FROM folder WHERE project_id = ? AND is_root = 1 ORDER BY id LIMIT 1",
+        (project_id,),
+    ).fetchone()
+    if row:
+        return row["id"]
+    cur = conn.execute(
+        """INSERT INTO folder (project_id, parent_id, name, sort_order, created_at, is_root)
+           VALUES (?, NULL, ?, -1, ?, 1)""",
+        (project_id, ROOT_FOLDER_NAME, now_iso()),
+    )
+    conn.commit()
+    return int(cur.lastrowid)
 
 
 def _parse_layout_json(layout_json):
@@ -1197,6 +1249,9 @@ def build_folder_tree(project_id: int) -> list[dict]:
         "SELECT * FROM folder WHERE project_id = ? ORDER BY sort_order, id", (project_id,)
     ).fetchall()
     all_folders = [dict(r) for r in rows]
+    # 「顶级」容器文件夹（is_root=1）不进树：它只是论文的收纳位，
+    # 里面的论文由前端以「顶级」身份平铺到项目最外层，与顶层文件夹同级。
+    all_folders = [f for f in all_folders if not f.get("is_root")]
     # 过滤掉已软删除的文件夹（及其后代）
     deleted = load_deleted()
     deleted_folder_ids = set(deleted.get("folders", []))
@@ -1798,7 +1853,21 @@ class Handler(BaseHTTPRequestHandler):
                 if pid in load_deleted().get("projects", []):
                     self._error(404, "项目已移入回收站")
                     return
-                json_response(self, {"folders": build_folder_tree(pid)})
+                # root_folder_id：本项目的「顶级」容器文件夹，论文放在这里就等于
+                # 「项目最外层」——与顶层文件夹同级。前端用它渲染顶级行与导入落点。
+                rid = ensure_project_root_folder(get_db(), pid)
+                deleted_paper_ids = list(load_deleted().get("papers", []))
+                cnt_sql = "SELECT COUNT(*) c FROM paper WHERE folder_id = ?"
+                cnt_params: list = [rid]
+                if deleted_paper_ids:
+                    cnt_sql += " AND id NOT IN ({})".format(",".join("?" for _ in deleted_paper_ids))
+                    cnt_params += deleted_paper_ids
+                rc = get_db().execute(cnt_sql, cnt_params).fetchone()["c"]
+                json_response(self, {
+                    "folders": build_folder_tree(pid),
+                    "root_folder_id": rid,
+                    "root_paper_count": rc,
+                })
             elif path == "/api/folders/all":
                 # 所有项目的文件夹树汇总（跨项目移动的目标选择器用；已剔除回收站项目）
                 uid = require_user(self)
@@ -1890,7 +1959,7 @@ class Handler(BaseHTTPRequestHandler):
                 # 子查询的占位符会抢走 WHERE 的参数，导致 pr.user_id=? 绑错值。
                 rows = conn.execute(
                     f"""SELECT pa.id, pa.title_en, pa.title_zh, pa.journal, pa.authors, pa.doi,
-                               pa.folder_id, f.name AS folder_name,
+                               pa.folder_id, f.name AS folder_name, f.is_root AS folder_is_root,
                                pr.id AS project_id, pr.name AS project_name
                         FROM paper pa
                         JOIN folder f ON f.id = pa.folder_id
@@ -1903,6 +1972,11 @@ class Handler(BaseHTTPRequestHandler):
                 out = []
                 for r in rows:
                     d = dict(r)
+                    # 装在「顶级」容器里的论文：对外显示为「顶级」，
+                    # 而不是暴露内部容器名，避免前端把隐藏容器当成普通文件夹。
+                    d["folder_is_root"] = bool(d.get("folder_is_root"))
+                    if d["folder_is_root"]:
+                        d["folder_name"] = ROOT_FOLDER_NAME
                     d["note_count"] = conn.execute(
                         "SELECT COUNT(*) c FROM note n WHERE n.paper_id = ?" + nfilter,
                         [d["id"]] + nparams,
@@ -2250,6 +2324,10 @@ class Handler(BaseHTTPRequestHandler):
                     self._error(401, "未登录")
                     return
                 ids = [int(x) for x in (_read_json_body(self).get("ids") or []) if x]
+                ids = _drop_root_folders(get_db(), ids)
+                if not ids:
+                    self._error(400, "「顶级」不能删除（它就是项目最外层本身）")
+                    return
                 added = move_to_recycle(uid, "folder", ids)
                 json_response(self, {"ok": True, "deleted": added, "message": f"已删除 {added} 个文件夹"})
             elif path == "/api/papers/delete":
@@ -2299,7 +2377,9 @@ class Handler(BaseHTTPRequestHandler):
                     (uid, name, body.get("note", "").strip(), now_iso()),
                 )
                 conn.commit()
-                json_response(self, {"ok": True, "id": cur.lastrowid})
+                pid = int(cur.lastrowid)
+                ensure_project_root_folder(conn, pid)  # 新项目立刻有「顶级」落点
+                json_response(self, {"ok": True, "id": pid})
             elif path == "/api/folders":
                 uid = require_user(self)
                 if not uid:
@@ -3038,7 +3118,11 @@ class Handler(BaseHTTPRequestHandler):
                 return
             if path == "/api/folders":
                 fid = int((qs.get("id") or [None])[0])
-                added = move_to_recycle(uid, "folder", [fid])
+                kept = _drop_root_folders(get_db(), [fid])
+                if not kept:
+                    self._error(400, "「顶级」不能删除（它就是项目最外层本身）")
+                    return
+                added = move_to_recycle(uid, "folder", kept)
                 json_response(self, {"ok": True, "deleted": added, "message": f"已删除 {added} 个文件夹（可在回收站恢复）"})
                 return
             if path == "/api/papers":

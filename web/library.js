@@ -315,6 +315,8 @@ const state = {
   folderTree: [],
   currentFolderId: null,
   currentFolderPath: [],   // [{id, name}] 从根到当前
+  rootFolderId: null,      // 本项目的「顶级」容器文件夹 id：装在这里的论文与顶层文件夹同级
+  rootPaperCount: 0,       // 顶级论文篇数（树上来不存在的那个容器，计数要单独带回来）
   papers: [],
   recycleItems: [],
   recycleSummary: { total: 0, project: 0, folder: 0, paper: 0 },
@@ -1154,8 +1156,15 @@ async function openProject(pid) {
 async function loadTree() {
   const data = await req("GET", "/api/projects/tree?id=" + state.currentProjectId);
   state.folderTree = data.folders || [];
+  // 「顶级」容器文件夹不在树里显示，但它的 id 是顶级论文的归属位；
+  // 空缺时（老数据还没跑 ensure）一律需求一次，保证界面总有顶级这一档。
+  state.rootFolderId = data.root_folder_id || null;
+  state.rootPaperCount = data.root_paper_count || 0;
   renderTree();
 }
+
+// 「顶级」= 项目最外层：与「膜实验基础操作」等顶层文件夹同级，论文放在这里最显眼。
+const ROOT_LEVEL_NAME = "顶级";
 
 function renderTree() {
   const el = $("#folder-tree");
@@ -1182,11 +1191,29 @@ function renderTree() {
         ${hasChildren && isOpen ? `<div class="tree-children">${node.children.map(c => renderNode(c, depth + 1)).join("")}</div>` : ""}
       </div>`;
   };
-  el.innerHTML = state.folderTree.map(n => renderNode(n, 0)).join("");
+  // 顶级行：与顶层文件夹同级的一条特殊行。它不是普通文件夹——
+  // 没有勾选框/新建/移动/删除，因为它就是「项目最外层」本身。
+  const rootRow = state.rootFolderId ? `
+      <div class="tree-folder" data-fid="${state.rootFolderId}">
+        <div class="tree-row tree-row--root ${state.currentFolderId === state.rootFolderId ? "is-active" : ""}" data-fid="${state.rootFolderId}" data-root="1" title="项目最外层：论文在这里与顶层文件夹同级，导入的新论文默认落在这里">
+          <span class="tree-row__spacer" aria-hidden="true"></span>
+          <svg class="tree-chevron is-leaf"><use href="#i-chevron"/></svg>
+          <svg class="folder-ico"><use href="#i-grid"/></svg>
+          <span class="tree-name">${esc(ROOT_LEVEL_NAME)}</span>
+          <span class="tree-count">${state.rootPaperCount || 0}</span>
+        </div>
+      </div>` : "";
+  el.innerHTML = rootRow + state.folderTree.map(n => renderNode(n, 0)).join("");
 
   // 事件
   $$(".tree-row", el).forEach(row => {
     row.addEventListener("click", (e) => {
+      // 顶级行：不是普通文件夹，只负责「切到项目最外层」，不参与多选/移动/删除
+      if (row.dataset.root === "1") {
+        if (e.ctrlKey || e.metaKey || e.shiftKey) return;
+        selectRootLevel();
+        return;
+      }
       // 点击在 checkbox 上 → 切换选择
       if (e.target.closest(".lib-sel")) {
         const fid = parseInt(row.dataset.fid);
@@ -1267,6 +1294,21 @@ async function selectFolder(fid) {
   await loadPapers();
 }
 
+// 切到「顶级」：论文在这里与顶层文件夹同级（顶级容器本身不在树里显示）
+function isAtRootLevel() {
+  return !!state.rootFolderId && state.currentFolderId === state.rootFolderId;
+}
+
+async function selectRootLevel() {
+  if (!state.rootFolderId) { await selectRoot(); return; }
+  state.currentFolderId = state.rootFolderId;
+  state.currentFolderPath = []; // 顶级没有上层文件夹路径
+  state.selPapers.clear();
+  renderTree();
+  renderCrumbs();
+  await loadPapers();
+}
+
 async function selectRoot() {
   state.currentFolderId = null;
   state.currentFolderPath = [];
@@ -1278,7 +1320,11 @@ async function selectRoot() {
 
 function renderCrumbs() {
   const el = $("#crumbs");
-  let html = `<span class="crumb" data-id="root">根目录</span>`;
+  let html = `<span class="crumb ${!state.currentFolderPath.length && !isAtRootLevel() ? "crumb-current" : ""}" data-id="root">根目录</span>`;
+  // 顶级：显示成「根目录 / 顶级」，让人知道自己站在项目最外层
+  if (isAtRootLevel()) {
+    html += `<span class="crumb-sep">/</span><span class="crumb crumb-current" data-id="${state.rootFolderId}">${esc(ROOT_LEVEL_NAME)}</span>`;
+  }
   state.currentFolderPath.forEach((c, i) => {
     html += `<span class="crumb-sep">/</span><span class="crumb ${i === state.currentFolderPath.length - 1 ? "crumb-current" : ""}" data-id="${c.id}">${esc(c.name)}</span>`;
   });
@@ -1286,6 +1332,7 @@ function renderCrumbs() {
   $$(".crumb", el).forEach(c => c.addEventListener("click", () => {
     const id = c.dataset.id;
     if (id === "root") selectRoot();
+    else if (state.rootFolderId && parseInt(id) === state.rootFolderId) selectRootLevel();
     else selectFolder(parseInt(id));
   }));
 }
@@ -1306,12 +1353,14 @@ function renderPapers() {
     const q = state.searchTerm.toLowerCase();
     papers = papers.filter(p => (p.title_en + " " + p.title_zh + " " + p.authors + " " + p.journal).toLowerCase().includes(q));
   }
-  $("#papers-title").textContent = state.currentFolderPath.length
-    ? state.currentFolderPath[state.currentFolderPath.length - 1].name
-    : "全部论文（根目录）";
+  $("#papers-title").textContent = isAtRootLevel()
+    ? ROOT_LEVEL_NAME
+    : (state.currentFolderPath.length
+        ? state.currentFolderPath[state.currentFolderPath.length - 1].name
+        : "全部论文（根目录）");
 
   if (!papers.length) {
-    el.innerHTML = `<div class="empty-state"><p>${state.searchTerm ? "没有匹配的论文" : "这个文件夹还没有论文"}</p><small>${state.searchTerm ? "" : "点击右上角「导入论文」，拖入或选择 PDF"}</small></div>`;
+    el.innerHTML = `<div class="empty-state"><p>${state.searchTerm ? "没有匹配的论文" : (isAtRootLevel() ? "「顶级」里还没有论文" : "这个文件夹还没有论文")}</p><small>${state.searchTerm ? "" : "点击右上角「导入论文」，拖入或选择 PDF"}</small></div>`;
     return;
   }
 
@@ -1932,7 +1981,7 @@ function enterArrangeMode(card, note) {
   }, 50);
   state._arrangeDragoverFn = (e) => { state._arrangeDragY = e.clientY; };
   document.addEventListener("dragover", state._arrangeDragoverFn);
-  toast("排版模式：拖块上下换位；拖到目标块左/右边缘可改版式；每块右上角可直设 左/右/全宽；Ctrl+点另一块对换。点「完成」退出");
+  toast("排版模式：拖块上下换位；拖到目标块左/右边缘 = 与它并排成一行（左右自动分配）；每块右上角可直设 左/右/全宽；Ctrl+点另一块对换。点「完成」退出");
 }
 
 function exitArrangeMode(notify = true) {
@@ -2075,10 +2124,11 @@ async function setArrangeCol(key, col, card) {
   await applyArrangeAndSave(card);
 }
 
-// 拖拽插入：把 dragKey 块移到 targetKey 块所在「视觉行」的前/后，列可由落点指定。
-// 显式行模型下，视觉行就是数据顺序里的连续分组（visualRows），
-// 因此锚点非常确定：before → 目标行第一个成员的位置；after → 目标行最后一个成员之后。
-// dropCol：拖拽落点判定的列（"1"/"2" 左/右半区；null = 保持拖拽块当前列）。
+// 拖拽插入（两种语义，由落点横区决定）：
+// ① 左/右 1/3 边缘区（dropCol = "1"/"2"）→ 「与目标并排成一行」：
+//    拖拽块占这一半，目标块自动占另一半，并紧贴到目标前/后——
+//    一步完成「2.2 在左上、译文在右上」这类并排需求，不用分别调两块的列。
+// ② 中间 1/3（dropCol = null）→ 纯换位：插到目标所在视觉行的前/后，列保持不变。
 async function insertArrangeBlock(dragKey, targetKey, before, card, dropCol) {
   const a = state.arrange;
   if (!a) return;
@@ -2086,18 +2136,29 @@ async function insertArrangeBlock(dragKey, targetKey, before, card, dropCol) {
   const from = sorted.findIndex(b => b.key === dragKey);
   if (from < 0) return;
   const [moved] = sorted.splice(from, 1);
-  if (dropCol != null) moved.col = dropCol === "full" ? "full" : Number(dropCol);
-  // 移除拖拽块后重新分行（它自己那行可能因此解散/合并），再定位目标行
-  const rows = visualRows(sorted);
-  const rowIdx = rows.findIndex(r => r.some(b => b.key === targetKey));
-  let anchor;
-  if (rowIdx < 0) anchor = sorted.length; // 目标行不存在（理论不会）→ 末尾
-  else {
-    const row = rows[rowIdx];
-    const firstIdx = sorted.indexOf(row[0]);
-    anchor = before ? firstIdx : firstIdx + row.length;
+  const target = sorted.find(b => b.key === targetKey);
+  if (!target) { sorted.splice(from, 0, moved); return; }
+
+  if (dropCol === "1" || dropCol === "2") {
+    // 并排：拖拽块占 dropCol 半边，目标占另一半，紧贴相邻
+    moved.col = dropCol === "1" ? 1 : 2;
+    target.col = dropCol === "1" ? 2 : 1;
+    const tIdx = sorted.indexOf(target);
+    sorted.splice(dropCol === "1" ? tIdx : tIdx + 1, 0, moved);
+  } else {
+    if (dropCol != null && dropCol !== "full") moved.col = Number(dropCol);
+    // 移除拖拽块后重新分行（它自己那行可能因此解散/合并），再定位目标行
+    const rows = visualRows(sorted);
+    const rowIdx = rows.findIndex(r => r.some(b => b.key === targetKey));
+    let anchor;
+    if (rowIdx < 0) anchor = sorted.length; // 目标行不存在（理论不会）→ 末尾
+    else {
+      const row = rows[rowIdx];
+      const firstIdx = sorted.indexOf(row[0]);
+      anchor = before ? firstIdx : firstIdx + row.length;
+    }
+    sorted.splice(anchor, 0, moved);
   }
-  sorted.splice(anchor, 0, moved);
   sorted.forEach((b, i) => { b.order = i; });
   a.blocks.sort((x, y) => x.order - y.order);
   a.dirty = true;
@@ -3112,8 +3173,8 @@ function openPaperModal(existing, onSaved) {
         pushUndo("导入论文",
           async () => { await req("DELETE", "/api/papers?id=" + r.id); },
           async () => { await restoreRecycleByEntities("paper", [r.id]); });
-        // 告知落点：从观点库等无上下文处导入时是自动选的第一个项目/文件夹
-        const loc = (state.currentFolderPath || []).map(x => x.name).join(" / ");
+        // 告知落点：从观点库等无上下文处导入时是自动选的项目「顶级」
+        const loc = currentLocationLabel();
         toast(loc ? `论文已保存到「${loc}」` : "论文已保存");
         closeModal();
         if (onSaved) onSaved(r && r.id);
@@ -3161,7 +3222,12 @@ async function ensureRootFolder() {
     }
   }
   await loadTree();
-  if (!state.folderTree.length) {
+  if (state.rootFolderId) {
+    // 落点固定为「顶级」——项目最外层，与顶层文件夹同级。
+    // 不能悄悄塞进某个文件夹（比如「膜实验基础操作」），否则导入完还得翻找。
+    state.currentFolderId = state.rootFolderId;
+    state.currentFolderPath = [];
+  } else if (!state.folderTree.length) {
     const r = await req("POST", "/api/folders", { project_id: state.currentProjectId, parent_id: null, name: "默认" });
     await loadTree();
     state.currentFolderId = r.id;
@@ -3173,6 +3239,12 @@ async function ensureRootFolder() {
   }
   renderTree();
   renderCrumbs();
+}
+
+// 落点中文名，给导入成功的提示用（顶级要说清楚，不然用户不知道落到哪了）
+function currentLocationLabel() {
+  if (isAtRootLevel()) return ROOT_LEVEL_NAME + "（项目最外层，与顶层文件夹同级）";
+  return (state.currentFolderPath || []).map(x => x.name).join(" / ");
 }
 
 async function handlePdfFile(file) {
@@ -4064,7 +4136,7 @@ async function buildPaperNotesPanel(paperId, topicFileId, currentTopicName, onCh
           acts.appendChild(b);
         } else {
           const b = document.createElement("button");
-          b.type = "button"; b.className = "scan-button scan-button--sm scan-button--ghost"; b.textContent = "改归…";
+          b.type = "button"; b.className = "scan-button scan-button--sm scan-button--ghost"; b.textContent = "改归属";
           b.onclick = () => confirmReassign(n);
           acts.appendChild(b);
         }
@@ -4090,7 +4162,8 @@ async function buildPaperNotesPanel(paperId, topicFileId, currentTopicName, onCh
   return panel;
 }
 
-async function openTopicNoteComposer(topicFileId) {
+// highlightPaperId：就地导入完成后带回的新论文 id —— 打开选择器时直接选中并滚到它
+async function openTopicNoteComposer(topicFileId, highlightPaperId) {
   const load = async (q) => {
     const d = await req("GET", "/api/papers/search?q=" + encodeURIComponent(q || ""));
     return d.papers || [];
@@ -4178,6 +4251,7 @@ async function openTopicNoteComposer(topicFileId) {
       + (p.journal ? " · " + p.journal : "");
     const row = document.createElement("div");
     row.className = "picker-row";
+    row.dataset.pid = p.id; // 供「导入后自动选中」按 id 找回这一行
     row.innerHTML = `<b title="${esc(main)}">${esc(main)}</b><small>${esc(sub)}</small>`
       + `<span class="picker-row__more" title="点这张行就能看到这篇文献已有的全部条目、归属状态，并能直接处理">已有条目</span>`;
     row.addEventListener("click", async () => {
@@ -4238,6 +4312,33 @@ async function openTopicNoteComposer(topicFileId) {
   buildNav();
   paintList();
 
+  // 就地导入刚完成：直接把新论文高亮选中并滚进视野。
+  // 否则用户回到选择器看到一屏列表，会以为没导进来、不知道跑哪去了。
+  const highlightImported = (pid) => {
+    if (!pid) return;
+    const row = list.querySelector(`.picker-row[data-pid="${pid}"]`);
+    if (!row) return;
+    const p = papers.find(x => x.id === pid) || null;
+    list.querySelectorAll(".picker-row.is-chosen").forEach(el => el.classList.remove("is-chosen"));
+    row.classList.add("is-chosen");
+    row.classList.add("is-fresh"); // 短暂闪一下，提示「就是这篇」
+    setTimeout(() => row.classList.remove("is-fresh"), 1600);
+    chosenPaper = p;
+    okBtn.disabled = false;
+    okBtn.querySelector("span").textContent = "确定 · " + (((p && (p.title_en || p.title_zh)) || "")).slice(0, 22);
+    row.scrollIntoView({ block: "center", behavior: "smooth" });
+    toast("已导入「" + (((p && (p.title_en || p.title_zh)) || "新论文")).slice(0, 30) + "」，已为你选中在下方");
+  };
+  if (highlightPaperId) {
+    // 搜索词/文件夹过滤可能把新论文挡住 —— 先回到「全部论文」再定位
+    if (q.value) q.value = "";
+    current = { projectId: null, folderId: null };
+    buildNav();
+    paintList();
+    // 等一帧，确保列表已经渲染出来再滚
+    requestAnimationFrame(() => highlightImported(highlightPaperId));
+  }
+
   let timer = null;
   q.addEventListener("input", () => {
     clearTimeout(timer);
@@ -4250,14 +4351,14 @@ async function openTopicNoteComposer(topicFileId) {
     closeModal();
     openNoteComposeEditor({ paperId: p.id, topicFileId });
   });
-  // 就地导入新论文：保存成功后重新打开本选择器（论文会出现在列表里）
+  // 就地导入新论文：保存成功后重新打开本选择器（论文会出现在列表里，并被自动选中）
   $("#topic-import").addEventListener("click", () => {
-    openPaperModal(null, async () => {
+    openPaperModal(null, async (newId) => {
       try {
         const d = await req("GET", "/api/papers/search?q=");
         papers = d.papers || [];
       } catch (e) { /* 下次打开会重新加载 */ }
-      openTopicNoteComposer(topicFileId);
+      openTopicNoteComposer(topicFileId, newId);
     });
   });
 }

@@ -103,7 +103,7 @@ svg { width: 1.25rem; height: 1.25rem; fill: none; stroke: currentColor; stroke-
 }
 .assign-chip:hover { background: rgba(31,91,87,.2); }
 .assign-chip svg { width: 15px; height: 15px; flex: none; }
-.assign-chip span { max-width: 640px; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.assign-chip span { max-width: 100%; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .assign-chip.is-none { color: var(--ink-500); border-color: var(--paper-300); background: var(--paper-50); cursor: default; }
 .assign-chip.is-none:hover { background: var(--paper-50); }
 .assign-chip--source { background: rgba(183,94,29,.07); border-color: var(--copper-600); color: var(--copper-600); }
@@ -706,6 +706,13 @@ body.view-paper-view header.topbar > .topbar-actions { display: none !important;
 .tree-row .tree-name { flex: 1; min-width: 0; font-size: .86rem; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .tree-row .tree-count { flex: none; color: var(--ink-700); font: 500 .66rem var(--font-data); }
 .tree-children { margin-left: 17px; border-left: 1px solid var(--paper-300); padding-left: 6px; }
+/* 「顶级」行：项目最外层，与顶层文件夹同级。用 accent 色区别于普通文件夹 */
+.tree-row--root { border-bottom: 1px solid var(--paper-200); margin-bottom: 3px; border-radius: 3px 3px 0 0; }
+.tree-row--root svg.folder-ico { color: var(--oxide-700); }
+.tree-row--root .tree-name { font-weight: 600; letter-spacing: .02em; }
+.tree-row--root.is-active { background: rgba(42,109,103,.14); }
+/* 与普通行对齐：普通行最前面是 18px 的勾选框 + 9px gap，顶级行没有勾选框，补等宽占位 */
+.tree-row__spacer { width: 18px; flex: none; }
 .tree-actions { display: none; gap: 4px; }
 .tree-row:hover .tree-actions { display: flex; }
 .tree-actions button { display: inline-flex; align-items: center; justify-content: center; width: 24px; height: 24px; color: var(--ink-700); background: transparent; border: 1px solid transparent; border-radius: 3px; cursor: pointer; }
@@ -879,7 +886,7 @@ body.view-paper-view header.topbar > .topbar-actions { display: none !important;
 .folder-drop-target { outline: 2px dashed var(--oxide-600); outline-offset: -2px; background: rgba(42,109,103,.1) !important; }
 
 /* 项目详情：三栏布局 */
-.project-workspace { display: grid; grid-template-columns: 270px 1fr; gap: 24px; align-items: start; }
+.project-workspace { display: grid; grid-template-columns: 270px minmax(0, 1fr); gap: 24px; align-items: start; min-width: 0; }
 .folder-pane { position: sticky; top: calc(var(--topbar) + 20px); max-height: calc(100vh - var(--topbar) - 40px); overflow-y: auto; background: var(--white); border: 1px solid var(--paper-300); border-radius: 3px; padding: 14px; }
 .folder-pane__head { display: flex; align-items: center; justify-content: space-between; margin-bottom: 10px; padding-bottom: 10px; border-bottom: 1px solid var(--paper-200); }
 .folder-pane__head span { font: 600 .7rem var(--font-data); letter-spacing: .1em; color: var(--oxide-700); text-transform: uppercase; }
@@ -887,6 +894,7 @@ body.view-paper-view header.topbar > .topbar-actions { display: none !important;
 .folder-pane__head button:hover { background: var(--paper-100); }
 .folder-pane__head button svg { width: 13px; height: 13px; }
 
+.papers-pane { min-width: 0; }
 .papers-pane__head { display: flex; align-items: center; justify-content: space-between; margin-bottom: 16px; }
 /* 观点库：标题 + 三个按钮（新建文件夹/新建观点/新增条目）整行冻结，下滑常驻 */
 section[data-view="topics"] .papers-pane__head {
@@ -1467,6 +1475,8 @@ section[data-view="topics"] .crumbs { margin-bottom: 8px; }
   display: flex;
   align-items: center;
   justify-content: space-between;
+  flex-wrap: wrap;
+  gap: 12px;
   padding-bottom: 14px;
   margin-bottom: 18px;
   border-bottom: 1px solid var(--paper-200);
@@ -1875,6 +1885,13 @@ section[data-view="topics"] .crumbs { margin-bottom: 8px; }
 .note-card__assign.is-set { border-color: var(--copper-600); color: var(--copper-700); }
 
 .picker-row.is-chosen { background: rgba(31,91,87,.11); box-shadow: inset 3px 0 0 var(--oxide-700); }
+/* 刚导入回来的论文：闪一下，让人一眼看到新论文在列表里的位置 */
+.picker-row.is-fresh { animation: picker-flash 1.5s ease-out; }
+@keyframes picker-flash {
+  0%   { background: rgba(214,138,74,.42); }
+  70%  { background: rgba(214,138,74,.20); }
+  100% { background: rgba(31,91,87,.11); }
+}
 
 /* ============ 宽弹窗 + 来源文献选择器两栏布局 ============ */
 .modal.modal--wide { width: min(860px, calc(100vw - 40px)); }
