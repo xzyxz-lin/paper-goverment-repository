@@ -2052,12 +2052,15 @@ function bindArrangeDrag(card) {
         x.classList.remove("is-insert-before", "is-insert-after", "is-drop-col-1", "is-drop-col-2");
         if (x !== el) delete x.dataset.dropCol;
       });
-      el.classList.add(before ? "is-insert-before" : "is-insert-after");
+      // 两种落点提示互斥，信号才不混淆：
+      //  左/右 1/3 → 只亮「并排到左/右」虚线带（落下=与目标并排成一行）；
+      //  中间 1/3 → 只亮上/下铜橙插入线（落下=插到它前面/后面，列不变）。
       if (dropCol) {
         el.classList.add(dropCol === "1" ? "is-drop-col-1" : "is-drop-col-2");
         el.dataset.dropCol = dropCol;
       } else {
         delete el.dataset.dropCol;
+        el.classList.add(before ? "is-insert-before" : "is-insert-after");
       }
     });
     el.addEventListener("dragleave", () => {
