@@ -1789,7 +1789,7 @@ async function openPaperView(pid, focusNoteId) {
   renderPaperView(paper);
   showView("paper-view");
   // 跨视图横跳：把点过来的那条思考滚到视口居中
-  if (focusNoteId != null) centerNoteIn("#pv-list", focusNoteId);
+  if (focusNoteId != null) landNoteIn("#pv-list", focusNoteId);
 }
 
 function closePaperView() {
@@ -2963,7 +2963,7 @@ async function openNoteComposeEditor(opts) {
       if (topicFileId && TOPIC_CURRENT_FILE && TOPIC_CURRENT_FILE.id === topicFileId) {
         // 观点视图里保存：原地刷新列表，并把刚写/刚改的条目滚到视口居中
         await openTopicFile(TOPIC_CURRENT_FILE);
-        centerNoteIn("#topic-notes", focusNoteId);
+        landNoteIn("#topic-notes", focusNoteId);
       }
     } catch (e) { toast(e.message, true); }
   }
@@ -4508,17 +4508,27 @@ function renderNotesGrouped(notes) {
     </div>` : "");
 }
 
-/* 把某条条目滚到视口居中（跨视图横跳 / 新增条目后定位用）。
+/* 把目标条目落到视口「上部」：让 归属/分组头 + 块上沿 完整露出，
+   下面再长也不影响——而不是死板地把整块正中摆在屏幕正中央。
    html 有 scroll-behavior:smooth，必须用 instant 覆盖；
-   懒加载图片陆续撑高文档会挪动位置，故稍后再校正一次。 */
-function centerNoteIn(containerSel, noteId) {
+   懒加载图片撑高文档会挪动位置，故稍后再校正一次。 */
+function landNoteIn(containerSel, noteId) {
   if (noteId == null) return;
-  const doCenter = () => {
-    const el = document.querySelector(`${containerSel} .pv-card[data-note-id="${noteId}"]`);
-    if (el) el.scrollIntoView({ block: "center", behavior: "instant" });
+  const TOP_GAP = 92; // 顶部留白，保证圆角归属条不被贴边裁掉
+  const doLand = () => {
+    const card = document.querySelector(`${containerSel} .pv-card[data-note-id="${noteId}"]`);
+    if (!card) return;
+    // 若该卡片是所属分组的第一张，「归属分组头」就在它正上方 → 从上方的分组头开始落位，
+    // 这样归属和块上沿一起露出（点进来的那条若在组中间，则直接以卡片上沿为准）
+    const group = card.closest(".note-group");
+    const head = group ? group.querySelector(".note-group__head") : null;
+    const firstCard = group ? group.querySelector(".pv-card") : null;
+    const anchor = (head && firstCard === card) ? head : card;
+    const top = anchor.getBoundingClientRect().top + window.scrollY - TOP_GAP;
+    window.scrollTo({ top: Math.max(0, top), behavior: "instant" });
   };
-  doCenter();
-  setTimeout(doCenter, 350);
+  doLand();
+  setTimeout(doLand, 350);
 }
 
 /* 回到观点视图时重新拉取当前文件（保证与论文视图的增删改实时一致） */
@@ -4541,7 +4551,7 @@ async function jumpToTopicFile(fileId, centerNoteId) {
     if (node) {
       await openTopicFile(node);
       // 定位到「我真实点击的那条归属」所在的观点文件里的那条条目（而不是抱死回上一个观点）
-      if (centerNoteId != null) centerNoteIn("#topic-notes", centerNoteId);
+      if (centerNoteId != null) landNoteIn("#topic-notes", centerNoteId);
     } else toast("找不到该观点文件", true);
   } finally {
     _topicNavInProgress = false;
